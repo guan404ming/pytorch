@@ -99,7 +99,7 @@ ReconstructFn: TypeAlias = Callable[
 @dataclass
 class _OpaqueTypeInfo:
     class_name: str
-    opaque_typ: Literal["symbolic", "value"]
+    opaque_typ: Literal["symbolic", "constant"]
     guard_fn: Callable[
         [Any], list[Any]
     ]  # Callable that takes the object and returns list of values to guard on
@@ -218,12 +218,16 @@ def register_custom_class(
         log.warning("typ='reference' is deprecated, use typ='symbolic' instead")
         typ = "symbolic"
 
-    if typ not in ["symbolic", "value"]:
+    if typ == "value":
+        log.warning("typ='value' is deprecated, use typ='constant' instead")
+        typ = "constant"
+
+    if typ not in ["symbolic", "constant"]:
         raise AssertionError(
-            f"Custom class type must be either 'symbolic' or 'value', got {typ!r}"
+            f"Custom class type must be either 'symbolic' or 'constant', got {typ!r}"
         )
 
-    if typ == "value":
+    if typ == "constant":
         # Enums use identity-based equality (singletons), which is fine for guarding.
         if not issubclass(cls, Enum) and cls.__eq__ is object.__eq__:  # type: ignore[comparison-overlap]
             raise TypeError(
@@ -293,7 +297,7 @@ def register_opaque_type(
 
 
 # Enums are always opaque value types.
-register_custom_class(Enum, typ="value")
+register_custom_class(Enum, typ="constant")
 
 
 def is_opaque_value(value: object) -> TypeIs[OpaqueType]:
@@ -355,12 +359,12 @@ def is_opaque_value_type(cls: type[Any] | str) -> bool:
         return False
 
     if isinstance(cls, str):
-        return _OPAQUE_TYPES_BY_NAME[cls].opaque_typ == "value"
+        return _OPAQUE_TYPES_BY_NAME[cls].opaque_typ == "constant"
 
     info = _resolve_opaque_type_info(cls)
     if info is None:
         return False
-    return info.opaque_typ == "value"
+    return info.opaque_typ == "constant"
 
 
 def is_opaque_reference_type(cls: Any) -> bool:
