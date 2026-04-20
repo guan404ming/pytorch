@@ -43,9 +43,9 @@ from torch._dispatch.python import enable_python_dispatcher
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import (
     get_reconstruct_fn,
-    is_opaque_reference_type,
+    is_opaque_constant_type,
+    is_opaque_symbolic_type,
     is_opaque_value,
-    is_opaque_value_type,
     should_hoist,
 )
 from torch._logging import trace_structured
@@ -956,7 +956,7 @@ def track_tensor_tree(
             # in the graph, not tracked as proxy references. This matches
             # dynamo's behavior where non-hoisted values are not graph inputs.
             if (
-                is_opaque_value_type(type(e))  # pyrefly: ignore[bad-argument-type]
+                is_opaque_constant_type(type(e))  # pyrefly: ignore[bad-argument-type]
                 and not should_hoist(type(e))
             ):
                 set_meta(proxy, e)
@@ -1490,7 +1490,7 @@ class PythonKeyTracer(Tracer):
         """
         real_obj: CustomClassBase = a.real_obj if isinstance(a, FakeScriptObject) else a
 
-        if not is_opaque_reference_type(type(real_obj)):
+        if not is_opaque_symbolic_type(type(real_obj)):
             return None
 
         reconstruct_fn = get_reconstruct_fn(type(real_obj))
@@ -2878,7 +2878,7 @@ class _MakefxTracer:
                     source=source,
                 )
             elif isinstance(x, torch.ScriptObject) or is_opaque_value(x):
-                if is_opaque_value_type(
+                if is_opaque_constant_type(
                     type(x)  # pyrefly: ignore[bad-argument-type]
                 ):
                     return x
