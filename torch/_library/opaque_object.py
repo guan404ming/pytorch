@@ -203,17 +203,6 @@ def register_custom_class(
             "registered as a pytree. Opaque objects must be pytree leaves."
         )
 
-    # Value types store the real object directly during tracing (no
-    # FakeScriptObject wrapper), so they don't need CustomClassBaseMeta.
-    if typ != "value" and not isinstance(cls, CustomClassBaseMeta):
-        raise TypeError(
-            f"Opaque type {cls} must subclass torch._opaque_base.OpaqueBase "
-            "or 'metaclass=torch._opaque_base.OpaqueBaseMeta'. "
-            "This is required so that FakeScriptObject can be registered "
-            "as a virtual subclass, allowing isinstance() checks to work "
-            "during torch.compile tracing. "
-        )
-
     if typ == "reference":
         log.warning("typ='reference' is deprecated, use typ='symbolic' instead")
         typ = "symbolic"
@@ -221,6 +210,17 @@ def register_custom_class(
     if typ == "value":
         log.warning("typ='value' is deprecated, use typ='constant' instead")
         typ = "constant"
+
+    # Constant types store the real object directly during tracing (no
+    # FakeScriptObject wrapper), so they don't need CustomClassBaseMeta.
+    if typ != "constant" and not isinstance(cls, CustomClassBaseMeta):
+        raise TypeError(
+            f"Custom class {cls} must subclass torch._custom_class_base.CustomClassBase "
+            "or 'metaclass=torch._custom_class_base.CustomClassBaseMeta'. "
+            "This is required so that FakeScriptObject can be registered "
+            "as a virtual subclass, allowing isinstance() checks to work "
+            "during torch.compile tracing. "
+        )
 
     if typ not in ["symbolic", "constant"]:
         raise AssertionError(
@@ -300,14 +300,19 @@ def register_opaque_type(
 register_custom_class(Enum, typ="constant")
 
 
-def is_opaque_value(value: object) -> TypeIs[OpaqueType]:
-    if is_opaque_type(type(value)):
+def is_custom_class_obj(value: object) -> TypeIs[OpaqueType]:
+    if is_custom_class(type(value)):
         return True
     from torch._library.fake_class_registry import FakeScriptObject
 
     if isinstance(value, FakeScriptObject):
-        return is_opaque_type(type(value.real_obj))
+        return is_custom_class(type(value.real_obj))
     return False
+
+
+def is_opaque_value(value: object) -> TypeIs[OpaqueType]:
+    log.warning("is_opaque_value is deprecated, use is_custom_class_obj instead")
+    return is_custom_class_obj(value)
 
 
 def should_hoist(cls: Any) -> bool:
@@ -331,16 +336,16 @@ def has_members(cls: Any) -> bool:
     return len(info.members) > 0
 
 
-def is_opaque_type(cls: type[Any] | str) -> bool:
+def is_custom_class(cls: type[Any] | str) -> bool:
     """
-    Checks if the given type is an opaque type.
-    Also returns True for subclasses of registered opaque types.
+    Checks if the given type is a registered custom class.
+    Also returns True for subclasses of registered custom classes.
     """
     if isinstance(cls, str):
         return torch._C._is_opaque_type_registered(cls)
 
     if not isinstance(cls, type):
-        log.warning("Passed invalid type `%s` to is_opaque_type, returning False", cls)
+        log.warning("Passed invalid type `%s` to is_custom_class, returning False", cls)
         return False
 
     info = _resolve_opaque_type_info(cls)
@@ -350,12 +355,17 @@ def is_opaque_type(cls: type[Any] | str) -> bool:
     return torch._C._is_opaque_type_registered(info.class_name)
 
 
+def is_opaque_type(cls: type[Any] | str) -> bool:
+    log.warning("is_opaque_type is deprecated, use is_custom_class instead")
+    return is_custom_class(cls)
+
+
 def is_opaque_constant_type(cls: type[Any] | str) -> bool:
     """
     Checks if the given type is an opaque **constant** type.
     See Note [Opaque Objects] for more information.
     """
-    if not is_opaque_type(cls):
+    if not is_custom_class(cls):
         return False
 
     if isinstance(cls, str):
@@ -379,7 +389,7 @@ def is_opaque_symbolic_type(cls: Any) -> bool:
     Checks if the given type is an opaque **symbolic** type.
     See Note [Opaque Objects] for more information.
     """
-    if not is_opaque_type(cls):
+    if not is_custom_class(cls):
         return False
 
     if isinstance(cls, str):
@@ -444,7 +454,7 @@ def get_opaque_obj_repr(obj: Any) -> tuple[str, dict[str, type]]:
 
 
 def get_opaque_obj_info(cls: Any) -> _OpaqueTypeInfo | None:
-    if not is_opaque_type(cls):
+    if not is_custom_class(cls):
         return None
 
     if isinstance(cls, str):
