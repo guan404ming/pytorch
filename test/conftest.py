@@ -19,6 +19,7 @@ from _pytest.stash import StashKey
 from _pytest.terminal import _get_raw_skip_reason
 
 from pytest_shard_custom import pytest_addoptions as shard_addoptions, PytestShardPlugin
+from pytest_trace_custom import pytest_addoptions as trace_addoptions, PytestTracePlugin
 
 
 try:
@@ -90,6 +91,7 @@ def pytest_addoption(parser: Parser) -> None:
         default="xunit2",
     )
     shard_addoptions(parser)
+    trace_addoptions(parser)
 
 
 def pytest_configure(config: Config) -> None:
@@ -116,6 +118,8 @@ def pytest_configure(config: Config) -> None:
         config.pluginmanager.register(StepcurrentPlugin(config), "stepcurrentplugin")
     if config.getoption("num_shards"):
         config.pluginmanager.register(PytestShardPlugin(config), "pytestshardplugin")
+    if config.getoption("pytest_trace"):
+        config.pluginmanager.register(PytestTracePlugin(config), "pytesttraceplugin")
 
 
 def pytest_unconfigure(config: Config) -> None:
