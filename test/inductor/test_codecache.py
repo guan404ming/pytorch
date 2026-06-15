@@ -3184,18 +3184,28 @@ if not torch.allclose(eager_result, compiled_result, atol=0.1, rtol=0.01):
         torch._dynamo.mark_dynamic(x, 0)
 
         def backend(gm, args, **kwargs):
+            example_inputs = [
+                5 if isinstance(a, (int, torch.SymInt)) else torch.ones(4)
+                for a in args
+            ]
             compiled_artifact = torch._inductor.standalone_compile(
-                gm, [5, torch.ones(4)], dynamic_shapes="from_example_inputs", aot=is_aot
+                gm, example_inputs, dynamic_shapes="from_example_inputs", aot=is_aot
             )
             y = torch.ones(4)
-            (result,) = compiled_artifact(4, y)
+            call_args = [
+                4 if isinstance(a, (int, torch.SymInt)) else y for a in args
+            ]
+            (result,) = compiled_artifact(*call_args)
             # 5 was baked in
             self.assertEqual(result, y * 5)
 
             # shape of y was baked in
             with self.assertRaisesRegex(AssertionError, "expected size 5==4"):
                 y = torch.ones(5)
-                (result,) = compiled_artifact(4, y)
+                call_args = [
+                    4 if isinstance(a, (int, torch.SymInt)) else y for a in args
+                ]
+                (result,) = compiled_artifact(*call_args)
 
             return compiled_artifact
 

@@ -472,7 +472,7 @@ class GraphModule(torch.nn.Module):
                 actual_graph,
                 """\
 class GraphModule(torch.nn.Module):
-    def forward(self, s77: "Sym(s77)", L_x_: "f32[s77, 1]"):
+    def forward(self, L_x_: "f32[s77, 1]", s77: "Sym(s77)"):
         l_x_ = L_x_
 
         wrap_body_0 = self.wrap_body_0

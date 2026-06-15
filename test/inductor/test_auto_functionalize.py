@@ -187,7 +187,7 @@ class AutoFunctionalizeTests(torch._inductor.test_case.TestCase):
                     """\
 def forward(self, arg0_1: "f32[3][1]cpu", arg1_1: "f32[3][1]cpu", arg2_1: "f32[3][1]cpu", arg3_1: "f32[3][1]cpu", arg4_1: "f32[3][1]cpu"):
         foo_default = torch.ops.mylib.foo.default(arg1_1, [arg2_1, arg3_1], arg4_1, 2, arg0_1);  arg1_1 = arg2_1 = arg3_1 = arg4_1 = arg0_1 = foo_default = None
-        return ()""",  # noqa: B950
+        return ()""",
                     ignore_comments=True,
                 )
 
@@ -250,7 +250,7 @@ def forward(self, arg0_1: "f32[3][1]cpu", arg1_1: "f32[3][1]cpu", arg2_1: "f32[3
         foo_default = torch.ops.mylib.foo.default(arg1_1, [arg2_1, arg3_1], arg4_1, 2, arg0_1);  arg1_1 = arg2_1 = arg3_1 = arg4_1 = arg0_1 = None
         getitem_4: "f32[3][1]cpu" = foo_default[0]
         getitem_5: "f32[3][1]cpu" = foo_default[1];  foo_default = None
-        return (getitem_4, getitem_5)""",  # noqa: B950
+        return (getitem_4, getitem_5)""",
                     ignore_comments=True,
                 )
 

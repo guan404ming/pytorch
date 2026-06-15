@@ -1321,14 +1321,14 @@ def forward(self, x):
         self.assertExpectedInline(
             backend.graphs[0].code.strip(),
             f"""\
-def forward(self, L_rng_state_ : {fx_class}, L_x_ : torch.Tensor):
+def forward(self, L_rng_state_ : __main___RNGState, L_x_ : torch.Tensor):
     l_rng_state_ = L_rng_state_
     l_x_ = L_x_
-    x = torch.ops._TestOpaqueObject.noisy_inject(l_x_, l_rng_state_);  l_x_ = None
-    x_1 = x * x;  x = None
-    x_2 = torch.ops._TestOpaqueObject.noisy_inject(x_1, l_rng_state_);  x_1 = l_rng_state_ = None
-    x_3 = x_2 + x_2;  x_2 = None
-    return (x_3,)""",
+    noisy_inject = torch.ops._TestOpaqueObject.noisy_inject(l_x_, l_rng_state_);  l_x_ = None
+    mul = noisy_inject * noisy_inject;  noisy_inject = None
+    noisy_inject_1 = torch.ops._TestOpaqueObject.noisy_inject(mul, l_rng_state_);  mul = l_rng_state_ = None
+    add = noisy_inject_1 + noisy_inject_1;  noisy_inject_1 = None
+    return (add,)""",
         )
         self.assertExpectedInline(
             backend.fw_graphs[0].code.strip(),

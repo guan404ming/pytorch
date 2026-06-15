@@ -603,13 +603,13 @@ class TestProvenanceTracingStackTraces(TestCase):
         )
 
         expected = {
-            "cpp_fused_mul_relu_sigmoid_threshold_backward_0:2": [
+            "cpp_fused_mul_0:2": [
                 "d = a * 3.14",
+            ],
+            "cpp_fused_gelu_relu_sigmoid_threshold_backward_1:4": [
+                "z = torch.nn.functional.gelu(y)",
                 "x = self.relu(x)",
                 "x = self.sigmoid(x)",
-            ],
-            "cpp_fused_gelu_1:4": [
-                "z = torch.nn.functional.gelu(y)",
             ],
             "extern_kernels.addmm:1": [
                 "x = self.fc1(x)",
