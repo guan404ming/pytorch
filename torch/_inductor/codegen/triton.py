@@ -3183,9 +3183,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # before kernel launch instead of every CTA calling
         # tl.make_tensor_descriptor() (fixes issue #185819).
         self.host_tma_descriptor_args: dict[str, TensorDescriptorOptions] = {}
-        # Buffers that have any non-TMA access (pointer arithmetic, non-zero
-        # offset) and cannot be replaced with host-side TMA descriptors.
-        self._host_tma_ineligible: OrderedSet[str] = OrderedSet()
+        # Vars whose access the host launcher cannot materialize a
+        # TensorDescriptor for (indirect/ModularIndexing indexing, non-zero
+        # offset, misalignment, complex block shape, or >1 read). This is NOT
+        # a TMA eligibility check -- such accesses may still be device-TMA
+        # eligible; eligibility is decided by TMACompatibilityChecker.
+        self._host_tma_non_materializable: OrderedSet[str] = OrderedSet()
+        # True once any access in this kernel is emitted as a device-side TMA
+        # descriptor (tl.make_tensor_descriptor). Used after codegen to decide
+        # whether tma_min_block_sizes constraints are still relevant.
+        self._emitted_device_tma = False
         self.hint_override = hint_override
         self._load_counts: collections.Counter[str] = collections.Counter()
         self._pdl_load_index = 0
@@ -3270,15 +3277,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return any(stride == 1 for stride in stride_vars)
 
     @staticmethod
-    def _is_host_tma_eligible(
+    def _is_host_tma_materializable(
         indexing: TensorDescriptorOptions,
         dtype: torch.dtype | None = None,
     ) -> bool:
-        """Check if an access pattern is eligible for host-side TMA.
+        """Whether the host launcher can materialize a TensorDescriptor for
+        this access. This is NOT a TMA eligibility (possibility) check --
+        eligibility is decided by TMACompatibilityChecker.
 
-        Rejects:
-        - Complex block shape expressions (floor division, etc.)
-        - Sub-byte dtypes (i1/bool) that TMA can't handle
+        Returns False when:
+        - the block_shape contains non-trivial expressions (e.g. the nested
+          min/max clamps produced by a transpose/reshape) that can't be
+          resolved to concrete host-side dims, or
+        - the dtype is sub-byte i1/bool (no CUtensorMap mapping).
         """
         if dtype is not None and dtype == torch.bool:
             return False
@@ -3290,15 +3301,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return False
         return True
 
-    def _prescan_host_tma_eligibility(self) -> None:
-        """Pre-scan all buffer reads to identify those with non-block-ptr access.
+    def _prescan_host_tma_materializability(self) -> None:
+        """Pre-scan all buffer reads to find those the host launcher cannot
+        materialize a TMA descriptor for.
 
-        Populates _host_tma_ineligible_buffers (buffer names) with buffers
-        that have any read which can't be expressed as a block pointer.
-        During codegen, load() maps these names to var names and adds them
-        to _host_tma_ineligible.
+        Populates _host_tma_non_materializable_buffers (buffer names) with
+        buffers whose reads can't be expressed as a single host-side block
+        descriptor: indirect (TMP) indexing, FloorDiv/ModularIndexing access,
+        or (conservatively) more than one read. During codegen, load() maps
+        these names to var names and adds them to _host_tma_non_materializable.
+
+        Non-materializable means "the host can't build the descriptor", not
+        "TMA is impossible" -- such accesses may still be device-TMA eligible.
         """
-        self._host_tma_ineligible_buffers = set()
+        self._host_tma_non_materializable_buffers = set()
         if not (config.triton.enable_host_side_tma or config.triton.use_tensor_descriptor):
             return
         if not hasattr(self, "features") or not hasattr(self.features, "node_schedule"):
@@ -3321,31 +3337,31 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             for dep in node.read_writes.reads:
                 if not hasattr(dep, "var_names"):
                     if hasattr(dep, "name"):
-                        self._host_tma_ineligible_buffers.add(dep.name)
+                        self._host_tma_non_materializable_buffers.add(dep.name)
                     continue
                 buffer_read_indices[dep.name].append((dep.index, dep.var_names))
 
         for buf_name, reads in buffer_read_indices.items():
-            if buf_name in self._host_tma_ineligible_buffers:
+            if buf_name in self._host_tma_non_materializable_buffers:
                 continue
 
             for index, var_names in reads:
                 dep_vars = set(var_names)
 
                 if any(symbol_is_type(s, SymT.TMP) for s in index.free_symbols):
-                    self._host_tma_ineligible_buffers.add(buf_name)
+                    self._host_tma_non_materializable_buffers.add(buf_name)
                     break
 
                 for expr_node in sympy.preorder_traversal(index):
                     if isinstance(expr_node, (FloorDiv, ModularIndexing)):
                         if expr_node.free_symbols & dep_vars:
-                            self._host_tma_ineligible_buffers.add(buf_name)
+                            self._host_tma_non_materializable_buffers.add(buf_name)
                             break
                 else:
                     continue
                 break
 
-            if buf_name in self._host_tma_ineligible_buffers:
+            if buf_name in self._host_tma_non_materializable_buffers:
                 continue
 
             # Multiple reads from the same buffer may have different access
@@ -3353,7 +3369,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # compatibility until codegen runs, conservatively mark buffers
             # with >1 read as ineligible.
             if len(reads) > 1:
-                self._host_tma_ineligible_buffers.add(buf_name)
+                self._host_tma_non_materializable_buffers.add(buf_name)
 
     def _check_buffer_alignment(self, name: str, var: str, dtype: torch.dtype) -> bool:
         """Check if a buffer has a misaligned layout offset that prevents TMA use.
@@ -3374,7 +3390,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 if layout_offset != 0:
                     offset_bytes = int(layout_offset) * dtype.itemsize
                     if offset_bytes % 16 != 0:
-                        self._host_tma_ineligible.add(var)
+                        self._host_tma_non_materializable.add(var)
                         self.host_tma_descriptor_args.pop(var, None)
                         return True
         except (TypeError, ValueError):
@@ -4047,8 +4063,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 and use_tma
                 and not indexing.can_lift
                 and indexing.constant_offset == 0
-                and var not in self._host_tma_ineligible
-                and self._is_host_tma_eligible(indexing, V.graph.get_dtype(name))
+                and var not in self._host_tma_non_materializable
+                and self._is_host_tma_materializable(
+                    indexing, V.graph.get_dtype(name)
+                )
             ):
                 if var not in self.host_tma_descriptor_args:
                     self.host_tma_descriptor_args[var] = indexing
@@ -4060,11 +4078,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 and indexing.constant_offset != 0
             ):
                 # Non-zero offset access — this buffer can't be host-side TMA
-                self._host_tma_ineligible.add(var)
+                self._host_tma_non_materializable.add(var)
                 if var in self.host_tma_descriptor_args:
                     del self.host_tma_descriptor_args[var]
             # ── end host-side TMA fast path ──────────────────────────────
 
+            # Reaching here with a TensorDescriptorOptions means the host fast
+            # path did not claim this access (host-non-materializable), so it
+            # is emitted as a device-side TMA descriptor below.
+            self._emitted_device_tma = True
 
         else:
             if not check:
@@ -4373,16 +4395,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         uses_uint8_storage = use_uint8_triton_storage_for_cuda_float8_e4m3fn(dtype, var)
 
         # Apply pre-scan results: if the buffer was identified as having
-        # non-block-ptr reads, mark the var as ineligible for host-side TMA.
-        if not hasattr(self, "_host_tma_ineligible_buffers"):
-            self._prescan_host_tma_eligibility()
-        prescan_ineligible = name in self._host_tma_ineligible_buffers
-        if prescan_ineligible:
-            self._host_tma_ineligible.add(var)
+        # reads the host launcher can't materialize a descriptor for, mark
+        # the var as non-materializable for host-side TMA.
+        if not hasattr(self, "_host_tma_non_materializable_buffers"):
+            self._prescan_host_tma_materializability()
+        prescan_non_materializable = (
+            name in self._host_tma_non_materializable_buffers
+        )
+        if prescan_non_materializable:
+            self._host_tma_non_materializable.add(var)
 
         buffer_misaligned = self._check_buffer_alignment(name, var, dtype)
 
-        skip_tma = buffer_misaligned or prescan_ineligible
+        skip_tma = buffer_misaligned or prescan_non_materializable
         tma_checker = (
             None if skip_tma
             else self.tma_compatibility_checker_cls(
@@ -4506,13 +4531,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     for_store=False,
                 )
             elif is_sympy_integer_like(original_index):
-                self._host_tma_ineligible.add(var)
+                self._host_tma_non_materializable.add(var)
                 self.host_tma_descriptor_args.pop(var, None)
                 line = f"tl.load({var} + ({original_index}))"
                 append_broadcast = indexing.expand_str
                 shape = ()
             else:
-                self._host_tma_ineligible.add(var)
+                self._host_tma_non_materializable.add(var)
                 self.host_tma_descriptor_args.pop(var, None)
                 line = f"tl.load({var} + ({indexing.index_str}), {indexing.mask_str}{ep}{other}{cachemod})"
 
@@ -4620,7 +4645,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             isinstance(indexing, TensorDescriptorOptions)
             and config.triton.enable_host_side_tma
             and not config.triton.use_tensor_descriptor
-            and not self._is_host_tma_eligible(indexing, dtype)
+            and not self._is_host_tma_materializable(indexing, dtype)
         ):
             indexing = self.indexing(
                 index,
@@ -4670,7 +4695,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 ):
                     value_shape = ", ".join(map(str, value.shape))
                     indexing_str += f".broadcast_to({value_shape})"
-            self._host_tma_ineligible.add(var)
+            self._host_tma_non_materializable.add(var)
             self.host_tma_descriptor_args.pop(var, None)
             line = f"tl.store({var} + ({indexing_str}), {value}, {indexing.mask_str})"
         elif mode == "atomic_add":
@@ -6861,7 +6886,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.inductor_meta = inductor_meta
 
         self.codegen_prologue(self.body)
-        self._prescan_host_tma_eligibility()
+        self._prescan_host_tma_materializability()
         self.codegen_body()
 
         # After codegen_body, host_tma_descriptor_args may have been pruned
@@ -6881,12 +6906,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         elif "host_tma_descriptor_args" in self.inductor_meta:
             del self.inductor_meta["host_tma_descriptor_args"]
 
-        # If no buffers use host-side TMA and device-side TMA is off,
-        # clear tma_min_block_sizes to avoid overly aggressive config filtering.
+        # Clear tma_min_block_sizes when this kernel emitted no TMA descriptor
+        # (neither host- nor device-side). The constraint is set during TMA
+        # compatibility probing (are_block_parameters_compatible), which fires
+        # even when the access ultimately falls back to a plain tl.load (e.g.
+        # looping reductions). A stale constraint over-filters the autotune
+        # config space and can severely regress otherwise non-TMA kernels.
         if (
-            config.triton.enable_host_side_tma
-            and not config.triton.use_tensor_descriptor
-            and not self.inductor_meta.get("host_tma_descriptor_args")
+            not self.inductor_meta.get("host_tma_descriptor_args")
+            and not self._emitted_device_tma
         ):
             self.inductor_meta.pop("tma_min_block_sizes", None)
 
