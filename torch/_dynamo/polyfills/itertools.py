@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "accumulate",
+    "combinations",
     "combinations_with_replacement",
     "compress",
     "cycle",
