@@ -197,7 +197,7 @@ class TORCH_API StaticRuntimeMetadata : public torch::CustomClassHolder {
   StaticModuleOptions opts_;
 };
 
-/// The static runime supports two execution modes.
+/// The static runtime supports two execution modes.
 ///
 /// Mode 1: single-threaded with no parallelism except for intra-op parallelism
 /// For this mode, you can do either:
@@ -1112,6 +1112,12 @@ class TORCH_API StaticRuntime {
   class IValueArray {
    public:
     IValueArray() = default;
+    IValueArray(const IValueArray&) = delete;
+    IValueArray& operator=(const IValueArray&) = delete;
+
+    IValueArray(IValueArray&&) noexcept = default;
+    IValueArray& operator=(IValueArray&&) noexcept = default;
+
     explicit IValueArray(size_t size) : array_(size) {}
 
     IValue* data() {
