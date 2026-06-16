@@ -1898,6 +1898,8 @@ coverage_ignore_classes = [
     # torch.torch_version
     "TorchVersion",
     # torch.types
+    "SymBool",
+    "SymFloat",
     "SymInt",
     # torch.utils.benchmark.examples.compare
     "FauxTorch",
