@@ -79,7 +79,7 @@ def _adjust_lr(lr: float, adjust_lr_fn: str | None, param_shape: torch.Size) -> 
         adjusted_ratio = math.sqrt(max(1, A / B))
     elif adjust_lr_fn == "match_rms_adamw":
         adjusted_ratio = 0.2 * math.sqrt(max(A, B))
-    elif adjust_lr_fn == "spectral":
+    elif adjust_lr_fn == "spectral_unclamped":
         adjusted_ratio = math.sqrt(A / B)
     else:
         adjusted_ratio = 1.0
@@ -110,7 +110,7 @@ class Muon(Optimizer):
         if adjust_lr_fn is not None and adjust_lr_fn not in [
             "original",
             "match_rms_adamw",
-            "spectral",
+            "spectral_unclamped",
         ]:
             raise ValueError(
                 f"Adjust learning rate function {adjust_lr_fn} is not supported"
@@ -255,11 +255,11 @@ Muon.__doc__ = (
     and weight decay tuned for AdamW.
 
     Jeremy Bernstein in `Deriving Muon`_ proposes a scaling condition on the spectral norm, which
-    scales the update by :math:`\sqrt{\frac{A}{B}}`. This is similar to the "original" implementation
-    but removes clamping down to 1.
+    scales the update by :math:`\sqrt{\frac{A}{B}}`. This is similar to the "original" Keller's
+    implementation but removes clamping down to 1.
 
     We provide these options for the learning rate adjustment: "original", which follows Keller's
-    implementation, "match_rms_adamw", which refers to Moonshot's implementation, and "spectral",
+    implementation, "match_rms_adamw", which refers to Moonshot's implementation, and "spectral_unclamped",
     which matches Bernstein's implementation. If `adjust_lr_fn` is not specified, the default is "original".
 
     For further details regarding the algorithm we refer to `Muon: An optimizer for hidden layers in neural networks`_,
@@ -278,7 +278,7 @@ Muon.__doc__ = (
             Newton–Schulz orthogonalization polynomial (default: ({DEFAULT_A}, {DEFAULT_B}, {DEFAULT_C}))
         eps (float, optional): term added to the denominator for numerical stability. (default: {EPS})
         ns_steps (int, optional): number of Newton–Schulz iteration steps. (default: {DEFAULT_NS_STEPS})
-        adjust_lr_fn (str, optional): function to adjust learning rate. One of "original", "match_rms_adamw", and "spectral".
+        adjust_lr_fn (str, optional): function to adjust learning rate. One of "original", "match_rms_adamw", and "spectral_unclamped".
             If not specified, we will default to use "original". (default: None)
 
     Example:
