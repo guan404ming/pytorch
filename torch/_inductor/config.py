@@ -12,6 +12,7 @@ from torch.utils._config_module import (
     inherit_fields_from,
     install_config_module,
 )
+from torch.utils._ordered_set import OrderedSet
 
 
 if TYPE_CHECKING:
@@ -1892,6 +1893,12 @@ class triton:
 
     # Synchronize before and after every compiled graph.
     debug_sync_graph = False
+
+    # Synchronize after compiled graph returns for given training phases.
+    # None means disabled; e.g. {"backward"} to sync only the backward graph.
+    # Valid phases: "inference", "forward", "backward".
+    # Python wrapper only; cpp_wrapper graphs do not honor this.
+    debug_sync_graph_phases: OrderedSet[str] | None = None
 
     # Synchronize after every kernel launch, to help pinpoint bugs
     debug_sync_kernel = False

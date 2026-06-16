@@ -1990,6 +1990,11 @@ class PythonWrapperCodegen(CodeGen):
                 self.wrapper_call.writeline("assert not var.isinf().any().item()")
                 self.wrapper_call.do_unindent(2)
 
+            sync_phases = config.triton.debug_sync_graph_phases
+            if sync_phases is not None and V.graph.device_type in ("cuda", "xpu"):
+                if V.graph.get_training_phase() in sync_phases:
+                    self.wrapper_call.writeline(V.graph.device_ops.synchronize())
+
             self.wrapper_call.writeline("return (" + ", ".join(output_refs) + ", )")
         else:
             self.wrapper_call.writeline("return ()")
