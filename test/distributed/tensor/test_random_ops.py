@@ -24,7 +24,11 @@ from torch.distributed.tensor._random import (
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
-from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     create_local_tensor_test_class,
     DTensorTestBase,
@@ -41,6 +45,14 @@ def get_generator_seed_for_device_type(device_type: str):
     )
 
     return _get_seed(device_type)
+
+
+def _run_uniform_op(dtensor: DTensor, uniform_op: str) -> DTensor:
+    if uniform_op == "inplace":
+        return dtensor.uniform_(0, 1)
+    if uniform_op == "functional":
+        return torch.ops.aten.uniform.default(dtensor, 0, 1)
+    raise AssertionError(f"Unexpected uniform op: {uniform_op}")
 
 
 class DistTensorRandomInitTest(DTensorTestBase):
@@ -589,7 +601,8 @@ class DistTensorRandomOpTest(DTensorTestBase):
 
     @with_comms
     @skip_if_lt_x_gpu(4)
-    def test_deterministic_uniform_2d(self):
+    @parametrize("uniform_op", ["inplace", "functional"])
+    def test_deterministic_uniform_2d(self, uniform_op):
         mesh = torch.arange(self.world_size).reshape(2, 2)
         device_mesh = DeviceMesh(self.device_type, mesh)
         dtensor = distribute_tensor(
@@ -627,8 +640,7 @@ class DistTensorRandomOpTest(DTensorTestBase):
         for placements, shard_index in zip(placements_list, shard_index_list):
             dtensor = dtensor.redistribute(device_mesh, placements)
 
-            # random op call
-            dtensor.uniform_(0, 1)
+            dtensor = _run_uniform_op(dtensor, uniform_op)
 
             # check shard information is correct
             shard_coord = [
@@ -892,11 +904,12 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
 
     @with_comms
     @skip_unless_torch_gpu
-    def test_compile_uniform_(self):
+    @parametrize("uniform_op", ["inplace", "functional"])
+    def test_compile_uniform(self, uniform_op):
         device_mesh = self.build_device_mesh()
 
         def fn(x):
-            return x.uniform_(0.0, 1.0)
+            return _run_uniform_op(x, uniform_op)
 
         for placements in ([Shard(0)], [Replicate()]):
             self._test_compile_random_op(fn, device_mesh, placements=placements)
@@ -1029,6 +1042,10 @@ class DistTensorRandomOpsTest3D(DTensorTestBase):
                     )
 
         compute_rankwise_if_local_tensor(weight_local, self.rank)
+
+
+instantiate_parametrized_tests(DistTensorRandomOpTest)
+instantiate_parametrized_tests(DistTensorRandomOpCompileTest)
 
 
 DistTensorRandomInitTestWithLocalTensor = create_local_tensor_test_class(

@@ -13,12 +13,12 @@ from torch.distributed.tensor.placement_types import Placement
 aten = torch.ops.aten
 
 
-def _random_inplace_single_dim_strategy(
+def _input_sharding_preserving_random_single_dim_strategy(
     op: OpOverload,
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
-    """Single-dim strategy for in-place random ops (single tensor input, output follows input).
+    """Single-dim strategy for random ops whose outputs follow the input.
 
     No Partial inputs: random sampling on partial tensors is undefined.
     """
@@ -35,10 +35,11 @@ def _random_inplace_single_dim_strategy(
     return placements
 
 
-# In-place random sampling ops: output follows input sharding exactly.
-_inplace_random_ops = [
+# Random sampling ops whose tensor outputs follow input sharding exactly.
+_input_sharding_preserving_random_ops = [
     aten.normal_.default,
     aten.uniform_.default,
+    aten.uniform.default,
     aten.native_dropout.default,
     aten.bernoulli_.float,
     aten.bernoulli.default,
@@ -47,9 +48,9 @@ _inplace_random_ops = [
     aten.geometric_.default,
 ]
 
-for _op in _inplace_random_ops:
+for _op in _input_sharding_preserving_random_ops:
     register_single_dim_strategy(_op, allow_uneven_sharding=True)(
-        _random_inplace_single_dim_strategy
+        _input_sharding_preserving_random_single_dim_strategy
     )
 
 

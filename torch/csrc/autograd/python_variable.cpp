@@ -1354,6 +1354,7 @@ static bool is_random_op(const c10::OperatorHandle& op) {
       "normal_",
       "rand_like",
       "randn_like",
+      "uniform",
       "uniform_",
       "bernoulli",
   });
