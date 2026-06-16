@@ -377,8 +377,13 @@ def _expand_dict_returning_deps(
     Python dict, corrupting every user that expected an FX Node.
 
     To avoid this, we insert ``operator.getitem`` nodes *before* the sync for
-    each after-sync getitem user, so that only plain tensor nodes are passed
-    through ``control_deps``.
+    each after-sync getitem user, so that only tensor-valued nodes are passed
+    through ``control_deps``.  The dict node may still appear in
+    ``additional_deps`` (ordering-only) which is safe since that tuple is
+    never decomposed.
+
+    More generally, any dep whose value is replaced by a non-Node Python
+    container in a later pass needs this treatment.
     """
     expanded: list[Node] = []
     for dep in deps:

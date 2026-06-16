@@ -785,6 +785,15 @@ def check_shape(
         buffer.writeline(f"tl.static_assert({var}.shape == ({shape_str}))")
 
 
+def check_nan(buffer: IndentedBuffer, var: CSEVariableType) -> None:
+    backend = get_current_backend()
+    if backend == "triton":
+        msg = "NaN or Inf found"
+        buffer.writeline(
+            f"tl.device_assert(({var} == {var}) & ({var} != float('inf')) & ({var} != float('-inf')), '{msg}')"
+        )
+
+
 class DataTypePropagation:
     def __init__(self, body: LoopBody) -> None:
         self.body = body
