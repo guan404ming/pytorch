@@ -12,7 +12,7 @@ from typing import cast, TYPE_CHECKING
 if TYPE_CHECKING:
     import os
 
-from . import _cupti_monitor as _mon
+from .cupti_python import Driver_api_trace_cbid, Runtime_api_trace_cbid
 
 
 # Matches the value Kineto uses to round the trace base time down to a ~3-month
@@ -46,7 +46,6 @@ _MEMORY_KIND_NAMES = {
 
 _FLOW_CATEGORY = "ac2g"
 _OVERHEAD_PID = -1
-_USER_EXTERNAL_CORRELATION_KIND: int | None = None
 _RUNTIME_CBID_NAMES: dict[int, str] | None = None
 _DRIVER_CBID_NAMES: dict[int, str] | None = None
 _RUNTIME_BLOCKLIST = {
@@ -82,13 +81,6 @@ _DRIVER_FLOW_NAMES = {
     "cuLaunchKernel",
     "cuLaunchKernelEx",
 }
-
-
-def _ensure_cupti_python_bindings() -> None:
-    global _USER_EXTERNAL_CORRELATION_KIND
-    cc = _mon._require_cupti_python()
-    if _USER_EXTERNAL_CORRELATION_KIND is None:
-        _USER_EXTERNAL_CORRELATION_KIND = int(cc.ExternalCorrelationKind.CUSTOM1)
 
 
 def _default_base_ns() -> int:
@@ -178,23 +170,21 @@ def _load_cbid_names(enum_cls) -> dict[int, str]:
             prefix, maybe_version = normalized.rsplit("_v", 1)
             if maybe_version.isdigit():
                 normalized = prefix
-        names[int(member.value)] = normalized
+        names[member.value] = normalized
     return names
 
 
 def _runtime_cbid_name(cbid: int) -> str:
     global _RUNTIME_CBID_NAMES
-    cc = _mon._require_cupti_python()
     if _RUNTIME_CBID_NAMES is None:
-        _RUNTIME_CBID_NAMES = _load_cbid_names(cc.Runtime_api_trace_cbid)
+        _RUNTIME_CBID_NAMES = _load_cbid_names(Runtime_api_trace_cbid)
     return _RUNTIME_CBID_NAMES.get(cbid, f"cbid_{cbid}")
 
 
 def _driver_cbid_name(cbid: int) -> str:
     global _DRIVER_CBID_NAMES
-    cc = _mon._require_cupti_python()
     if _DRIVER_CBID_NAMES is None:
-        _DRIVER_CBID_NAMES = _load_cbid_names(cc.Driver_api_trace_cbid)
+        _DRIVER_CBID_NAMES = _load_cbid_names(Driver_api_trace_cbid)
     return _DRIVER_CBID_NAMES.get(cbid, f"cbid_{cbid}")
 
 
@@ -465,6 +455,17 @@ def _trace_window_entries(
                 args["value"] = _as_int(event["value"])
                 args["memory kind"] = _as_int(event["memory_kind"])
                 args["flags"] = _as_int(event["flags"])
+            elif kind == "kernel":
+                # Launch config, kineto-compatible arg names.
+                args["grid"] = event.get("grid")
+                args["block"] = event.get("block")
+                args["registers per thread"] = _as_int(
+                    event.get("registers_per_thread", 0)
+                )
+                args["shared memory"] = _as_int(
+                    event.get("static_shared_memory", 0)
+                ) + _as_int(event.get("dynamic_shared_memory", 0))
+                args["priority"] = _as_int(event.get("priority", 0))
 
         ts_us = max((_as_int(event["start_ns"]) - base_ns) / 1000.0, 0.0)
         dur_us = max(
@@ -513,19 +514,22 @@ def _gpu_user_annotation_events(
     *,
     base_ns: int,
 ) -> list[dict[str, object]]:
-    _ensure_cupti_python_bindings()
     user_annotations = trace_window.get("user_annotations", {})
     if not isinstance(user_annotations, dict) or not user_annotations:
         return []
     trace_window_events = cast(list[dict[str, object]], trace_window["events"])
 
+    # The monitor is the sole external-correlation pusher, so every record is ours;
+    # the `external_id in user_annotations` check below already scopes to the ids we
+    # pushed for named regions -- no kind filtering needed. `user_external_id` is the
+    # innermost ENCLOSING named-region id resolved at decode via the monitor's
+    # active-id chain (so a kernel nested below a region -- e.g. a collective -- maps
+    # to that region); it falls back to the raw innermost external_id when not nested.
     correlation_to_user_external: dict[int, int] = {}
     for event in trace_window_events:
         if event.get("kind") != "external_correlation":
             continue
-        if _as_int(event.get("external_kind", 0)) != _USER_EXTERNAL_CORRELATION_KIND:
-            continue
-        external_id = _as_int(event.get("external_id", 0))
+        external_id = _as_int(event.get("user_external_id", event.get("external_id", 0)))
         correlation_id = _as_int(event.get("correlation_id", 0))
         if external_id in user_annotations and correlation_id != 0:
             correlation_to_user_external[correlation_id] = external_id
