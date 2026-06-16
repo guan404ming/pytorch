@@ -1091,7 +1091,7 @@ class Loops(IRNode):
             self.inner_fn, *self.inner_fn_args()
         )
 
-    def has_large_inner_fn(self, threshold: int | None = None) -> bool:
+    def get_realize_opcount_threshold(self, threshold: int | None = None) -> int:
         if threshold is None:
             threshold = 0
         realize_opcount_threshold = config.realize_opcount_threshold
@@ -1105,8 +1105,12 @@ class Loops(IRNode):
                 raise AssertionError(
                     f"expected int realize_opcount_threshold, got {type(realize_opcount_threshold)}"
                 )
-        threshold = max(threshold, realize_opcount_threshold)
-        return self.inner_fn_opcount().num_ops > threshold
+        return max(threshold, realize_opcount_threshold)
+
+    def has_large_inner_fn(self, threshold: int | None = None) -> bool:
+        return self.inner_fn_opcount().num_ops > self.get_realize_opcount_threshold(
+            threshold
+        )
 
     def inner_fn_free_symbols(self, unbacked_only: bool = False) -> OrderedSet[Symbol]:
         index = self._index(self.ranges)
@@ -4473,7 +4477,7 @@ class Layout(OutputSpec):
         if len(self.stride) != len(order):
             raise AssertionError("Expected len(self.stride) == len(order)")
 
-        # ignore dimensions of size 1, they dont affect layout
+        # ignore dimensions of size 1, they don't affect layout
         non_1_indices = [
             i
             for i, dim in enumerate(self.size)
@@ -8406,6 +8410,7 @@ class UserDefinedTritonKernel(ExternKernel):
             reset_to_zero_args,
             self.grid,
             epilogue_fusion,
+            self.launch_kwargs,
         )
         named_args = {
             k: self.get_kwargs_value(k) for k in self.ordered_kwargs_for_cpp_kernel
@@ -8492,6 +8497,7 @@ class UserDefinedTritonKernel(ExternKernel):
         grid: Any,
         tma_descriptor_metadata: dict[str, Any],
         kernel_args: dict[str, Any],
+        launch_kwargs: tuple[str, ...],
     ) -> None:
         inputs: list[IRNode] = []
         kwargs: dict[str, IRNode] = {}
@@ -8523,6 +8529,7 @@ class UserDefinedTritonKernel(ExternKernel):
         )
         self.kernel_idx = kernel_idx
         self.grid = grid
+        self.launch_kwargs = launch_kwargs
 
         kernel, configs, _, _ = self.get_kernel_and_metadata()
 
@@ -9907,7 +9914,7 @@ class MemoryCheckKernel(FallbackKernel):
         dead_repr = repr(dead_list)
         if is_final_step:
             wrapper.writeline(
-                "# note: dont currently distinguish between buffers returned and dealloc'd in last step"
+                "# note: don't currently distinguish between buffers returned and dealloc'd in last step"
             )
             call = f"check_memory_step(allocated={alive_repr}, freed={dead_repr}, is_final_step={is_final_step})"
         else:
@@ -10453,6 +10460,14 @@ class StorageBox(MutableBox):
                     "tanh",
                 ]
                 if any(x in opcount.used_ops for x in heavy_ops):
+                    return True
+                realize_threshold = self.data.get_realize_opcount_threshold()
+                if (
+                    isinstance(self.data, Pointwise)
+                    and graph_reuse
+                    and users > config.realize_opusers_threshold
+                    and opcount.num_ops > max(0, realize_threshold - 2)
+                ):
                     return True
             if self.has_large_inner_fn():
                 return True

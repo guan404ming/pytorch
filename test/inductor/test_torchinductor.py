@@ -2325,13 +2325,15 @@ class CommonTemplate:
         triton reduction configs for large size hints. #128826 introduced a scaling XBLOCK
         feature to resolve the issue in reduction configs which may exceed the maxGridSize
         """
+        from torch._inductor.runtime.hints import get_warp_size
         from torch._inductor.runtime.runtime_utils import next_power_of_2
         from torch._inductor.runtime.triton_heuristics import triton_config_reduction
 
+        warp_size = get_warp_size(torch.device(self.device))
         size_hints = {"x": 67108864, "r0_": 8192}
         for _ in range(4):
             size_hints["x"] = next_power_of_2(size_hints["x"])
-            triton_config_reduction(size_hints, 1, 2048, 1, 8)
+            triton_config_reduction(size_hints, 1, 2048, 1, 8, warp_size=warp_size)
 
     def test_prod(self):
         def fn(a):
@@ -8189,24 +8191,18 @@ for dtype in (torch.int32, torch.int64):
             atol = 5e-4
             rtol = 3e-4
 
-        # MPS has correctness problem before MacOS15
-        with (
-            contextlib.nullcontext()
-            if self.device != "mps" or MACOS_VERSION >= 15.0
-            else self.assertRaises(AssertionError)
-        ):
-            self.common(
-                fn,
-                (
-                    torch.randn(256, 256),
-                    torch.randn(256, 1024),
-                    torch.randn(1024, 1600),
-                    torch.randn(100, 256),
-                ),
-                atol=atol,
-                rtol=rtol,
-                check_lowp=False,  # accuracy issues with relatively large matmuls
-            )
+        self.common(
+            fn,
+            (
+                torch.randn(256, 256),
+                torch.randn(256, 1024),
+                torch.randn(1024, 1600),
+                torch.randn(100, 256),
+            ),
+            atol=atol,
+            rtol=rtol,
+            check_lowp=False,  # accuracy issues with relatively large matmuls
+        )
 
     @skip_if_gpu_halide
     # Constant folding was explicitly turned off due to issue #108388
@@ -12787,7 +12783,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_cuda
     def test_max_min_bool(self):
         # Regression test for https://github.com/pytorch/pytorch/issues/174069
-        # max/min on boolean tensors returned incorrect indices in Triton
+        # and https://github.com/pytorch/pytorch/issues/184893
+        # max/min on boolean tensors returned incorrect indices on Triton and CPU.
         def fn(x):
             return (
                 x.max(0),
@@ -12796,17 +12793,28 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 x.min(1),
             )
 
-        # Unrolled reduction
-        t1 = torch.randint(2, size=(6, 6), dtype=torch.bool)
-        self.common(fn, (t1,))
+        # Use deterministic seeds since the exact index values depend on
+        # which duplicate True/False row is selected when ties are broken.
+        shapes = [
+            (2, 32),  # Minimal CPU repro from #184893
+            (7, 32),  # CPU repro from #184893
+            (6, 6),  # Unrolled reduction
+            (32, 32),  # Persistent reduction
+            (1028, 1028),  # Non-persistent reduction
+        ]
+        for i, shape in enumerate(shapes, start=2):
+            torch.manual_seed(i)
+            t1 = torch.randint(2, size=shape, dtype=torch.bool)
+            self.common(fn, (t1,))
 
-        # Persistent reduction
-        t1 = torch.randint(2, size=(32, 32), dtype=torch.bool)
-        self.common(fn, (t1,))
+    def test_max_min_bool_keepdim(self):
+        # keepdim=True variant -- second reproducer from #184893
+        def fn(x):
+            return x.min(1, keepdim=True)[1]
 
-        # Non-persistent reduction
-        t1 = torch.randint(2, size=(1028, 1028), dtype=torch.bool)
-        self.common(fn, (t1,))
+        torch.manual_seed(184893)
+        t = torch.randint(2, size=(4, 8, 32), dtype=torch.bool)
+        self.common(fn, (t,))
 
     def test_conv_backward(self):
         def fn(rank4_inps, rank3_inps, rank5_inps):
@@ -15952,6 +15960,26 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         with self.assertRaises(RuntimeError):
             torch.compile(fn)(x, source)
 
+    @parametrize("inplace", [False, True])
+    def test_index_add_source_shape_mismatch(self, inplace):
+        def fn(x, source):
+            index = torch.arange(source.numel(), device=x.device)
+            if inplace:
+                x = x.clone()
+                x.index_add_(0, index, source)
+                return x
+            return torch.index_add(x, 0, index, source)
+
+        x = torch.randn(10, 5, device=self.device)
+        source = torch.randn(5, device=self.device)
+        msg = "source tensor shape must match self tensor shape"
+
+        with self.assertRaisesRegex(RuntimeError, msg):
+            fn(x, source)
+
+        with self.assertRaisesRegex(RuntimeError, msg):
+            torch.compile(fn)(x, source)
+
     @skip_if_gpu_halide  # cuda error
     def test_mutations_loop_fusion(self):
         def fn(tensor, index, source):
@@ -18472,6 +18500,36 @@ if RUN_CPU:
     class CpuTests(TestCase):
         common = check_model
         device = "cpu"
+
+        def test_uint8_abs_codegen_issue_187018(self):
+            """
+            Ensures torch.compile does not emit std::abs or .abs() for unsigned integers,
+            which causes implicit promotion to signed int and downstream miscompilation.
+            """
+            from torch._inductor.utils import run_and_get_cpp_code
+            from torch.testing import FileCheck
+
+            def f(x):
+                y = -x.abs()
+                return torch.cat([y, y]).sum()
+
+            # Small tensor triggers the scalar codegen path
+            x_scalar = torch.tensor([200, 200], dtype=torch.uint8)
+            # Large tensor (>= 256) triggers the vectorized codegen path
+            x_vec = torch.full((256,), 200, dtype=torch.uint8)
+
+            opt_f = torch.compile(f)
+
+            # 1. Numeric equivalence tests
+            self.assertEqual(opt_f(x_scalar), f(x_scalar))
+            self.assertEqual(opt_f(x_vec), f(x_vec))
+
+            # 2. FileCheck tests to strictly guarantee bypass in generated C++
+            _, code_scalar = run_and_get_cpp_code(opt_f, x_scalar)
+            FileCheck().check_not("std::abs(").run(code_scalar)
+
+            _, code_vec = run_and_get_cpp_code(opt_f, x_vec)
+            FileCheck().check_not(".abs()").run(code_vec)
 
     copy_tests(CommonTemplate, CpuTests, "cpu")
 
