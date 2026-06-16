@@ -1026,6 +1026,47 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @skipIfNoCuteDSL
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
+    def test_baddbmm_matrix_dim_broadcast_bias_compiled_matches_reference(self):
+        batch, m, n, k = 2, 128, 192, 64
+        a = torch.randn(batch, m, k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(batch, k, n, device="cuda", dtype=torch.bfloat16)
+        bias_cases = (
+            ("row_1d", torch.randn(n, device="cuda", dtype=torch.bfloat16)),
+            ("row_2d", torch.randn(1, n, device="cuda", dtype=torch.bfloat16)),
+            ("col_2d", torch.randn(m, 1, device="cuda", dtype=torch.bfloat16)),
+        )
+
+        def epilogue_fn(acc):
+            return acc.relu()
+
+        for name, bias in bias_cases:
+            with self.subTest(name=name):
+                actual = torch.compile(flex_gemm, backend="inductor", fullgraph=True)(
+                    torch.baddbmm,
+                    (bias, a, b),
+                    epilogue_fn,
+                    gemm_kwargs={"beta": 0.5, "alpha": 1.5},
+                    kernel_options={"backend": "QUACK"},
+                )
+
+                self.assertMatchesLowPrecisionEager(
+                    actual,
+                    epilogue_fn(torch.baddbmm(bias, a, b, beta=0.5, alpha=1.5)),
+                    epilogue_fn(
+                        torch.baddbmm(
+                            bias.double(),
+                            a.double(),
+                            b.double(),
+                            beta=0.5,
+                            alpha=1.5,
+                        )
+                    ),
+                    k,
+                )
+
+    @skipIfNoCuteDSL
+    @unittest.skipIf(not TEST_CUDA, "CUDA required")
+    @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_bmm_generated_code_calls_flex_gemm_adapter(self):
         def epilogue_fn(acc):
             return acc.relu()
