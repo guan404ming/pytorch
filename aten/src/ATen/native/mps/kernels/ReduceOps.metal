@@ -95,6 +95,12 @@ kernel void norm(
     } else if (p == 0) {
       output_val += (input_abs == 0) ? 0 : 1;
 
+    } else if (p == 1) {
+      output_val += input_abs;
+
+    } else if (p == 2) {
+      output_val += input_abs * input_abs;
+
     } else {
       output_val += static_cast<TA>(::precise::pow(input_abs, p));
     }
@@ -150,7 +156,9 @@ kernel void norm(
     }
 
     if (p != 0 && p != 1 && p != INFINITY && p != -INFINITY) {
-      output_val = static_cast<TA>(::precise::pow(output_val, 1 / p));
+      output_val = (p == 2)
+          ? static_cast<TA>(::precise::sqrt(output_val))
+          : static_cast<TA>(::precise::pow(output_val, 1 / p));
     }
     output[output_offset] = static_cast<TO>(output_val);
   }
@@ -178,12 +186,18 @@ REGISTER_NORM(half2, half);
 #include <c10/metal/reduction_utils.h>
 
 // Load modes for sum_reduction: identity (sum), nan-to-zero (nansum),
-// or nonzero-as-one (count_nonzero).
+// nonzero-as-one (count_nonzero), abs (L1 norm), or square (L2 norm).
 enum LoadMode : uint {
   LOAD_IDENTITY = 0,
   LOAD_NAN_TO_ZERO = 1,
-  LOAD_NONZERO = 2
+  LOAD_NONZERO = 2,
+  LOAD_ABS = 3,
+  LOAD_SQUARE = 4
 };
+
+// Finalize op applied to the accumulator (in opmath_t) before the output cast.
+// FINAL_SQRT turns a sum-of-squares reduction into an L2 norm.
+enum FinalizeOp : uint { FINAL_NONE = 0, FINAL_SQRT = 1 };
 
 template <typename T, ::metal::enable_if_t<!is_complex_v<T>, bool> = true>
 inline bool load_is_nonzero(T v) {
@@ -228,6 +242,40 @@ template <
     ::metal::enable_if_t<MODE == LOAD_NONZERO, bool> = true>
 inline uint load_val(TI v) {
   return load_is_nonzero(v) ? 1u : 0u;
+}
+
+template <
+    LoadMode MODE,
+    typename TI,
+    ::metal::enable_if_t<MODE == LOAD_ABS, bool> = true>
+inline opmath_t<TI> load_val(TI v) {
+  return static_cast<opmath_t<TI>>(
+      ::precise::abs(static_cast<opmath_t<TI>>(v)));
+}
+
+template <
+    LoadMode MODE,
+    typename TI,
+    ::metal::enable_if_t<MODE == LOAD_SQUARE, bool> = true>
+inline opmath_t<TI> load_val(TI v) {
+  auto r = static_cast<opmath_t<TI>>(v);
+  return r * r;
+}
+
+template <
+    FinalizeOp FINAL,
+    typename T,
+    ::metal::enable_if_t<FINAL == FINAL_NONE, bool> = true>
+inline T finalize_val(T v) {
+  return v;
+}
+
+template <
+    FinalizeOp FINAL,
+    typename T,
+    ::metal::enable_if_t<FINAL == FINAL_SQRT, bool> = true>
+inline T finalize_val(T v) {
+  return static_cast<T>(::precise::sqrt(v));
 }
 
 // Sum reduction kernel with multiple independent accumulation chains (ILP).
@@ -512,7 +560,8 @@ template <
     typename TI,
     typename TO,
     uint NCHAINS = SUM_NCHAINS,
-    LoadMode MODE = LOAD_IDENTITY>
+    LoadMode MODE = LOAD_IDENTITY,
+    FinalizeOp FINAL = FINAL_NONE>
 kernel void sum_reduction_inner(
     constant TI* input [[buffer(0)]],
     device TO* output [[buffer(1)]],
@@ -563,28 +612,31 @@ kernel void sum_reduction_inner(
     if (divisor > 0) {
       sum /= static_cast<TA>(divisor);
     }
-    output[row] = static_cast<TO>(sum);
+    output[row] = static_cast<TO>(finalize_val<FINAL>(sum));
   }
 }
 
-#define REGISTER_SUM_INNER_IMPL(TI, TO, PREFIX, MODE)           \
-  template [[host_name(PREFIX "reduction_inner_" #TI "_" #TO)]] \
-  kernel void sum_reduction_inner<TI, TO, SUM_NCHAINS, MODE>(   \
-      constant TI * input [[buffer(0)]],                        \
-      device TO * output [[buffer(1)]],                         \
-      constant uint2 & sizes [[buffer(2)]],                     \
-      constant float& divisor [[buffer(3)]],                    \
-      uint tptg [[threads_per_threadgroup]],                    \
-      uint tgid [[threadgroup_position_in_grid]],               \
-      uint simd_lane_id [[thread_index_in_simdgroup]],          \
+#define REGISTER_SUM_INNER_IMPL(TI, TO, PREFIX, MODE, FINAL)         \
+  template [[host_name(PREFIX "reduction_inner_" #TI "_" #TO)]]      \
+  kernel void sum_reduction_inner<TI, TO, SUM_NCHAINS, MODE, FINAL>( \
+      constant TI * input [[buffer(0)]],                             \
+      device TO * output [[buffer(1)]],                              \
+      constant uint2 & sizes [[buffer(2)]],                          \
+      constant float& divisor [[buffer(3)]],                         \
+      uint tptg [[threads_per_threadgroup]],                         \
+      uint tgid [[threadgroup_position_in_grid]],                    \
+      uint simd_lane_id [[thread_index_in_simdgroup]],               \
       uint simdgroup_id [[simdgroup_index_in_threadgroup]]);
 
 #define REGISTER_SUM_INNER(TI, TO) \
-  REGISTER_SUM_INNER_IMPL(TI, TO, "sum_", LOAD_IDENTITY)
+  REGISTER_SUM_INNER_IMPL(TI, TO, "sum_", LOAD_IDENTITY, FINAL_NONE)
 #define REGISTER_NANSUM_INNER(TI, TO) \
-  REGISTER_SUM_INNER_IMPL(TI, TO, "nansum_", LOAD_NAN_TO_ZERO)
+  REGISTER_SUM_INNER_IMPL(TI, TO, "nansum_", LOAD_NAN_TO_ZERO, FINAL_NONE)
 #define REGISTER_COUNT_NONZERO_INNER(TI) \
-  REGISTER_SUM_INNER_IMPL(TI, long, "count_nonzero_", LOAD_NONZERO)
+  REGISTER_SUM_INNER_IMPL(TI, long, "count_nonzero_", LOAD_NONZERO, FINAL_NONE)
+#define REGISTER_NORM_INNER(TI, TO)                                 \
+  REGISTER_SUM_INNER_IMPL(TI, TO, "norm_l1_", LOAD_ABS, FINAL_NONE) \
+  REGISTER_SUM_INNER_IMPL(TI, TO, "norm_l2_", LOAD_SQUARE, FINAL_SQRT)
 
 REGISTER_SUM_INNER(float, float);
 REGISTER_SUM_INNER(half, half);
@@ -604,6 +656,10 @@ REGISTER_SUM_INNER(bool, long);
 REGISTER_SUM_INNER(bool, int);
 REGISTER_SUM_INNER(float2, float2);
 REGISTER_SUM_INNER(half2, half2);
+
+REGISTER_NORM_INNER(float, float);
+REGISTER_NORM_INNER(half, half);
+REGISTER_NORM_INNER(bfloat, bfloat);
 
 #define REGISTER_SUM_IMPL(TI, TO, PREFIX, MODE)             \
   template [[host_name(PREFIX "reduction_" #TI "_" #TO)]]   \
@@ -723,75 +779,10 @@ REGISTER_COUNT_NONZERO_INNER(half2);
 // input element to {0, 1} (nonzero, NaN -> 1) before the reduction.
 // =============================================================================
 
-// Reduction op functors. Each Op defines identity<T>(), combine(), and
-// threadgroup_reduce(). Identity is the "neutral" element for the op (-INF
-// for max on floats, numeric_limits<T>::lowest() for integers, etc.).
-// combine() and threadgroup_reduce() delegate to c10::metal helpers, which
-// propagate NaN for floats.
-struct MaxOp {
-  template <
-      typename T,
-      ::metal::enable_if_t<!is_floating_point_v<T>, bool> = true>
-  static inline constexpr T identity() {
-    return ::metal::numeric_limits<T>::lowest();
-  }
-  // Float identity is -INFINITY (not -FLT_MAX): max(-INF, x) = x for any
-  // finite x including -FLT_MAX, but max(-FLT_MAX, -INFINITY) would
-  // incorrectly return -FLT_MAX.
-  template <
-      typename T,
-      ::metal::enable_if_t<is_floating_point_v<T>, bool> = true>
-  static inline constexpr T identity() {
-    return T(-INFINITY);
-  }
-  template <typename T>
-  static inline T combine(T a, T b) {
-    return c10::metal::max(a, b);
-  }
-  template <typename T>
-  static inline T simd_reduce(T val) {
-    return c10::metal::simd_max(val);
-  }
-  template <typename T>
-  static inline T threadgroup_reduce(
-      threadgroup T* shared,
-      T val,
-      uint tid,
-      uint tptg) {
-    return c10::metal::threadgroup_max(shared, val, tid, tptg);
-  }
-};
-
-struct MinOp {
-  template <
-      typename T,
-      ::metal::enable_if_t<!is_floating_point_v<T>, bool> = true>
-  static inline constexpr T identity() {
-    return ::metal::numeric_limits<T>::max();
-  }
-  template <
-      typename T,
-      ::metal::enable_if_t<is_floating_point_v<T>, bool> = true>
-  static inline constexpr T identity() {
-    return T(INFINITY);
-  }
-  template <typename T>
-  static inline T combine(T a, T b) {
-    return c10::metal::min(a, b);
-  }
-  template <typename T>
-  static inline T simd_reduce(T val) {
-    return c10::metal::simd_min(val);
-  }
-  template <typename T>
-  static inline T threadgroup_reduce(
-      threadgroup T* shared,
-      T val,
-      uint tid,
-      uint tptg) {
-    return c10::metal::threadgroup_min(shared, val, tid, tptg);
-  }
-};
+// Reduction op functors MaxOp / MinOp (identity, replace, combine,
+// simd_reduce, threadgroup_reduce) live in c10/metal/reduction_utils.h so the
+// inductor MPS codegen can reuse the same identity/replace pair; both are
+// pulled in via the file-scope `using namespace c10::metal`.
 
 // Load functors decide how an input element is converted into the
 // accumulator type. IdentityLoad casts (min/max keep the value unchanged);
@@ -818,7 +809,7 @@ struct PredicateLoad {
 // runtime tptg value, which in turn lets c10::metal::threadgroup_min/max
 // constant-fold its size-vs-simdgroup_size branch.
 template <
-    typename Op,
+    template <typename> class OpFn,
     typename Load,
     typename TI,
     typename TO,
@@ -849,7 +840,8 @@ kernel void value_reduction(
   }
 
   using TA = TO;
-  const TA identity_val = Op::template identity<TA>();
+  using Op = OpFn<TA>;
+  const TA identity_val = Op::identity();
   metal::array<TA, NCHAINS> acc;
   for (uint j = 0; j < NCHAINS; j++) {
     acc[j] = identity_val;
@@ -917,7 +909,7 @@ kernel void value_reduction(
 // threads split the M rows. Mirrors sum_reduction_outer; uses the same
 // (Op, Load) abstraction as value_reduction.
 template <
-    typename Op,
+    template <typename> class OpFn,
     typename Load,
     typename TI,
     typename TO,
@@ -932,6 +924,7 @@ kernel void value_reduction_outer(
     uint2 tid_tg [[thread_position_in_threadgroup]],
     uint2 tg_pos [[threadgroup_position_in_grid]]) {
   using TA = TO;
+  using Op = OpFn<TA>;
   const uint M = sizes.x;
   const uint N = sizes.y;
   const uint out_stride = sizes.z;
@@ -945,7 +938,7 @@ kernel void value_reduction_outer(
   uint row_start = tid_tg.y * rows_per_y;
   uint row_end = min(row_start + rows_per_y, M);
 
-  const TA identity_val = Op::template identity<TA>();
+  const TA identity_val = Op::identity();
   metal::array<TA, NCHAINS> acc;
   for (uint j = 0; j < NCHAINS; j++) {
     acc[j] = identity_val;
@@ -991,7 +984,7 @@ kernel void value_reduction_outer(
 // SIMD groups per TG for occupancy. No shared memory needed since
 // simd_reduce suffices for intra-row collapse. Mirrors sum_reduction_inner.
 template <
-    typename Op,
+    template <typename> class OpFn,
     typename Load,
     typename TI,
     typename TO,
@@ -1005,6 +998,7 @@ kernel void value_reduction_inner(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simdgroup_id [[simdgroup_index_in_threadgroup]]) {
   using TA = TO;
+  using Op = OpFn<TA>;
   const uint M = sizes.x;
   const uint N = sizes.y;
   const uint num_simd_groups = tptg / simdgroup_size;
@@ -1016,7 +1010,7 @@ kernel void value_reduction_inner(
 
   constant TI* row_ptr = input + row * N;
 
-  const TA identity_val = Op::template identity<TA>();
+  const TA identity_val = Op::identity();
   metal::array<TA, NCHAINS> acc;
   for (uint j = 0; j < NCHAINS; j++) {
     acc[j] = identity_val;

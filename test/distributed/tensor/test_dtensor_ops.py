@@ -151,8 +151,6 @@ dtensor_fails = {
     # dtensor_numeric_only_fails for the subtraction.
     xfail("nn.functional.linear_cross_entropy"),
     # 0-dim tensor edge cases: strategies don't handle scalar tensors
-    xfail("logsumexp"),
-    xfail("masked.logsumexp"),
     xfail("transpose"),
     # conv stride+padding: TP convolution rejects stride != 1 with padding
     xfail("nn.functional.conv1d"),
@@ -298,6 +296,7 @@ dtensor_compiled_fails = {
     skip("histc"),
     xfail("nn.functional.linear_cross_entropy"),
     xfail("nn.functional.linear_cross_entropy", "chunked"),
+    xfail("nn.functional.linear_cross_entropy", "chunked_none"),
 }
 
 # Ops that compile successfully but fail numeric checks in eager DTensor tests.
@@ -370,6 +369,7 @@ dtensor_fails_no_strategy = {
     xfail("nanquantile"),
     xfail("nn.functional.bilinear"),
     xfail("nn.functional.linear_cross_entropy", "chunked"),
+    xfail("nn.functional.linear_cross_entropy", "chunked_none"),
     xfail("nn.functional.multi_margin_loss"),
     xfail("nn.functional.multilabel_margin_loss"),
     xfail("nn.functional.pad", "reflect"),
