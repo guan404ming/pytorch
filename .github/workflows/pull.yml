@@ -280,11 +280,17 @@ jobs:
         with:
           name: test-diff-result
       - name: Post sticky comment
-        if: hashFiles('test-diff-result.json') != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python3 -m tools.testing.introspection.post_comment test-diff-result.json
+        # Check the file in-container; hashFiles() (host-evaluated) doesn't see the
+        # artifact written into the ARC container workspace, so it would skip wrongly.
+        run: |
+          if [ -f test-diff-result.json ]; then
+            python3 -m tools.testing.introspection.post_comment test-diff-result.json
+          else
+            echo "no test-diff-result.json artifact; nothing to post"
+          fi
 
   # ╠══════════════════════════════════════════════════════════════════════╣
   # ║ linux-jammy-py3.10-gcc11-no-ops (build only)                         ║

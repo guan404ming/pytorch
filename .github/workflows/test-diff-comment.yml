@@ -44,8 +44,12 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Render and upsert sticky comment
-        if: hashFiles('test-diff-result.json') != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python3 -m tools.testing.introspection.post_comment test-diff-result.json
+        run: |
+          if [ -f test-diff-result.json ]; then
+            python3 -m tools.testing.introspection.post_comment test-diff-result.json
+          else
+            echo "no test-diff-result.json artifact; nothing to post"
+          fi
