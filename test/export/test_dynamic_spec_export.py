@@ -10,10 +10,8 @@ import torch.fx.experimental._config as _fx_experimental_config
 import torch.utils._pytree as pytree
 from torch.export import export
 from torch.export._trace import (
-    _export_to_aten_ir,
     _export_to_aten_ir_make_fx,
     _export_to_torch_ir,
-    _non_strict_export,
     _strict_export,
 )
 from torch.fx.experimental.dynamic_spec import (
@@ -352,18 +350,19 @@ Range constraints: {u0: VR[0, int_oo], u1: VR[0, int_oo]}""",
         shape = _first_tensor_placeholder_shape(ep.graph_module)
         self.assertEqual(tuple(shape), (8, 3))
 
-    def test_non_strict_raises_not_implemented(self):
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            r"ShapesSpec/ParamsSpec in dynamic_shapes is not yet supported "
-            r"in non-strict export",
-        ):
-            export(
-                _ModX(),
-                (torch.randn(8, 3),),
-                dynamic_shapes=PARAMS({"x": T([VAR("batch"), STATIC])}),
-                strict=False,
-            )
+    def test_non_strict_produces_unbacked_dim(self):
+        """Non-strict export now accepts ShapesSpec/ParamsSpec and produces an
+        unbacked dim, same as strict / make_fx."""
+        ep = export(
+            _ModX(),
+            (torch.randn(8, 3),),
+            dynamic_shapes=PARAMS({"x": T([VAR("batch"), STATIC])}),
+            strict=False,
+        )
+        shape = _first_tensor_placeholder_shape(ep.graph_module)
+        self.assertIsInstance(shape[0], torch.SymInt)
+        self.assertGreater(len(free_unbacked_symbols(shape[0])), 0)
+        self.assertEqual(int(shape[1]), 3)
 
     def test_named_dims_vs_shapes_spec(self):
         from torch.export import Dim
@@ -864,24 +863,6 @@ class <lambda>(torch.nn.Module):
             ignore_comments=True,
             ignore_empty_lines=True,
         )
-
-    def test_non_strict_export_shapes_spec_raises_direct(self):
-        args = (torch.randn(8, 3),)
-        _, in_spec = pytree.tree_flatten((args, {}))
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            r"not yet supported .*in non-strict export",
-        ):
-            _non_strict_export(
-                mod=_ModX(),
-                args=args,
-                kwargs={},
-                dynamic_shapes=self._spec(),
-                preserve_module_call_signature=(),
-                orig_in_spec=in_spec,
-                prefer_deferred_runtime_asserts_over_guards=False,
-                _to_aten_func=_export_to_aten_ir,
-            )
 
 
 class TestContainerSpec(TestCase):
@@ -1434,6 +1415,104 @@ class TestContainerSpec(TestCase):
             self.assertEqual(
                 len(out), expected, f"no-spec leaf-count drift for {arg_value!r}"
             )
+
+
+class TestExportDynamicSpecNonStrict(TestCase):
+    """ShapesSpec/ParamsSpec in non-strict export (strict=False): same
+    unbacked-symbol semantics as strict / make_fx."""
+
+    def setUp(self):
+        super().setUp()
+        _reset_uid_counter()
+
+    def test_tensor_shape_var_is_unbacked(self):
+        ep = export(
+            _ModX(),
+            (torch.randn(8, 3),),
+            dynamic_shapes=PARAMS({"x": T([VAR("batch"), STATIC])}),
+            strict=False,
+        )
+        shape = _first_tensor_placeholder_shape(ep.graph_module)
+        self.assertIsInstance(shape[0], torch.SymInt)
+        self.assertGreater(len(free_unbacked_symbols(shape[0])), 0)
+        self.assertEqual(int(shape[1]), 3)
+
+    def test_scalar_intvar_is_unbacked_and_undeclared_static(self):
+        ep = export(
+            _ModXN(),
+            (torch.randn(4), 7),
+            dynamic_shapes=PARAMS({"x": T([STATIC]), "n": IntVar("n")}),
+            strict=False,
+        )
+        sym = [
+            n.meta.get("val")
+            for n in ep.graph.nodes
+            if n.op == "placeholder" and isinstance(n.meta.get("val"), torch.SymInt)
+        ]
+        self.assertEqual(len(sym), 1)
+        self.assertGreater(len(free_unbacked_symbols(sym[0])), 0)
+        # tensor x declared STATIC stays concrete.
+        self.assertEqual(int(_first_tensor_placeholder_shape(ep.graph_module)[0]), 4)
+
+    def test_derived_dim_shared_symbol(self):
+        B = VAR("batch")
+
+        class M(torch.nn.Module):
+            def forward(self, x, y):
+                return x.sum() + y.sum()
+
+        ep = export(
+            M(),
+            (torch.randn(4, 3), torch.randn(8, 3)),
+            dynamic_shapes=ShapesSpec(
+                params=PARAMS({"x": T([B, STATIC]), "y": T([B * 2, STATIC])}),
+                assumptions=[B % 2 == 0],
+            ),
+            strict=False,
+        )
+        shapes = [
+            n.meta["val"].shape
+            for n in ep.graph.nodes
+            if n.op == "placeholder" and isinstance(n.meta.get("val"), torch.Tensor)
+        ]
+        # x dim0 = u0 (unbacked); y dim0 = 2*u0 (derived).
+        self.assertGreater(len(free_unbacked_symbols(shapes[0][0])), 0)
+        self.assertEqual(str(shapes[1][0]), f"2*{shapes[0][0]}")
+
+    def test_container_specs_unbacked_and_static(self):
+        from collections import namedtuple
+
+        Pair = namedtuple("Pair", ["first", "second"])
+
+        class M(torch.nn.Module):
+            def forward(self, d, xs, p):
+                return d["b"].sum(0) + xs[1].sum(0) + p.second.sum(0)
+
+        ep = export(
+            M(),
+            (
+                {"a": torch.randn(7, 3), "b": torch.randn(8, 3)},
+                [torch.randn(4, 3), torch.randn(5, 3)],
+                Pair(torch.randn(6, 3), torch.randn(9, 3)),
+            ),
+            dynamic_shapes=PARAMS(
+                {
+                    "d": DICT({"b": T([VAR("B"), STATIC])}),
+                    "xs": L([STATIC, T([VAR("X"), STATIC])]),
+                    "p": OBJ({"second": T([VAR("P"), STATIC])}),
+                }
+            ),
+            strict=False,
+        )
+        shapes = [
+            n.meta["val"].shape
+            for n in ep.graph.nodes
+            if n.op == "placeholder" and isinstance(n.meta.get("val"), torch.Tensor)
+        ]
+        dynamic = [s for s in shapes if free_unbacked_symbols(s[0])]
+        static = [s for s in shapes if isinstance(s[0], int)]
+        self.assertEqual(len(dynamic), 3)  # d["b"], xs[1], p.second
+        self.assertEqual(len(static), 3)  # d["a"], xs[0], p.first
 
 
 if __name__ == "__main__":

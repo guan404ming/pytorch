@@ -9445,3 +9445,53 @@ def _finalize_spec_wiring(shape_env: ShapeEnv) -> None:
         f"bare-IntVar slot somewhere in the spec. Offending checks:\n"
         + "\n".join(lines)
     )
+
+
+def _fakify_one_leaf_with_spec(
+    fake_mode: Any,
+    x: Any,
+    source: Any,
+    leaf_spec: Any,
+    *,
+    symbolic_unspecced_int: bool,
+) -> Any:
+    """Fakify a single flat input leaf against its (already-bound) dynamic spec.
+
+    Shared by make_fx (``_MakefxTracer._convert_args_to_fake``) and non-strict
+    export (``torch._export.non_strict_utils.make_fake_inputs``).
+    """
+    from torch.fx.experimental.dynamic_spec import IntVar
+
+    if isinstance(x, torch.Tensor):
+        if leaf_spec is None:
+            # Not declared in the spec -> fully static.
+            return fake_mode.from_tensor(x, static_shapes=True, source=source)
+        ctx = _symbolic_context_from_shapes_spec(x, source, leaf_spec, None, {})
+        fake_x = fake_mode.from_tensor(
+            x,
+            static_shapes=False,
+            source=source,
+            symbolic_context=ctx,
+        )
+        _wire_tensor_spec_dims(leaf_spec, fake_x)
+        return fake_x
+
+    # NB: don't match on bools.
+    if type(x) is int:
+        shape_env = fake_mode.shape_env
+        if isinstance(leaf_spec, (IntVar, torch.SymInt)):
+            # Spec-declared scalar: allocate an unbacked symbol (u0, ...) so the
+            # spec path stays sound (no 0/1 or size>=2 backed assumptions).
+            sym_node: torch.SymInt = shape_env.create_unbacked_symint(source=source)
+            _wire_spec_slot(leaf_spec, sym_node)
+            return sym_node
+        if symbolic_unspecced_int:
+            # Legacy whole-graph auto-dynamic: every int becomes a backed symbol.
+            return shape_env.create_symintnode(
+                shape_env.create_symbol(x, source, positive=None),
+                hint=x,
+                source=source,
+            )
+        # Otherwise an int not declared in the spec stays static.
+
+    return x

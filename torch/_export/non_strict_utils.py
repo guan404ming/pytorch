@@ -442,17 +442,26 @@ def make_fake_inputs(
     #   - output_graph.py fakifies inputs.
     #   - [post-tracing] guards.py processes input shape equalities.
     import torch._functorch.config as _config
+    from torch.fx.experimental.dynamic_spec import ParamsSpec, ShapesSpec
 
-    # Map ints to a wrapper structure to help us mark it as dynamic, if it is
-    # dynamic. We will unwrap ints in fakify later.
-    args, kwargs = pytree.tree_map_only(int, lambda a: _IntWrapper(a), (args, kwargs))
+    # ShapesSpec/ParamsSpec drive dynamism via unbacked symbols (handled by the
+    # spec fakify branch below); skip the legacy constraint machinery for it.
+    is_shapes_spec = isinstance(dynamic_shapes, (ShapesSpec, ParamsSpec))
 
-    combined_args = _combine_args(nn_module, args, kwargs)
-    _check_dynamic_shapes(combined_args, dynamic_shapes)
-    constraints = _process_dynamic_shapes(combined_args, dynamic_shapes)
+    constraints: list[Constraint] = []
     t_constraints: dict[int, dict[int, Constraint]] = defaultdict(dict)
-    for constraint in constraints:
-        t_constraints[constraint.t_id][constraint.dim] = constraint
+    if not is_shapes_spec:
+        # Map ints to a wrapper structure to help us mark it as dynamic, if it is
+        # dynamic. We will unwrap ints in fakify later.
+        args, kwargs = pytree.tree_map_only(
+            int, lambda a: _IntWrapper(a), (args, kwargs)
+        )
+
+        combined_args = _combine_args(nn_module, args, kwargs)
+        _check_dynamic_shapes(combined_args, dynamic_shapes)
+        constraints = _process_dynamic_shapes(combined_args, dynamic_shapes)
+        for constraint in constraints:
+            t_constraints[constraint.t_id][constraint.dim] = constraint
 
     context = torch._guards.TracingContext.try_get()
     if context is not None:
@@ -503,6 +512,69 @@ def make_fake_inputs(
         original_signature = inspect.signature(nn_module.forward)
         sources: dict[tuple[int, int], list[Source]] = defaultdict(list)
         sourced_prefixes = make_sourced_prefixes(nn_module, args, kwargs)
+        if is_shapes_spec:
+            from torch.fx.experimental._spec_binding import _bind_spec_to_args
+            from torch.fx.experimental.dynamic_spec import (
+                _coerce_to_shapes_spec,
+                ShapesSpec,
+            )
+            from torch.fx.experimental.symbolic_shapes import (
+                _fakify_one_leaf_with_spec,
+                _finalize_spec_wiring,
+                _wire_spec_assumptions,
+            )
+
+            # Spec-driven fakification: declared dims/scalars become unbacked
+            # symbols (sound; no constraints/equalities). Mirrors make_fx's
+            # _convert_args_to_fake; non-strict supplies keypath sources.
+            user_spec = _coerce_to_shapes_spec(dynamic_shapes)
+            shape_env = fake_mode.shape_env
+            # Wire assumptions BEFORE processing inputs so derived / assumption
+            # checks can drain as inputs bind.
+            if user_spec is not None and user_spec._assumptions:
+                _wire_spec_assumptions(shape_env, user_spec)
+
+            leaf_specs, flat_args, in_spec = _bind_spec_to_args(
+                nn_module, args, kwargs, user_spec or ShapesSpec()
+            )
+            leaf_sources = [
+                key_path_to_source(kp, sourced_prefixes=sourced_prefixes)
+                for kp, _ in pytree.tree_flatten_with_path((args, kwargs))[0]
+            ]
+
+            with shape_env.ignore_fresh_unbacked_symbols():
+                fake_leaves = [
+                    _fakify_one_leaf_with_spec(
+                        fake_mode,
+                        x,
+                        leaf_sources[i],
+                        leaf_specs[i],
+                        symbolic_unspecced_int=False,
+                    )
+                    for i, x in enumerate(flat_args)
+                ]
+
+            # Verify every spec assumption / derived check that survived input
+            # processing has been emitted.
+            if user_spec is not None:
+                _finalize_spec_wiring(shape_env)
+
+            fake_args, fake_kwargs = pytree.tree_unflatten(fake_leaves, in_spec)
+            equalities_inputs = EqualityConstraint(
+                source_pairs=[],
+                derived_equalities=[],
+                phantom_symbols=[],
+                relaxed_sources=set(),
+                warn_only=False,
+            )
+            return (
+                fake_mode,
+                fake_args,
+                fake_kwargs,
+                equalities_inputs,
+                original_signature,
+                dynamic_shapes,
+            )
         fake_args, fake_kwargs = tree_map_with_path(
             lambda kp, val: fakify(
                 fake_mode,
