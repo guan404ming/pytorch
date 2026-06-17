@@ -3861,9 +3861,9 @@ class GraphModule(torch.nn.Module):
 
         _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
 
-        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  _wrap_for_grad = None
+        _make_dual: "f32[4, 3]" = torch._functorch.predispatch._make_dual(l_x_, _add_batch_dim, level = 0);  _add_batch_dim = None
 
-        _make_dual: "f32[4, 3]" = torch._functorch.predispatch._make_dual(l_x_, _add_batch_dim, level = 0);  l_x_ = _add_batch_dim = None
+        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = _wrap_for_grad = None
 
         _saved_tensors_hooks_disable = torch._C._autograd._saved_tensors_hooks_disable("torch.func.{grad, vjp, jacrev, hessian} don't yet support saved tensor hooks. Please open an issue with your use case.");  _saved_tensors_hooks_disable = None
         _grad_increment_nesting = torch._C._functorch._grad_increment_nesting();  _grad_increment_nesting = None
@@ -3910,9 +3910,11 @@ class GraphModule(torch.nn.Module):
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(view_2, level = 0);  view_2 = None
         getitem_2: "f32[4, 3, 4, 3]" = _unpack_dual[0]
-        getitem_3: "f32[4, 3, 4, 3]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad_1: "f32[4, 3, 4, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_2, 2);  getitem_2 = _unwrap_for_grad_1 = None
+
+        getitem_3: "f32[4, 3, 4, 3]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_2: "f32[4, 3, 4, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_3, 2);  getitem_3 = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -3985,24 +3987,24 @@ class GraphModule(torch.nn.Module):
 
         _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
 
-        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = None
-        _wrap_for_grad_1: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(l_y_, 2);  _wrap_for_grad_1 = None
+        _make_dual: "f32[3, 4]" = torch._functorch.predispatch._make_dual(l_y_, _add_batch_dim, level = 0);  _add_batch_dim = None
 
-        _make_dual: "f32[3, 4]" = torch._functorch.predispatch._make_dual(l_y_, _add_batch_dim, level = 0);  l_y_ = _add_batch_dim = None
+        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = None
+        _wrap_for_grad_1: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(l_y_, 2);  l_y_ = _wrap_for_grad_1 = None
 
         _saved_tensors_hooks_disable = torch._C._autograd._saved_tensors_hooks_disable("torch.func.{grad, vjp, jacrev, hessian} don't yet support saved tensor hooks. Please open an issue with your use case.");  _saved_tensors_hooks_disable = None
         _grad_increment_nesting = torch._C._functorch._grad_increment_nesting();  _grad_increment_nesting = None
 
-        _wrap_for_grad_2: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(_wrap_for_grad, 3);  _wrap_for_grad = None
-        _wrap_for_grad_3: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(_make_dual, 3);  _make_dual = None
+        _wrap_for_grad_2: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(_make_dual, 3);  _make_dual = None
+        _wrap_for_grad_3: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(_wrap_for_grad, 3);  _wrap_for_grad = None
 
         set_inplace_requires_grad_allowed = torch._C._functorch.set_inplace_requires_grad_allowed(True);  set_inplace_requires_grad_allowed = None
 
-        _set_tensor_requires_grad: "f32[3, 4]" = torch._functorch.eager_transforms._set_tensor_requires_grad(_wrap_for_grad_3);  _set_tensor_requires_grad = None
+        _set_tensor_requires_grad: "f32[3, 4]" = torch._functorch.eager_transforms._set_tensor_requires_grad(_wrap_for_grad_2);  _set_tensor_requires_grad = None
 
         set_inplace_requires_grad_allowed_1 = torch._C._functorch.set_inplace_requires_grad_allowed(False);  set_inplace_requires_grad_allowed_1 = None
 
-        sin: "f32[4, 3]" = _wrap_for_grad_2.sin();  _wrap_for_grad_2 = None
+        sin: "f32[4, 3]" = _wrap_for_grad_3.sin();  _wrap_for_grad_3 = None
 
         _unwrap_for_grad: "f32[4, 3]" = torch._functorch.predispatch._unwrap_for_grad(sin, 3)
 
@@ -4022,7 +4024,7 @@ class GraphModule(torch.nn.Module):
 
         _add_batch_dim_1: "f32[4, 3]" = torch._functorch.predispatch._add_batch_dim(view_1, 0, 3);  view_1 = None
 
-        _autograd_grad = torch._functorch.eager_transforms._autograd_grad([sin], [_wrap_for_grad_3], [_add_batch_dim_1], retain_graph = True, create_graph = True);  sin = _wrap_for_grad_3 = _add_batch_dim_1 = None
+        _autograd_grad = torch._functorch.eager_transforms._autograd_grad([sin], [_wrap_for_grad_2], [_add_batch_dim_1], retain_graph = True, create_graph = True);  sin = _wrap_for_grad_2 = _add_batch_dim_1 = None
         getitem: "f32[3, 4]" = _autograd_grad[0];  _autograd_grad = None
 
         _remove_batch_dim: "f32[12, 3, 4]" = torch._functorch.predispatch._remove_batch_dim(getitem, 3, 12, 0);  getitem = None
@@ -4037,9 +4039,10 @@ class GraphModule(torch.nn.Module):
         _unpack_dual = torch._functorch.predispatch._unpack_dual(view_2, level = 0);  view_2 = None
         getitem_2: "f32[4, 3, 3, 4]" = _unpack_dual[0];  _unpack_dual = None
 
-        zeros_like: "f32[4, 3, 3, 4]" = torch.zeros_like(getitem_2)
+        _unwrap_for_grad_1: "f32[4, 3, 3, 4]" = torch._functorch.predispatch._unwrap_for_grad(getitem_2, 2);  _unwrap_for_grad_1 = None
 
-        _unwrap_for_grad_1: "f32[4, 3, 3, 4]" = torch._functorch.predispatch._unwrap_for_grad(getitem_2, 2);  getitem_2 = _unwrap_for_grad_1 = None
+        zeros_like: "f32[4, 3, 3, 4]" = torch.zeros_like(getitem_2);  getitem_2 = None
+
         _unwrap_for_grad_2: "f32[4, 3, 3, 4]" = torch._functorch.predispatch._unwrap_for_grad(zeros_like, 2);  zeros_like = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -4605,9 +4608,11 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = sin.sum();  sin = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad], create_graph = True);  _wrap_for_grad = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
 
         _unwrap_for_grad: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 1);  sum_1 = _unwrap_for_grad = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
         _unwrap_for_grad_1: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -4672,9 +4677,11 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = add.sum();  add = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad], create_graph = True);  _wrap_for_grad = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
 
         _unwrap_for_grad: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 1);  sum_1 = _unwrap_for_grad = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
         _unwrap_for_grad_1: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -4728,9 +4735,11 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = add.sum();  add = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad], create_graph = True);  _wrap_for_grad = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
 
         _unwrap_for_grad: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 1);  sum_1 = _unwrap_for_grad = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
         _unwrap_for_grad_1: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -4784,9 +4793,11 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = add.sum();  add = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad], create_graph = True);  _wrap_for_grad = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
 
         _unwrap_for_grad: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 1);  sum_1 = _unwrap_for_grad = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
         _unwrap_for_grad_1: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -4841,9 +4852,11 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = add.sum();  add = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad], create_graph = True);  _wrap_for_grad = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
 
         _unwrap_for_grad_1: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 1);  sum_1 = _unwrap_for_grad_1 = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
         _unwrap_for_grad_2: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -4899,9 +4912,11 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = add.sum();  add = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad], create_graph = True);  _wrap_for_grad = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
 
         _unwrap_for_grad_1: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 1);  sum_1 = _unwrap_for_grad_1 = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
         _unwrap_for_grad_2: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -4973,11 +4988,15 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = add.sum();  add = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad, _wrap_for_grad_1], create_graph = True);  _wrap_for_grad = _wrap_for_grad_1 = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0]
-        getitem_1: "f32[3, 3, 3]" = _autograd_grad[1];  _autograd_grad = None
 
         _unwrap_for_grad_1: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 1);  sum_1 = _unwrap_for_grad_1 = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0]
+
         _unwrap_for_grad_2: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
+
+        getitem_1: "f32[3, 3, 3]" = _autograd_grad[1];  _autograd_grad = None
+
         _unwrap_for_grad_3: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 1);  getitem_1 = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -5019,11 +5038,15 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = add.sum();  add = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad, _wrap_for_grad_1], create_graph = True);  _wrap_for_grad = _wrap_for_grad_1 = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0]
-        getitem_1: "f32[3, 3, 3]" = _autograd_grad[1];  _autograd_grad = None
 
         _unwrap_for_grad_1: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 1);  sum_1 = _unwrap_for_grad_1 = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0]
+
         _unwrap_for_grad_2: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
+
+        getitem_1: "f32[3, 3, 3]" = _autograd_grad[1];  _autograd_grad = None
+
         _unwrap_for_grad_3: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 1);  getitem_1 = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -5080,18 +5103,22 @@ class GraphModule(torch.nn.Module):
         sum_1: "f32[]" = sin.sum();  sin = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((sum_1,), [_wrap_for_grad_1], create_graph = True);  _wrap_for_grad_1 = None
-        getitem: "f32[]" = _autograd_grad[0];  _autograd_grad = None
 
         _unwrap_for_grad: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(sum_1, 2);  sum_1 = _unwrap_for_grad = None
+
+        getitem: "f32[]" = _autograd_grad[0];  _autograd_grad = None
+
         _unwrap_for_grad_1: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 2);  getitem = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
         _saved_tensors_hooks_disable_2 = torch._C._autograd._saved_tensors_hooks_disable("torch.func.{grad, vjp, jacrev, hessian} don't yet support saved tensor hooks. Please open an issue with your use case.");  _saved_tensors_hooks_disable_2 = None
 
         _autograd_grad_1 = torch._functorch.eager_transforms._autograd_grad((_unwrap_for_grad_1,), [_wrap_for_grad], create_graph = True);  _wrap_for_grad = None
-        getitem_1: "f32[]" = _autograd_grad_1[0];  _autograd_grad_1 = None
 
         _unwrap_for_grad_2: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(_unwrap_for_grad_1, 1);  _unwrap_for_grad_1 = _unwrap_for_grad_2 = None
+
+        getitem_1: "f32[]" = _autograd_grad_1[0];  _autograd_grad_1 = None
+
         _unwrap_for_grad_3: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 1);  getitem_1 = None
 
         _grad_decrement_nesting_1 = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting_1 = None
@@ -5194,9 +5221,11 @@ class GraphModule(torch.nn.Module):
         add: "f32[]" = sum_1 + 3.0;  sum_1 = None
 
         _autograd_grad = torch._functorch.eager_transforms._autograd_grad((add,), [_wrap_for_grad], create_graph = True);  _wrap_for_grad = None
-        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
 
         _unwrap_for_grad: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(add, 1);  add = _unwrap_for_grad = None
+
+        getitem: "f32[3, 3, 3]" = _autograd_grad[0];  _autograd_grad = None
+
         _unwrap_for_grad_1: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
 
         _grad_decrement_nesting = torch._C._functorch._grad_decrement_nesting();  _grad_decrement_nesting = None
@@ -5258,17 +5287,19 @@ class GraphModule(torch.nn.Module):
 
         _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
 
-        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  _wrap_for_grad = None
+        _make_dual: "f32[4, 3]" = torch._functorch.predispatch._make_dual(l_x_, _add_batch_dim, level = 0);  _add_batch_dim = None
 
-        _make_dual: "f32[4, 3]" = torch._functorch.predispatch._make_dual(l_x_, _add_batch_dim, level = 0);  l_x_ = _add_batch_dim = None
+        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = _wrap_for_grad = None
 
         sin: "f32[4, 3]" = torch.sin(_make_dual);  _make_dual = None
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(sin, level = 0);  sin = None
         getitem: "f32[4, 3]" = _unpack_dual[0]
-        getitem_1: "f32[4, 3]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad: "f32[4, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 2);  getitem = _unwrap_for_grad = None
+
+        getitem_1: "f32[4, 3]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_1: "f32[4, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 2);  getitem_1 = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -5333,18 +5364,20 @@ class GraphModule(torch.nn.Module):
 
         _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
 
-        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = _wrap_for_grad = None
-        _wrap_for_grad_1: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(l_y_, 2);  _wrap_for_grad_1 = None
+        _make_dual: "f32[3, 4]" = torch._functorch.predispatch._make_dual(l_y_, _add_batch_dim, level = 0);  _add_batch_dim = None
 
-        _make_dual: "f32[3, 4]" = torch._functorch.predispatch._make_dual(l_y_, _add_batch_dim, level = 0);  l_y_ = _add_batch_dim = None
+        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = _wrap_for_grad = None
+        _wrap_for_grad_1: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(l_y_, 2);  l_y_ = _wrap_for_grad_1 = None
 
         sin: "f32[3, 4]" = _make_dual.sin();  _make_dual = None
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(sin, level = 0);  sin = None
         getitem: "f32[3, 4]" = _unpack_dual[0]
-        getitem_1: "f32[3, 4]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad: "f32[3, 4]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 2);  getitem = _unwrap_for_grad = None
+
+        getitem_1: "f32[3, 4]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_1: "f32[3, 4]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 2);  getitem_1 = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -5409,20 +5442,23 @@ class GraphModule(torch.nn.Module):
 
         _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
 
-        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = None
-        _wrap_for_grad_1: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(l_y_, 2);  _wrap_for_grad_1 = None
+        _make_dual: "f32[3, 4]" = torch._functorch.predispatch._make_dual(l_y_, _add_batch_dim, level = 0);  _add_batch_dim = None
 
-        _make_dual: "f32[3, 4]" = torch._functorch.predispatch._make_dual(l_y_, _add_batch_dim, level = 0);  l_y_ = _add_batch_dim = None
+        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = None
 
         _unwrap_for_grad: "f32[4, 3]" = torch._functorch.predispatch._unwrap_for_grad(_wrap_for_grad, 2);  _wrap_for_grad = None
+
+        _wrap_for_grad_1: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(l_y_, 2);  l_y_ = _wrap_for_grad_1 = None
 
         sin: "f32[3, 4]" = _make_dual.sin();  _make_dual = None
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(sin, level = 0);  sin = None
         getitem: "f32[3, 4]" = _unpack_dual[0]
-        getitem_1: "f32[3, 4]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad_1: "f32[3, 4]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 2);  getitem = _unwrap_for_grad_1 = None
+
+        getitem_1: "f32[3, 4]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_2: "f32[3, 4]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 2);  getitem_1 = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -5490,16 +5526,19 @@ class GraphModule(torch.nn.Module):
 
         _maybe_load_decompositions = torch.autograd.forward_ad._maybe_load_decompositions();  _maybe_load_decompositions = None
 
-        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  _wrap_for_grad = None
-        _wrap_for_grad_1: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(l_y_, 2);  l_y_ = None
-
-        _make_dual: "f32[4, 3]" = torch._functorch.predispatch._make_dual(l_x_, _add_batch_dim, level = 0);  l_x_ = _add_batch_dim = None
+        _make_dual: "f32[4, 3]" = torch._functorch.predispatch._make_dual(l_x_, _add_batch_dim, level = 0);  _add_batch_dim = None
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(_make_dual, level = 0);  _make_dual = None
+
+        _wrap_for_grad: "f32[4, 3]" = torch._C._functorch._wrap_for_grad(l_x_, 2);  l_x_ = _wrap_for_grad = None
+        _wrap_for_grad_1: "f32[3, 4]" = torch._C._functorch._wrap_for_grad(l_y_, 2);  l_y_ = None
+
         getitem: "f32[4, 3]" = _unpack_dual[0]
-        getitem_1: "f32[4, 3]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad: "f32[4, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 2);  getitem = _unwrap_for_grad = None
+
+        getitem_1: "f32[4, 3]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_1: "f32[4, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 2);  getitem_1 = None
 
         sin: "f32[3, 4]" = _wrap_for_grad_1.sin();  _wrap_for_grad_1 = None
@@ -5507,9 +5546,10 @@ class GraphModule(torch.nn.Module):
         _unpack_dual_1 = torch._functorch.predispatch._unpack_dual(sin, level = 0);  sin = None
         getitem_2: "f32[3, 4]" = _unpack_dual_1[0];  _unpack_dual_1 = None
 
-        zeros_like: "f32[3, 4]" = torch.zeros_like(getitem_2)
+        _unwrap_for_grad_2: "f32[3, 4]" = torch._functorch.predispatch._unwrap_for_grad(getitem_2, 2);  _unwrap_for_grad_2 = None
 
-        _unwrap_for_grad_2: "f32[3, 4]" = torch._functorch.predispatch._unwrap_for_grad(getitem_2, 2);  getitem_2 = _unwrap_for_grad_2 = None
+        zeros_like: "f32[3, 4]" = torch.zeros_like(getitem_2);  getitem_2 = None
+
         _unwrap_for_grad_3: "f32[3, 4]" = torch._functorch.predispatch._unwrap_for_grad(zeros_like, 2);  zeros_like = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -5522,12 +5562,10 @@ class GraphModule(torch.nn.Module):
         _vmap_decrement_nesting = torch._functorch.predispatch._vmap_decrement_nesting();  _vmap_decrement_nesting = None
 
         movedim: "f32[3, 4, 12]" = _remove_batch_dim.movedim(0, -1);  _remove_batch_dim = None
+        movedim_1: "f32[4, 3, 12]" = _remove_batch_dim_1.movedim(0, -1);  _remove_batch_dim_1 = None
 
         split = torch.functional.split(movedim, [12], dim = -1);  movedim = None
         getitem_3: "f32[3, 4, 12]" = split[0];  split = None
-
-        movedim_1: "f32[4, 3, 12]" = _remove_batch_dim_1.movedim(0, -1);  _remove_batch_dim_1 = None
-
         split_1 = torch.functional.split(movedim_1, [12], dim = -1);  movedim_1 = None
         getitem_4: "f32[4, 3, 12]" = split_1[0];  split_1 = None
 
@@ -5631,9 +5669,11 @@ class GraphModule(torch.nn.Module):
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(sum_1, level = 0);  sum_1 = None
         getitem: "f32[]" = _unpack_dual[0]
-        getitem_1: "f32[]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad_1: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
+
+        getitem_1: "f32[]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_2: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 1);  getitem_1 = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -5692,9 +5732,11 @@ class GraphModule(torch.nn.Module):
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(add, level = 0);  add = None
         getitem: "f32[3, 3]" = _unpack_dual[0]
-        getitem_1: "f32[3, 3]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad_1: "f32[3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
+
+        getitem_1: "f32[3, 3]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_2: "f32[3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 1);  getitem_1 = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -5814,9 +5856,11 @@ class GraphModule(torch.nn.Module):
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(sum_1, level = 0);  sum_1 = None
         getitem: "f32[]" = _unpack_dual[0]
-        getitem_1: "f32[]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 1);  getitem = None
+
+        getitem_1: "f32[]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_1: "f32[]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 1);  getitem_1 = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None
@@ -5890,24 +5934,32 @@ class GraphModule(torch.nn.Module):
 
         _unpack_dual = torch._functorch.predispatch._unpack_dual(sin, level = 0);  sin = None
         getitem: "f32[3, 3, 3]" = _unpack_dual[0]
-        getitem_1: "f32[3, 3, 3]" = _unpack_dual[1];  _unpack_dual = None
 
         _unwrap_for_grad: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem, 2);  getitem = None
+
+        getitem_1: "f32[3, 3, 3]" = _unpack_dual[1];  _unpack_dual = None
+
         _unwrap_for_grad_1: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_1, 2);  getitem_1 = None
 
         _set_fwd_grad_enabled_2 = torch._C._set_fwd_grad_enabled(True);  _set_fwd_grad_enabled_2 = None
         _jvp_decrement_nesting = torch._functorch.predispatch._jvp_decrement_nesting();  _jvp_decrement_nesting = None
 
         _unpack_dual_1 = torch._functorch.predispatch._unpack_dual(_unwrap_for_grad, level = 0);  _unwrap_for_grad = None
-        getitem_2: "f32[3, 3, 3]" = _unpack_dual_1[0]
-        getitem_3: "f32[3, 3, 3]" = _unpack_dual_1[1];  _unpack_dual_1 = None
         _unpack_dual_2 = torch._functorch.predispatch._unpack_dual(_unwrap_for_grad_1, level = 0);  _unwrap_for_grad_1 = None
-        getitem_4: "f32[3, 3, 3]" = _unpack_dual_2[0]
-        getitem_5: "f32[3, 3, 3]" = _unpack_dual_2[1];  _unpack_dual_2 = None
+        getitem_2: "f32[3, 3, 3]" = _unpack_dual_1[0]
 
         _unwrap_for_grad_2: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_2, 1);  getitem_2 = None
+
+        getitem_3: "f32[3, 3, 3]" = _unpack_dual_1[1];  _unpack_dual_1 = None
+
         _unwrap_for_grad_3: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_3, 1);  getitem_3 = None
+
+        getitem_4: "f32[3, 3, 3]" = _unpack_dual_2[0]
+
         _unwrap_for_grad_4: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_4, 1);  getitem_4 = None
+
+        getitem_5: "f32[3, 3, 3]" = _unpack_dual_2[1];  _unpack_dual_2 = None
+
         _unwrap_for_grad_5: "f32[3, 3, 3]" = torch._functorch.predispatch._unwrap_for_grad(getitem_5, 1);  getitem_5 = None
 
         _exit_dual_level = torch._functorch.predispatch._exit_dual_level(level = 0);  _exit_dual_level = None

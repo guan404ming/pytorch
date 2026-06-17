@@ -325,9 +325,9 @@ class GraphModule(torch.nn.Module):
 
         _set_grad_enabled_1 = torch._C._set_grad_enabled(True);  _set_grad_enabled_1 = None
 
-        mul: "f32[2, 2]" = l_x_ * l_y_;  l_x_ = l_y_ = None
-
         _lower_version_count_by_1 = torch__dynamo_variables_builtin__lower_version_count_by_1(set_);  set_ = _lower_version_count_by_1 = None
+
+        mul: "f32[2, 2]" = l_x_ * l_y_;  l_x_ = l_y_ = None
         return (mul,)
 """,
         )

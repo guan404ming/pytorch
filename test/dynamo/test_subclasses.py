@@ -3046,17 +3046,16 @@ class GraphModule(torch.nn.Module):
         primals_6: "Sym(s47)",  # PlainAOTInput(idx=1)
         primals_7: "Sym(s16)",  # PlainAOTInput(idx=2)
     ):
-        mul: "Sym(s16*s47)" = primals_6 * primals_7
-
         clone: "f32[s47, s16]" = torch.ops.aten.clone.default(primals_1);  primals_1 = None
         clone_1: "f32[s47, s16]" = torch.ops.aten.clone.default(primals_2);  primals_2 = None
 
-        view: "f32[s16*s47]" = torch.ops.aten.view.default(clone, [mul]);  clone = None
-        view_1: "f32[s16*s47]" = torch.ops.aten.view.default(clone_1, [mul]);  clone_1 = None
+        mul_6: "Sym(s16*s47)" = primals_6 * primals_7
+        view: "f32[s16*s47]" = torch.ops.aten.view.default(clone, [mul_6]);  clone = None
+        view_1: "f32[s16*s47]" = torch.ops.aten.view.default(clone_1, [mul_6]);  clone_1 = None
         return (
             view,  # SubclassGetAttrAOTOutput(base=PlainAOTOutput(idx=0), attr='a')
             view_1,  # SubclassGetAttrAOTOutput(base=PlainAOTOutput(idx=0), attr='b')
-            mul,  # SubclassSizeAOTOutput(base=PlainAOTOutput(idx=0), idx=0)
+            mul_6,  # SubclassSizeAOTOutput(base=PlainAOTOutput(idx=0), idx=0)
             primals_6,  # SavedForBackwardsAOTOutput(idx=0)
             primals_7,  # SavedForBackwardsAOTOutput(idx=1)
         )
@@ -3113,18 +3112,17 @@ class GraphModule(torch.nn.Module):
         primals_6: "Sym(s47)",  # PlainAOTInput(idx=1)
         primals_7: "Sym(s16)",  # PlainAOTInput(idx=2)
     ):
-        mul: "Sym(s16*s47)" = primals_6 * primals_7
-
         clone: "f32[s47, s16]" = torch.ops.aten.clone.default(primals_1);  primals_1 = None
         clone_1: "f32[s47, s16]" = torch.ops.aten.clone.default(primals_2);  primals_2 = None
 
-        view: "f32[s16*s47]" = torch.ops.aten.view.default(clone, [mul])
-        view_1: "f32[s16*s47]" = torch.ops.aten.view.default(clone_1, [mul]);  clone_1 = None
+        mul_6: "Sym(s16*s47)" = primals_6 * primals_7
+        view: "f32[s16*s47]" = torch.ops.aten.view.default(clone, [mul_6])
+        view_1: "f32[s16*s47]" = torch.ops.aten.view.default(clone_1, [mul_6]);  clone_1 = None
         return (
             clone,  # PlainAOTOutput(idx=0)
             view,  # SubclassGetAttrAOTOutput(base=PlainAOTOutput(idx=1), attr='a')
             view_1,  # SubclassGetAttrAOTOutput(base=PlainAOTOutput(idx=1), attr='b')
-            mul,  # SubclassSizeAOTOutput(base=PlainAOTOutput(idx=1), idx=0)
+            mul_6,  # SubclassSizeAOTOutput(base=PlainAOTOutput(idx=1), idx=0)
             primals_6,  # SavedForBackwardsAOTOutput(idx=0)
             primals_7,  # SavedForBackwardsAOTOutput(idx=1)
         )
