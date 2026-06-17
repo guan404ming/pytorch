@@ -345,9 +345,18 @@ class ConstantVariable(VariableTracker):
         if isinstance(self.value, str) and name in str.__dict__:
             method = getattr(self.value, name)
             try:
-                return ConstantVariable.create(method(*const_args, **const_kwargs))
+                result = method(*const_args, **const_kwargs)
             except Exception as e:
                 raise_observed_exception(type(e), tx)
+            if isinstance(result, list):
+                # str methods like split/rsplit/splitlines return a fresh,
+                # caller-owned mutable list; model it as a new mutable list so
+                # subsequent mutations (e.g. list.sort) are tracked.
+                return variables.ListVariable(
+                    [ConstantVariable.create(x) for x in result],
+                    mutation_type=ValueMutationNew(),
+                )
+            return ConstantVariable.create(result)
         elif isinstance(self.value, (float, int)) and hasattr(self.value, name):
             if not (args or kwargs):
                 try:

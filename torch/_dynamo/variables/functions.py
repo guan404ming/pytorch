@@ -139,6 +139,17 @@ class ClosureConversionError(NotImplementedError):
     pass
 
 
+class ArgumentBindingError(TypeError):
+    # Raised by bind_args_cached for a genuine argument/signature mismatch that
+    # CPython would surface as a TypeError at call time (missing/extra
+    # positional args, unexpected/missing keyword args). The inline path
+    # converts this into an observed TypeError so user code catching it (e.g.
+    # list.sort with a bad key, assertRaises(TypeError, ...)) behaves like
+    # eager. A plain TypeError raised elsewhere in binding signals an internal
+    # Dynamo limitation and still graph-breaks.
+    pass
+
+
 @functools.lru_cache
 def get_pytree_SUPPORTED_NODES_source() -> AttrSource:
     return AttrSource(
@@ -249,14 +260,14 @@ def bind_args_cached(
                 default_source = DefaultsSource(fn_source, idx)
             ba[name] = wrap_bound_arg(tx, spec.defaults[idx], default_source)
         else:
-            raise TypeError(f"missing required positional argument: {name}")
+            raise ArgumentBindingError(f"missing required positional argument: {name}")
 
     # 2) *args
     extra = args[len(spec.all_pos_names) :]
     if spec.varargs_name:
         ba[spec.varargs_name] = wrap_bound_arg(tx, tuple(extra))
     elif extra:
-        raise TypeError(
+        raise ArgumentBindingError(
             f"Too many positional arguments: got {len(args)}, expected {len(spec.all_pos_names)}"
         )
 
@@ -270,13 +281,15 @@ def bind_args_cached(
                 kwdefault_source = DefaultsSource(fn_source, name, is_kw=True)
             ba[name] = wrap_bound_arg(tx, spec.kwdefaults[name], kwdefault_source)
         else:
-            raise TypeError(f"Missing required keyword-only argument: {name}")
+            raise ArgumentBindingError(
+                f"Missing required keyword-only argument: {name}"
+            )
 
     # 4) **kwargs
     if spec.varkw_name:
         ba[spec.varkw_name] = wrap_bound_arg(tx, rem_kw)
     elif rem_kw:
-        raise TypeError(f"Unexpected keyword arguments: {list(rem_kw)}")
+        raise ArgumentBindingError(f"Unexpected keyword arguments: {list(rem_kw)}")
 
     return ba
 
@@ -2112,7 +2125,10 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
         )
         if self.kwdefaults:
             func.__kwdefaults__ = self.kwdefaults.keys_as_python_constant()  # type: ignore[attr-defined]
-        bound = inspect.signature(func).bind(*args, **kwargs)
+        try:
+            bound = inspect.signature(func).bind(*args, **kwargs)
+        except TypeError as e:
+            raise ArgumentBindingError(str(e)) from e
         bound.apply_defaults()
         result = dict(bound.arguments.items())
         wrap_args_kwargs(parent.output.root_tx, result)  # type: ignore[arg-type]

@@ -162,6 +162,7 @@ from .variables.ctx_manager import (
 )
 from .variables.dicts import ConstDictVariable
 from .variables.functions import (
+    ArgumentBindingError,
     BaseUserFunctionVariable,
     CO_VARARGS,
     CO_VARKEYWORDS,
@@ -5829,6 +5830,13 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         sub_locals = None
         try:
             sub_locals = func.bind_args(parent, args, kwargs)
+        except ArgumentBindingError as e:
+            # A genuine signature mismatch CPython would raise at call time.
+            # Mirror it as an observed TypeError so user code that catches it
+            # (e.g. list.sort with a bad key) behaves like eager.
+            exc.raise_observed_exception(
+                TypeError, parent, args=[f"{func.get_name()}() {e}"]
+            )
         except TypeError as e:
             unimplemented(
                 gb_type="failed to bind arguments when attempting to inline",

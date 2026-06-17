@@ -6079,26 +6079,25 @@ class DefaultsTests(torch._dynamo.test_case.TestCase):
         with self.assertRaises(Unsupported):
             a.call_function(None, [], {})
 
-    def test_unsupported_msg_in_bind_args_error(self):
+    def test_bind_args_mismatch_raises_typeerror(self):
+        # A signature mismatch (here a missing required __init__ arg) raises
+        # TypeError in eager; Dynamo mirrors it as an observed TypeError that a
+        # try/except can catch instead of graph-breaking.
         class BadClass:
             """Class that requires 'cls' argument."""
 
             def __init__(self, cls):
                 self.cls = cls
 
-        @contextlib.contextmanager
-        def my_context():
-            yield
-
         @torch.compile(backend="eager", fullgraph=True)
         def fn():
-            with my_context():
-                # Error: Missing required positional argument 'cls'
-                obj = BadClass()  # This will raise TypeError
-                return obj
+            try:
+                BadClass()  # missing required positional argument 'cls'
+            except TypeError:
+                return "TypeError"
+            return "no error"
 
-        with self.assertRaisesRegex(Unsupported, "obj = BadClass()"):
-            fn()
+        self.assertEqual(fn(), "TypeError")
 
     def test_inspect_method_source(self):
         class Mod(torch.nn.Module):
@@ -6275,6 +6274,85 @@ class DefaultsTests(torch._dynamo.test_case.TestCase):
         result = func_compiled(x)
 
         self.assertEqual(result, expected)
+
+
+class ArgumentBindingTests(torch._dynamo.test_case.TestCase):
+    # A call with a signature mismatch raises TypeError in eager; Dynamo should
+    # mirror that as an observed TypeError rather than graph-breaking.
+    def test_missing_positional_arg_raises_typeerror(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn():
+            g = lambda x, y: x + y
+            try:
+                g(1)
+            except TypeError:
+                return "TypeError"
+            return "no error"
+
+        self.assertEqual(fn(), "TypeError")
+
+    def test_too_many_positional_args_raises_typeerror(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn():
+            g = lambda x: x
+            try:
+                g(1, 2)
+            except TypeError:
+                return "TypeError"
+            return "no error"
+
+        self.assertEqual(fn(), "TypeError")
+
+    def test_unexpected_keyword_arg_raises_typeerror(self):
+        def g(x):
+            return x
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn():
+            try:
+                g(1, z=2)
+            except TypeError:
+                return "TypeError"
+            return "no error"
+
+        self.assertEqual(fn(), "TypeError")
+
+    def test_list_sort_bad_key_raises_typeerror(self):
+        # CPython list.sort calls key(item) with one arg; a two-arg key raises
+        # TypeError, mirroring test_sort.TestDecorateSortUndecorate.test_baddecorator.
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn():
+            data = ["b", "a", "c"]
+            try:
+                data.sort(key=lambda x, y: 0)
+            except TypeError:
+                return "TypeError"
+            return "no error"
+
+        self.assertEqual(fn(), "TypeError")
+
+    def test_str_split_returns_mutable_list(self):
+        # str.split returns a fresh caller-owned list; sorting it must mutate
+        # in place under Dynamo just like eager.
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn():
+            data = "the quick brown fox".split()  # noqa: SIM905
+            data.sort()
+            return data
+
+        self.assertEqual(fn(), ["brown", "fox", "quick", "the"])
+
+    def test_str_split_sort_with_cmp_to_key(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn():
+            def my_cmp(x, y):
+                return (x > y) - (x < y)
+
+            data = "b a c".split()  # noqa: SIM905
+            data.sort(key=functools.cmp_to_key(my_cmp))
+            return data
+
+        self.assertEqual(fn(), ["a", "b", "c"])
 
 
 instantiate_parametrized_tests(FunctionTests)
