@@ -4,18 +4,18 @@ Note [Opaque Objects]
 Opaque objects are the way we allow custom operators to accept a user-defined
 "black box" object as an input.
 
-There are two kinds of opaque types: VALUE type and REFERENCE type.
+There are two kinds of opaque types: VALUE type and SYMBOLIC type.
 The distinction determines how torch.compile handles the object.
 
-REFERENCE TYPES (default):
+SYMBOLIC TYPES (default):
 
-Reference-typed opaque objects represent mutable stateful objects and are
+Symbolic-typed opaque objects represent mutable stateful objects and are
 treated as black boxes. In torch.compile, since torch.compile cannot optimize
 the anything (including tensors) within the object, the object must be an
 input to the graph.
 
-You can register a custom class as being a reference-based opaque object class
-through `register_custom_class(MyClass, typ="reference")`.
+You can register a custom class as being a symbolic-typed opaque object class
+through `register_custom_class(MyClass, typ="symbolic")`.
 
 VALUE TYPES:
 
@@ -99,7 +99,7 @@ ReconstructFn: TypeAlias = Callable[
 @dataclass
 class _OpaqueTypeInfo:
     class_name: str
-    opaque_typ: Literal["reference", "value"]
+    opaque_typ: Literal["symbolic", "value"]
     guard_fn: Callable[
         [Any], list[Any]
     ]  # Callable that takes the object and returns list of values to guard on
@@ -214,9 +214,13 @@ def register_custom_class(
             "during torch.compile tracing. "
         )
 
-    if typ not in ["reference", "value"]:
+    if typ == "reference":
+        log.warning("typ='reference' is deprecated, use typ='symbolic' instead")
+        typ = "symbolic"
+
+    if typ not in ["symbolic", "value"]:
         raise AssertionError(
-            f"Opaque type must be either 'reference' or 'value', got {typ!r}"
+            f"Custom class type must be either 'symbolic' or 'value', got {typ!r}"
         )
 
     if typ == "value":
@@ -368,12 +372,12 @@ def is_opaque_reference_type(cls: Any) -> bool:
         return False
 
     if isinstance(cls, str):
-        return _OPAQUE_TYPES_BY_NAME[cls].opaque_typ == "reference"
+        return _OPAQUE_TYPES_BY_NAME[cls].opaque_typ == "symbolic"
 
     info = _resolve_opaque_type_info(cls)
     if info is None:
         return False
-    return info.opaque_typ == "reference"
+    return info.opaque_typ == "symbolic"
 
 
 def get_opaque_obj_repr(obj: Any) -> tuple[str, dict[str, type]]:
