@@ -43,7 +43,7 @@ try:
 
     _HAS_CUDA_BINDINGS = True
 except ImportError:
-    _rt = None  # type: ignore[assignment]
+    _rt: Any = None
     _HAS_CUDA_BINDINGS = False
 
 
