@@ -2,8 +2,10 @@
 # ruff: noqa: F841
 
 import collections
+import contextlib
 import copy
 import gc
+import gzip
 import json
 import mmap
 import os
@@ -16,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import warnings
 from dataclasses import dataclass, field
@@ -23,6 +26,12 @@ from typing import Optional, TYPE_CHECKING
 from unittest.mock import patch
 
 import expecttest
+
+
+# Suppress libkineto USDT profiler_start/profiler_stop logs in this verbose
+# profiler test file. USDT is the highest libkineto log type, so use one level
+# above it.
+os.environ.setdefault("KINETO_LOG_LEVEL", "6")
 
 import torch
 import torch.nn as nn
@@ -42,20 +51,7 @@ from torch.profiler import (
     record_function,
     supported_activities,
 )
-from torch.profiler._pattern_matcher import (
-    Conv2dBiasFollowedByBatchNorm2dPattern,
-    ExtraCUDACopyPattern,
-    ForLoopIndexingPattern,
-    FP32MatMulPattern,
-    GradNotSetToNonePattern,
-    MatMulDimInFP16Pattern,
-    NamePattern,
-    OptimizerSingleTensorPattern,
-    Pattern,
-    report_all_anti_patterns,
-    SynchronizedDataLoaderPattern,
-)
-from torch.testing._internal.common_cuda import TEST_MULTIGPU
+from torch.testing._internal.common_cuda import SM100OrLater, TEST_MULTIGPU
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     onlyAccelerator,
@@ -83,10 +79,16 @@ from torch.testing._internal.common_utils import (
     TestCase,
     xfailIfNoAcceleratorTriton,
 )
+from torch.utils._import_utils import _check_module_exists
 
 
 if TYPE_CHECKING:
     from torch.autograd.profiler_util import FunctionEvent
+
+
+# cupti-python is pip-installable on ROCm hosts too, but CUPTI itself is a no-op
+# there, so gate the monitor tests off ROCm as well.
+TEST_CUPTI_PYTHON = _check_module_exists("cupti") and not TEST_WITH_ROCM
 
 
 def get_profiler_activities(device_type):
@@ -96,6 +98,21 @@ def get_profiler_activities(device_type):
         if device_activity and device_activity in supported_activities():
             activities.append(device_activity)
     return activities
+
+
+def setUpModule():
+    if (
+        kineto_available()
+        and torch.cuda.is_available()
+        and ProfilerActivity.CUDA in supported_activities()
+    ):
+        # Kineto's process-global profiler cannot currently upgrade from a
+        # CPU-only first initialization to CUDA-capable profiling. Prime it with
+        # CUDA so CPU-only tests do not poison later CUDA profiler tests.
+        x = torch.ones(1, device="cuda")
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]):
+            x + x
+            torch.cuda.synchronize()
 
 
 # if tqdm is not shutdown properly, it will leave the monitor thread alive.
@@ -140,6 +157,59 @@ class TestProfilerCUDA(TestCase):
         self.assertGreater(
             profiler_stats.function_events_build_tree_call_duration_us, 0
         )
+
+    @xfailIfNoAcceleratorTriton
+    @unittest.skipIf(not kineto_available(), "Kineto is required")
+    def test_compile_timeline_provenance_survives_reset_scope(self):
+        import torch._inductor.config as inductor_config
+        import torch._inductor.debug as inductor_debug
+
+        previous_kernel_information_jsons = copy.deepcopy(
+            inductor_debug.get_kernel_information_jsons()
+        )
+        inductor_debug.get_kernel_information_jsons().clear()
+
+        def fn(x):
+            return torch.sin(x + 1).relu()
+
+        try:
+            with (
+                inductor_config.patch(
+                    {
+                        "force_disable_caches": True,
+                        "trace.provenance_tracking_to_timeline": True,
+                        "triton.unique_kernel_names": True,
+                    }
+                ),
+                TemporaryFileName(mode="w+") as trace_path,
+            ):
+                compiled_fn = torch.compile(fn, backend="inductor")
+                x = torch.randn(64, 64, device="cuda")
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                ) as prof:
+                    compiled_fn(x)
+                    torch.cuda.synchronize()
+
+                prof.export_chrome_trace(trace_path)
+                with open(trace_path) as f:
+                    trace = json.load(f)
+
+            kernel_stacks = [
+                event.get("args", {}).get("stack")
+                for event in trace["traceEvents"]
+                if event.get("cat") == "kernel"
+            ]
+            self.assertTrue(
+                any(stack for stack in kernel_stacks),
+                "Expected a generated kernel in the exported trace to carry a stack",
+            )
+            self.assertEqual(inductor_debug.get_kernel_information_jsons(), {})
+        finally:
+            inductor_debug.get_kernel_information_jsons().clear()
+            inductor_debug.get_kernel_information_jsons().update(
+                previous_kernel_information_jsons
+            )
 
     @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/78457")
     def test_mem_leak(self):
@@ -230,7 +300,7 @@ with profile(activities=[ProfilerActivity.CUDA]):
     add_one_graphed(zeros)
 """,
             ],
-            universal_newlines=True,
+            text=True,
             timeout=60,
         )
 
@@ -407,6 +477,312 @@ with profile(activities=[ProfilerActivity.CUDA]):
                 y = torch.mm(x, x)
         self.assertGreater(len(p.events()), 0)
 
+    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    @unittest.skipUnless(
+        SM100OrLater, "hardware event sampling requires GB200+ (sm_100)"
+    )
+    def test_cupti_monitor_enable_hes_early_guard(self):
+        import subprocess
+
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-c",
+                """
+import torch
+from torch.profiler import _cupti_monitor
+
+_cupti_monitor.enable_hes_early()
+assert _cupti_monitor.is_hes_enabled()
+""",
+            ],
+            text=True,
+            timeout=60,
+        )
+
+        p = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import torch
+from torch.profiler import _cupti_monitor
+
+torch.randn(1, device="cuda")
+_cupti_monitor.enable_hes_early()
+""",
+            ],
+            text=True,
+            timeout=60,
+            capture_output=True,
+        )
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(
+            "enable_hes_early() must be called before CUDA context creation",
+            p.stderr,
+        )
+
+    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    def test_cupti_monitor_collection_raw_dump_smoke(self):
+        from torch.profiler import _cupti_monitor
+
+        with TemporaryDirectoryName() as out_dir:
+            self.assertIsNone(_cupti_monitor.get_monitor())
+            monitor = _cupti_monitor.start_collection(out_dir)
+            self.assertIs(monitor, _cupti_monitor.get_monitor())
+
+            x = torch.randn(64, 64, device="cuda")
+            y = torch.relu(x + 1)
+            y.sum().item()
+            torch.cuda.synchronize()
+
+            stats = _cupti_monitor.stop_collection()
+            self.assertIsNotNone(stats)
+            self.assertIsNone(_cupti_monitor.get_monitor())
+            # The native C++ pool must actually have been exercised: catches a
+            # silent regression to a no-op (e.g. broken callback registration or
+            # symbol export) that would still produce passing file-existence
+            # checks if the worker never saw a buffer.
+            self.assertGreater(stats["buffers_allocated"], 0)
+            self.assertGreater(stats["buffers_completed"], 0)
+            self.assertEqual(stats["buffers_pending"], 0)
+            self.assertTrue(
+                os.path.exists(os.path.join(out_dir, _cupti_monitor._META_FILE))
+            )
+            self.assertTrue(
+                os.path.exists(os.path.join(out_dir, _cupti_monitor._RAW_BUFFER_FILE))
+            )
+            self.assertGreater(
+                os.path.getsize(os.path.join(out_dir, _cupti_monitor._META_FILE)), 0
+            )
+            self.assertGreater(
+                os.path.getsize(os.path.join(out_dir, _cupti_monitor._RAW_BUFFER_FILE)),
+                0,
+            )
+
+    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    def test_cupti_monitor_collection_repeated_lifecycle(self):
+        from torch.profiler import _cupti_monitor
+
+        for _ in range(2):
+            with TemporaryDirectoryName() as out_dir:
+                self.assertIsNone(_cupti_monitor.get_monitor())
+                _cupti_monitor.start_collection(out_dir)
+
+                x = torch.randn(32, 32, device="cuda")
+                y = torch.sigmoid(x)
+                y.sum().item()
+                torch.cuda.synchronize()
+
+                stats = _cupti_monitor.stop_collection()
+                self.assertIsNotNone(stats)
+                self.assertIsNone(_cupti_monitor.get_monitor())
+
+                self.assertTrue(
+                    os.path.exists(os.path.join(out_dir, _cupti_monitor._META_FILE))
+                )
+                self.assertTrue(
+                    os.path.exists(
+                        os.path.join(out_dir, _cupti_monitor._RAW_BUFFER_FILE)
+                    )
+                )
+                self.assertGreater(
+                    os.path.getsize(
+                        os.path.join(out_dir, _cupti_monitor._RAW_BUFFER_FILE)
+                    ),
+                    0,
+                )
+
+    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    def test_cupti_monitor_multithread_runtime_thread_assignment(self):
+        x1 = torch.randn(256, 256, device="cuda")
+        x2 = torch.randn(256, 256, device="cuda")
+        y1 = torch.randn(256, 256, device="cuda")
+        y2 = torch.randn(256, 256, device="cuda")
+
+        # Warm up kernel/runtime state so the profiled region is dominated by the
+        # launches from the two worker threads.
+        _ = torch.relu(x1 + y1)
+        _ = torch.relu(x2 + y2)
+        torch.cuda.synchronize()
+
+        start_evt = threading.Event()
+
+        def worker(name, x, y):
+            start_evt.wait()
+            with record_function(name):
+                z = torch.relu(x + y)
+                z.sum().item()
+                torch.cuda.synchronize()
+
+        cfg = _ExperimentalConfig(
+            profile_all_threads=True,
+            custom_profiler_config='{"backend":"cupti_monitor"}',
+        )
+
+        with TemporaryFileName(mode="w+") as trace_path:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                experimental_config=cfg,
+            ) as prof:
+                threads = [
+                    threading.Thread(target=worker, args=("worker_a", x1, y1)),
+                    threading.Thread(target=worker, args=("worker_b", x2, y2)),
+                ]
+                for thread in threads:
+                    thread.start()
+                start_evt.set()
+                for thread in threads:
+                    thread.join()
+
+            prof.export_chrome_trace(trace_path)
+
+            opener = gzip.open if trace_path.endswith(".gz") else open
+            with opener(trace_path, "rt") as f:
+                data = json.load(f)
+
+        events = data["traceEvents"]
+        worker_tids = sorted(
+            {
+                e["tid"]
+                for e in events
+                if e.get("ph") == "X"
+                and e.get("cat") == "user_annotation"
+                and e.get("name") in {"worker_a", "worker_b"}
+                and isinstance(e.get("tid"), int)
+            }
+        )
+        launch_tids = sorted(
+            {
+                e["tid"]
+                for e in events
+                if e.get("ph") == "X"
+                and e.get("cat") == "cuda_runtime"
+                and e.get("name") == "cudaLaunchKernel"
+                and isinstance(e.get("tid"), int)
+            }
+        )
+
+        self.assertEqual(len(worker_tids), 2)
+        self.assertGreater(len(launch_tids), 0)
+        self.assertTrue(set(launch_tids).issubset(set(worker_tids)))
+
+    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    def test_cupti_monitor_trace_has_expected_events(self):
+        cfg = _ExperimentalConfig(
+            custom_profiler_config='{"backend":"cupti_monitor"}',
+        )
+        with TemporaryFileName(mode="w+") as trace_path:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                experimental_config=cfg,
+            ) as prof:
+                with record_function("monitor_region"):
+                    a = torch.randn(128, 128, device="cuda")
+                    b = torch.randn(128, 128, device="cuda")
+                    c = (a @ b).relu()
+                    _ = c.cpu()
+                    torch.cuda.synchronize()
+            prof.export_chrome_trace(trace_path)
+            with open(trace_path) as f:
+                events = json.load(f)["traceEvents"]
+
+        cats = {e.get("cat") for e in events if e.get("ph") == "X"}
+        for expected in (
+            "kernel",
+            "cuda_runtime",
+            "gpu_memcpy",
+            "cpu_op",
+            "user_annotation",
+        ):
+            self.assertIn(
+                expected,
+                cats,
+                f"missing {expected}; got {sorted(c for c in cats if c)}",
+            )
+
+        kernels = [e for e in events if e.get("cat") == "kernel" and e.get("ph") == "X"]
+        self.assertGreater(len(kernels), 0)
+        self.assertTrue(all(e["dur"] > 0 for e in kernels))
+
+        runtime_names = {
+            e.get("name") for e in events if e.get("cat") == "cuda_runtime"
+        }
+        self.assertIn("cudaLaunchKernel", runtime_names)
+
+        user_names = {
+            e["name"]
+            for e in events
+            if e.get("cat") == "user_annotation" and e.get("ph") == "X"
+        }
+        self.assertIn("monitor_region", user_names)
+
+    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    def test_cupti_monitor_record_shapes(self):
+        cfg = _ExperimentalConfig(
+            custom_profiler_config='{"backend":"cupti_monitor"}',
+        )
+
+        def shaped_cpu_ops(record_shapes):
+            with TemporaryFileName(mode="w+") as trace_path:
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=record_shapes,
+                    experimental_config=cfg,
+                ) as prof:
+                    a = torch.randn(64, 64, device="cuda")
+                    (a @ a).relu()
+                    torch.cuda.synchronize()
+                prof.export_chrome_trace(trace_path)
+                with open(trace_path) as f:
+                    events = json.load(f)["traceEvents"]
+            return [
+                e
+                for e in events
+                if e.get("cat") == "cpu_op" and "Input Dims" in e.get("args", {})
+            ]
+
+        # record_shapes is a CPU-side setting, so it must flow through the monitor
+        # backend just like the stock profiler.
+        self.assertEqual(shaped_cpu_ops(record_shapes=False), [])
+        self.assertGreater(len(shaped_cpu_ops(record_shapes=True)), 0)
+
+    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    def test_cupti_monitor_matches_stock_op_and_kernel_names(self):
+        def trace_summary(use_monitor):
+            cfg = _ExperimentalConfig(
+                custom_profiler_config='{"backend":"cupti_monitor"}'
+                if use_monitor
+                else ""
+            )
+            with TemporaryFileName(mode="w+") as trace_path:
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    experimental_config=cfg,
+                ) as prof:
+                    a = torch.randn(128, 128, device="cuda")
+                    b = torch.randn(128, 128, device="cuda")
+                    (a @ b).relu().sum()
+                    torch.cuda.synchronize()
+                prof.export_chrome_trace(trace_path)
+                with open(trace_path) as f:
+                    events = json.load(f)["traceEvents"]
+            aten_ops = {
+                e["name"]
+                for e in events
+                if e.get("cat") == "cpu_op" and e.get("name", "").startswith("aten::")
+            }
+            n_kernels = sum(
+                1 for e in events if e.get("cat") == "kernel" and e.get("ph") == "X"
+            )
+            return aten_ops, n_kernels
+
+        stock_ops, stock_kernels = trace_summary(use_monitor=False)
+        monitor_ops, monitor_kernels = trace_summary(use_monitor=True)
+        self.assertGreater(stock_kernels, 0)
+        self.assertGreater(monitor_kernels, 0)
+        self.assertEqual(monitor_ops, stock_ops)
+
 
 @unittest.skipIf(not torch.profiler.itt.is_available(), "ITT is required")
 class TestProfilerITT(TestCase):
@@ -438,6 +814,642 @@ class TestProfilerITT(TestCase):
 
 @instantiate_parametrized_tests
 class TestProfiler(TestCase):
+    @contextlib.contextmanager
+    def _kernel_information_jsons(self, kernel_information_jsons):
+        import torch._inductor.debug as inductor_debug
+
+        previous = copy.deepcopy(inductor_debug.get_kernel_information_jsons())
+        current = inductor_debug.get_kernel_information_jsons()
+        current.clear()
+        current.update(kernel_information_jsons)
+        try:
+            yield
+        finally:
+            current.clear()
+            current.update(previous)
+
+    @skipIfTorchDynamo("native ctypes/CUPTI probe; nothing to compile")
+    @parametrize("version", [1, 2])
+    def test_cupti_monitor_buffer_pool_reuse(self, version):
+        # The CUPTI monitor's buffer pool is pure C++ (no CUDA/cupti-python), so
+        # drive its native buffer-requested / buffer-completed callbacks directly
+        # via ctypes to verify returned buffers are recycled rather than
+        # reallocated. Both the v1 (cuptiActivityRegisterCallbacks) and v2
+        # (cuptiActivityRegisterCallbacks_v2) callback signatures feed the same
+        # pool/queue; v2's request appends an (ignored) info pointer, and v2's
+        # complete reorders args and drops the (CUcontext, streamId) that v1
+        # carries, so v2-completed buffers report ctx/stream of 0.
+        import ctypes
+
+        pyprof = torch._C._profiler
+        pyprof._cupti_monitor_reset_buffers()
+        self.addCleanup(pyprof._cupti_monitor_reset_buffers)
+        buffer_size = 64 * 1024
+        pyprof._cupti_monitor_configure_buffers(buffer_size)
+
+        if version == 1:
+            request_t = ctypes.CFUNCTYPE(
+                None,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t),
+            )
+            complete_t = ctypes.CFUNCTYPE(
+                None,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+            )
+        else:
+            request_t = ctypes.CFUNCTYPE(
+                None,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_void_p,
+            )
+            complete_t = ctypes.CFUNCTYPE(
+                None,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+            )
+        request = request_t(
+            pyprof._cupti_monitor_buffer_request_callback_address(version)
+        )
+        complete = complete_t(
+            pyprof._cupti_monitor_buffer_complete_callback_address(version)
+        )
+
+        def do_request():
+            buf = ctypes.c_void_p()
+            size = ctypes.c_size_t()
+            max_records = ctypes.c_size_t()
+            args = [ctypes.byref(buf), ctypes.byref(size), ctypes.byref(max_records)]
+            if version == 2:
+                args.append(None)  # CUpti_BufferCallbackRequestInfo*
+            request(*args)
+            return buf.value, size.value
+
+        def do_complete(ptr):
+            if version == 1:
+                complete(
+                    ctypes.c_void_p(0xABCD), 7, ctypes.c_void_p(ptr), buffer_size, 4096
+                )
+            else:
+                complete(ctypes.c_void_p(ptr), buffer_size, 4096, None)
+
+        # v1 carries ctx/stream through to the completed record; v2 reports 0.
+        expected_ctx, expected_stream = (0xABCD, 7) if version == 1 else (0, 0)
+
+        # First request has an empty free list, so it allocates.
+        ptr_a, size_a = do_request()
+        self.assertEqual(size_a, buffer_size)
+        self.assertEqual(pyprof._cupti_monitor_allocated_buffers(), 1)
+
+        # Complete it, drain it, and return it to the pool.
+        do_complete(ptr_a)
+        self.assertEqual(pyprof._cupti_monitor_pending_buffers(), 1)
+        item = pyprof._cupti_monitor_get_completed()
+        # 5th field is layout_epoch, 0 here (no reconfiguration in this test).
+        self.assertEqual(item, (ptr_a, 4096, expected_ctx, expected_stream, 0))
+        self.assertEqual(pyprof._cupti_monitor_pending_buffers(), 0)
+        pyprof._cupti_monitor_return_buffer(ptr_a)
+
+        # The next request reuses the freed buffer: same pointer, no new alloc.
+        ptr_b, _ = do_request()
+        self.assertEqual(ptr_b, ptr_a)
+        self.assertEqual(pyprof._cupti_monitor_allocated_buffers(), 1)
+
+        # A second concurrently-outstanding buffer forces a fresh allocation.
+        ptr_c, _ = do_request()
+        self.assertNotEqual(ptr_c, ptr_b)
+        self.assertEqual(pyprof._cupti_monitor_allocated_buffers(), 2)
+
+    @skipIfTorchDynamo("native ctypes/CUPTI probe; nothing to compile")
+    def test_cupti_monitor_v2_record_layout_capture(self):
+        # The v2 complete callback snapshots the CUPTI user-defined record layout
+        # (valid only during the callback) into the current layout epoch, so the
+        # decode thread can parse records afterward and reconfiguring (a new
+        # epoch) does not clobber the layout of buffers still queued under the old
+        # one. Build the CUPTI >= 13.2 complete-info / record-layout structs with
+        # ctypes and drive the native v2 callbacks directly (no CUDA/cupti-python);
+        # this also pins the C++ ABI mirror of those structs.
+        import ctypes
+
+        pyprof = torch._C._profiler
+        pyprof._cupti_monitor_reset_buffers()
+        self.addCleanup(pyprof._cupti_monitor_reset_buffers)
+        pyprof._cupti_monitor_configure_buffers(64 * 1024)
+
+        class FieldEntry(ctypes.Structure):
+            _fields_ = [
+                ("structSize", ctypes.c_size_t),
+                ("fieldId", ctypes.c_int),
+                ("offset", ctypes.c_size_t),
+                ("size", ctypes.c_size_t),
+                ("alignment", ctypes.c_size_t),
+            ]
+
+        class RecordLayout(ctypes.Structure):
+            _fields_ = [
+                ("structSize", ctypes.c_size_t),
+                ("pEntries", ctypes.POINTER(FieldEntry)),
+                ("numFields", ctypes.c_size_t),
+                ("recordSize", ctypes.c_size_t),
+            ]
+
+        class CompleteInfo(ctypes.Structure):
+            _fields_ = [
+                ("structSize", ctypes.c_size_t),
+                ("threadId", ctypes.c_uint64),
+                ("ppRecordLayouts", ctypes.POINTER(ctypes.POINTER(RecordLayout))),
+                ("numRecordLayouts", ctypes.c_size_t),
+            ]
+
+        # One activity kind (9) with two selected fields; the first must be the
+        # *_FIELD_KIND id (0). ppRecordLayouts is indexed by kind, null elsewhere.
+        entries = (FieldEntry * 2)(
+            FieldEntry(ctypes.sizeof(FieldEntry), 0, 0, 4, 4),
+            FieldEntry(ctypes.sizeof(FieldEntry), 5, 8, 8, 8),
+        )
+        layout = RecordLayout(
+            ctypes.sizeof(RecordLayout),
+            ctypes.cast(entries, ctypes.POINTER(FieldEntry)),
+            2,
+            16,
+        )
+        n_kinds = 10
+        layouts_arr = (ctypes.POINTER(RecordLayout) * n_kinds)()
+        layouts_arr[9] = ctypes.pointer(layout)
+        info = CompleteInfo(
+            ctypes.sizeof(CompleteInfo),
+            1234,
+            ctypes.cast(layouts_arr, ctypes.POINTER(ctypes.POINTER(RecordLayout))),
+            n_kinds,
+        )
+
+        request_t = ctypes.CFUNCTYPE(
+            None,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+        )
+        complete_t = ctypes.CFUNCTYPE(
+            None,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        )
+        request = request_t(pyprof._cupti_monitor_buffer_request_callback_address(2))
+        complete = complete_t(pyprof._cupti_monitor_buffer_complete_callback_address(2))
+
+        buf = ctypes.c_void_p()
+        size = ctypes.c_size_t()
+        max_records = ctypes.c_size_t()
+        request(ctypes.byref(buf), ctypes.byref(size), ctypes.byref(max_records), None)
+        complete(
+            ctypes.c_void_p(buf.value),
+            16,
+            16,
+            ctypes.cast(ctypes.pointer(info), ctypes.c_void_p),
+        )
+        # Drain the completed buffer so the pool is tidy for the reset cleanup.
+        item = pyprof._cupti_monitor_get_completed()
+        pyprof._cupti_monitor_return_buffer(item[0])
+        # Captured under the initial epoch 0, and the buffer is tagged with it.
+        self.assertEqual(item[4], 0)
+        self.assertEqual(
+            pyprof._cupti_monitor_record_layouts(0),
+            [(9, 16, [(0, 0, 4), (5, 8, 8)])],
+        )
+
+        # Reconfiguring opens a new epoch with a different layout; the old epoch's
+        # layout is retained so buffers still queued under it decode correctly.
+        self.assertEqual(pyprof._cupti_monitor_next_layout_epoch(), 1)
+        entries_b = (FieldEntry * 1)(FieldEntry(ctypes.sizeof(FieldEntry), 0, 0, 4, 4))
+        layout_b = RecordLayout(
+            ctypes.sizeof(RecordLayout),
+            ctypes.cast(entries_b, ctypes.POINTER(FieldEntry)),
+            1,
+            8,
+        )
+        layouts_arr_b = (ctypes.POINTER(RecordLayout) * 4)()
+        layouts_arr_b[3] = ctypes.pointer(layout_b)
+        info_b = CompleteInfo(
+            ctypes.sizeof(CompleteInfo),
+            1234,
+            ctypes.cast(layouts_arr_b, ctypes.POINTER(ctypes.POINTER(RecordLayout))),
+            4,
+        )
+        request(ctypes.byref(buf), ctypes.byref(size), ctypes.byref(max_records), None)
+        complete(
+            ctypes.c_void_p(buf.value),
+            8,
+            8,
+            ctypes.cast(ctypes.pointer(info_b), ctypes.c_void_p),
+        )
+        item_b = pyprof._cupti_monitor_get_completed()
+        pyprof._cupti_monitor_return_buffer(item_b[0])
+        self.assertEqual(item_b[4], 1)
+        self.assertEqual(
+            pyprof._cupti_monitor_record_layouts(1),
+            [(3, 8, [(0, 0, 4)])],
+        )
+        # Epoch 0 still holds the original layout.
+        self.assertEqual(
+            pyprof._cupti_monitor_record_layouts(0),
+            [(9, 16, [(0, 0, 4), (5, 8, 8)])],
+        )
+
+    def test_build_flow_mapping_supports_sparse_flow_ids(self):
+        flow_id = 1_000_000_000
+        trace = {
+            "traceEvents": [
+                {
+                    "name": "aten::add",
+                    "cat": "cpu_op",
+                    "ph": "X",
+                    "ts": 0,
+                    "dur": 5,
+                    "tid": 1,
+                    "args": {},
+                },
+                {
+                    "name": "ac2g",
+                    "cat": "ac2g",
+                    "ph": "s",
+                    "id": flow_id,
+                    "ts": 5,
+                    "tid": 1,
+                    "args": {},
+                },
+                {
+                    "name": "triton_poi_fused_add_0",
+                    "cat": "kernel",
+                    "ph": "X",
+                    "ts": 10,
+                    "dur": 7,
+                    "tid": 2,
+                    "args": {},
+                },
+                {
+                    "name": "ac2g",
+                    "cat": "ac2g",
+                    "ph": "f",
+                    "id": flow_id,
+                    "ts": 17,
+                    "tid": 2,
+                    "args": {},
+                },
+            ]
+        }
+
+        prof = _profile()
+        prof._assign_uniq_id_to_event(trace)
+
+        src2dst, dst2src = prof._build_flow_mapping(
+            trace,
+            [trace["traceEvents"][1], trace["traceEvents"][3]],
+        )
+
+        self.assertEqual(src2dst, {0: 2})
+        self.assertEqual(dst2src, {2: 0})
+
+    def test_maybe_triton_call_uses_inductor_prefix(self):
+        prof = _profile()
+
+        self.assertTrue(prof._maybe_triton_call("triton_poi_fused_add_0"))
+        self.assertFalse(prof._maybe_triton_call("not_triton_related"))
+
+    def test_add_inductor_kernel_stack_to_chrome_trace(self):
+        kernel_name = "triton_poi_fused_add_0"
+        stack = ["model.py:7 in forward"]
+        kernel_information_jsons = {
+            str(("Torch-Compiled Region: 0/0", False)): {
+                kernel_name: {
+                    "stack_traces": stack,
+                    "post_grad_nodes": ["add"],
+                    "pre_grad_nodes": ["add"],
+                }
+            }
+        }
+        with self._kernel_information_jsons(kernel_information_jsons):
+            trace = {
+                "traceEvents": [
+                    {
+                        "name": "Torch-Compiled Region: 0/0",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 0,
+                        "dur": 100,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "aten::add",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 10,
+                        "dur": 5,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "ac2g",
+                        "cat": "ac2g",
+                        "ph": "s",
+                        "id": 0,
+                        "ts": 15,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": kernel_name,
+                        "cat": "cuda_driver",
+                        "ph": "X",
+                        "ts": 20,
+                        "dur": 7,
+                        "tid": 2,
+                        "args": {},
+                    },
+                    {
+                        "name": "ac2g",
+                        "cat": "ac2g",
+                        "ph": "f",
+                        "id": 0,
+                        "ts": 27,
+                        "tid": 2,
+                        "args": {},
+                    },
+                ]
+            }
+
+            prof = _profile()
+            updated_trace = prof.add_to_chrome_trace(trace)
+
+            self.assertEqual(updated_trace["traceEvents"][3]["args"]["stack"], stack)
+
+    def test_add_inductor_kernel_stack_to_chrome_trace_by_external_id(self):
+        kernel_name = "triton_poi_fused_add_0"
+        stack = ["model.py:7 in forward"]
+        kernel_information_jsons = {
+            str(("Torch-Compiled Region: 0/0", False)): {
+                kernel_name + ":1": {
+                    "stack_traces": stack,
+                    "post_grad_nodes": ["add"],
+                    "pre_grad_nodes": ["add"],
+                }
+            }
+        }
+        with self._kernel_information_jsons(kernel_information_jsons):
+            trace = {
+                "traceEvents": [
+                    {
+                        "name": "Torch-Compiled Region: 0/0",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 0,
+                        "dur": 100,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": kernel_name,
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 10,
+                        "dur": 5,
+                        "tid": 1,
+                        "args": {"External id": 6},
+                    },
+                    {
+                        "name": kernel_name,
+                        "cat": "kernel",
+                        "ph": "X",
+                        "ts": 20,
+                        "dur": 3,
+                        "tid": 2,
+                        "args": {"External id": 6},
+                    },
+                ]
+            }
+
+            prof = _profile()
+            updated_trace = prof.add_to_chrome_trace(trace)
+
+            self.assertEqual(updated_trace["traceEvents"][2]["args"]["stack"], stack)
+
+    def test_add_inductor_kernel_stack_to_chrome_trace_by_external_id_without_triton_kernel_name(
+        self,
+    ):
+        kernel_name = "triton_poi_fused_add_0"
+        stack = ["model.py:7 in forward"]
+        kernel_information_jsons = {
+            str(("Torch-Compiled Region: 0/0", False)): {
+                kernel_name + ":1": {
+                    "stack_traces": stack,
+                    "post_grad_nodes": ["add"],
+                    "pre_grad_nodes": ["add"],
+                }
+            }
+        }
+        with self._kernel_information_jsons(kernel_information_jsons):
+            trace = {
+                "traceEvents": [
+                    {
+                        "name": "Torch-Compiled Region: 0/0",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 0,
+                        "dur": 100,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "hipLaunchKernel",
+                        "cat": "cuda_runtime",
+                        "ph": "X",
+                        "ts": 10,
+                        "dur": 5,
+                        "tid": 1,
+                        "args": {"External id": 6},
+                    },
+                    {
+                        "name": "kernel",
+                        "cat": "kernel",
+                        "ph": "X",
+                        "ts": 20,
+                        "dur": 3,
+                        "tid": 2,
+                        "args": {"External id": 6},
+                    },
+                ]
+            }
+
+            prof = _profile()
+            updated_trace = prof.add_to_chrome_trace(trace)
+
+            self.assertEqual(updated_trace["traceEvents"][2]["args"]["stack"], stack)
+
+    def test_add_inductor_kernel_stack_to_chrome_trace_skips_missing_stack(self):
+        kernel_name = "triton_poi_fused_add_0"
+        kernel_information_jsons = {
+            str(("Torch-Compiled Region: 0/0", False)): {
+                kernel_name: {
+                    "post_grad_nodes": ["add"],
+                    "pre_grad_nodes": ["add"],
+                }
+            }
+        }
+        with self._kernel_information_jsons(kernel_information_jsons):
+            trace = {
+                "traceEvents": [
+                    {
+                        "name": "Torch-Compiled Region: 0/0",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 0,
+                        "dur": 100,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "aten::add",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 10,
+                        "dur": 5,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "ac2g",
+                        "cat": "ac2g",
+                        "ph": "s",
+                        "id": 0,
+                        "ts": 15,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": kernel_name,
+                        "cat": "kernel",
+                        "ph": "X",
+                        "ts": 20,
+                        "dur": 7,
+                        "tid": 2,
+                        "args": {},
+                    },
+                    {
+                        "name": "ac2g",
+                        "cat": "ac2g",
+                        "ph": "f",
+                        "id": 0,
+                        "ts": 27,
+                        "tid": 2,
+                        "args": {},
+                    },
+                ]
+            }
+
+            prof = _profile()
+            updated_trace = prof.add_to_chrome_trace(trace)
+
+            self.assertNotIn("stack", updated_trace["traceEvents"][3]["args"])
+
+    def test_add_inductor_kernel_stack_to_chrome_trace_backward_quoted_region(self):
+        compile_name = "Torch-Compiled Region: odd', True) name"
+        kernel_name = "triton_poi_fused_mul_0"
+        stack = ["model.py:9 in backward"]
+        kernel_information_jsons = {
+            str((compile_name + "_backward_0", True)): {
+                kernel_name: {
+                    "stack_traces": stack,
+                    "post_grad_nodes": ["mul"],
+                    "pre_grad_nodes": ["mul"],
+                }
+            }
+        }
+        with self._kernel_information_jsons(kernel_information_jsons):
+            trace = {
+                "traceEvents": [
+                    {
+                        "name": compile_name,
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 0,
+                        "dur": 100,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "aten::add",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 10,
+                        "dur": 5,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "fwdbwd",
+                        "cat": "fwdbwd",
+                        "ph": "s",
+                        "id": 0,
+                        "ts": 16,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "CompiledFunctionBackward",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 200,
+                        "dur": 100,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "fwdbwd",
+                        "cat": "fwdbwd",
+                        "ph": "f",
+                        "id": 0,
+                        "ts": 201,
+                        "tid": 1,
+                        "args": {},
+                    },
+                    {
+                        "name": "aten::mul",
+                        "cat": "cpu_op",
+                        "ph": "X",
+                        "ts": 210,
+                        "dur": 5,
+                        "tid": 1,
+                        "args": {"External id": 6},
+                    },
+                    {
+                        "name": kernel_name,
+                        "cat": "kernel",
+                        "ph": "X",
+                        "ts": 220,
+                        "dur": 3,
+                        "tid": 2,
+                        "args": {"External id": 6},
+                    },
+                ]
+            }
+
+            prof = _profile()
+            updated_trace = prof.add_to_chrome_trace(trace)
+
+            self.assertEqual(updated_trace["traceEvents"][6]["args"]["stack"], stack)
+
     @unittest.skipIf(
         TEST_WITH_CROSSREF, "crossref intercepts calls and changes the callsite."
     )
@@ -979,6 +1991,20 @@ class TestProfiler(TestCase):
             copied = copy.deepcopy(config)
             self.assertIsInstance(copied, _ExperimentalConfig)
 
+    def test_profiler_range_metrics_deprecated(self):
+        # profiler_metrics and profiler_measure_per_kernel are deprecated
+        # no-ops: passing either must warn with FutureWarning and not error.
+        for cfg in (
+            _ExperimentalConfig(profiler_metrics=["m1", "m2"]),
+            _ExperimentalConfig(profiler_measure_per_kernel=True),
+        ):
+            with self.assertWarnsRegex(FutureWarning, "profiler_metrics"):
+                with profile(
+                    activities=[ProfilerActivity.CPU],
+                    experimental_config=cfg,
+                ):
+                    pass
+
     @unittest.skipIf(not kineto_available(), "Kineto is required")
     @parametrize("use_cuda", [False, True])
     def test_trace_only_export_matches_default(self, use_cuda):
@@ -1147,6 +2173,41 @@ class TestProfiler(TestCase):
             # Now validate the json
             with open(fname) as f:
                 json.load(f)
+
+    @unittest.skipIf(not kineto_available(), "Kineto is required")
+    def test_profiler_trace_sanitizes_python_function_names(self):
+        def template():
+            return None
+
+        bad_code = template.__code__.replace(
+            co_filename='profiler_bad"file.py',
+            co_name='bad"name',
+        )
+        bad_fn = types.FunctionType(bad_code, {})
+
+        with profile(activities=[ProfilerActivity.CPU], with_stack=True) as prof:
+            bad_fn()
+
+        del bad_fn, bad_code
+        gc.collect()
+
+        with TemporaryFileName(mode="w+") as fname:
+            prof.export_chrome_trace(fname)
+            with open(fname) as f:
+                trace = json.load(f)
+
+        python_function_names = [
+            event.get("name", "")
+            for event in trace["traceEvents"]
+            if event.get("cat") == "python_function"
+        ]
+        self.assertGreater(len(python_function_names), 0)
+        self.assertTrue(
+            any(
+                "profiler_bad'file.py" in name and "bad'name" in name
+                for name in python_function_names
+            )
+        )
 
     def test_profiler_tracing(self):
         self._test_profiler_tracing(False)
@@ -1664,7 +2725,11 @@ class TestProfiler(TestCase):
     def test_profiler_time_scale(self):
         MARGIN_ERROR = 0.5
         SEC_TO_US = 1000 * 1000
-        WAIT_TIME = 10
+        # IMPORTANT: For reasons that are not yet understood, having a long idle
+        # profiling window will make later CUPTI activity records (in other tests)
+        # arrive with invalid timestamps, causing them to be dropped as out-of-range.
+        # Empirically, WAIT_TIME should be kept <= 6.
+        WAIT_TIME = 5
         with profile() as p:
             with torch.profiler.record_function("test_span"):
                 for _ in range(WAIT_TIME):
@@ -1836,15 +2901,19 @@ class TestProfiler(TestCase):
                         # Calculate boundaries
                         pre_gc_end = pre_gc["ts"] + pre_gc.get("dur", 0)
                         post_gc_start = post_gc["ts"]
-                        # Assert each Python GC event is correctly placed
-                        for python_gc in python_gc_events:
-                            python_gc_start = python_gc["ts"]
-                            python_gc_end = python_gc["ts"] + python_gc.get("dur", 0)
-                            self.assertTrue(
-                                python_gc_start > pre_gc_end
-                                and python_gc_end < post_gc_start,
-                                f"Python GC event at {python_gc_start} is not correctly placed.",
-                            )
+                        # Assert at least one Python GC event is correctly placed.
+                        # Other automatic GC events can happen while the profiler is
+                        # active, especially during first-run initialization.
+                        python_gc_events_between = [
+                            e
+                            for e in python_gc_events
+                            if e["ts"] > pre_gc_end
+                            and e["ts"] + e.get("dur", 0) < post_gc_start
+                        ]
+                        self.assertTrue(
+                            len(python_gc_events_between) > 0,
+                            "No Python GC events found between pre_gc and post_gc",
+                        )
                     else:
                         python_gc_events = [
                             e for e in events if e["name"] == "Python GC"
@@ -2504,18 +3573,24 @@ class TestProfilerDevice(TestCase):
             opt.step()
             optimizer_step()
 
-        for _ in range(niters):
-            run_batch()
-
-        with profile(
-            activities=supported_activities(),
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=2),
-        ) as p:
+        try:
             for _ in range(niters):
                 run_batch()
-                p.step()
 
-        self.assertEqual(KinetoStepTracker.current_step(), initial_step + 2 * niters)
+            with profile(
+                activities=supported_activities(),
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=2),
+            ) as p:
+                for _ in range(niters):
+                    run_batch()
+                    p.step()
+
+            self.assertEqual(
+                KinetoStepTracker.current_step(), initial_step + 2 * niters
+            )
+        finally:
+            # KinetoStepTracker is global across device-specialized test runs.
+            KinetoStepTracker.erase_step_count("yet_another_step")
 
     @unittest.skipIf(
         IS_MACOS or IS_WINDOWS, "https://github.com/pytorch/pytorch/issues/82915"
@@ -2796,12 +3871,12 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
 
         cpu_op_found = False
         parent_tid = threading.current_thread().ident
-        with profile() as p:
+        with profile(activities=[ProfilerActivity.CPU]) as p:
             self.payload()
         pid = os.fork()
         if pid == 0:
             child_pid = os.getpid()
-            with profile() as p:
+            with profile(activities=[ProfilerActivity.CPU]) as p:
                 self.payload()
             validate_forked_json(p)
             self.assertTrue(cpu_op_found)
@@ -3297,272 +4372,6 @@ class TestExperimentalUtils(TestCase):
 <built-in function _cuda_synchronize>
 aten::copy_""",
         )
-
-    def test_profiler_name_pattern(self):
-        x = torch.ones((100, 100))
-        with profile() as prof:
-            for _ in range(5):
-                x = x @ x
-                x = x + x
-        matched_events = NamePattern(prof, "aten::mm").matched_events()
-        output = "\n".join([f"{event.name}" for event in matched_events])
-        self.assertExpectedInline(
-            output,
-            """\
-aten::mm
-aten::mm
-aten::mm
-aten::mm
-aten::mm""",
-        )
-
-    # TODO: Add logic for CUDA version of test
-    @unittest.skipIf(torch.cuda.is_available(), "Test not working for CUDA")
-    def test_profiler_pattern_match_helper(self):
-        x = torch.ones((100, 100))
-        with profile() as prof:
-            for _ in range(5):
-                x = x @ x
-                x = x + x
-        event_tree = prof.profiler.kineto_results.experimental_event_tree()
-        pattern = Pattern(prof)
-        self.assertEqual([], pattern.siblings_of(event_tree[0])[0])
-        self.assertEqual(event_tree[1:], pattern.siblings_of(event_tree[0])[1])
-        child_nodes = event_tree[0].children
-        self.assertEqual([], pattern.siblings_of(child_nodes[0])[0])
-        self.assertEqual(child_nodes[1:], pattern.siblings_of(child_nodes[0])[1])
-        self.assertEqual(
-            event_tree[0], pattern.root_of(event_tree[0].children[0].children[0])
-        )
-        self.assertEqual(None, pattern.next_of(event_tree[-1]))
-        self.assertEqual(event_tree[1], pattern.next_of(event_tree[0]))
-        self.assertEqual(event_tree[0], pattern.prev_of(event_tree[1]))
-
-    @unittest.skipIf(
-        TEST_WITH_CROSSREF, "crossref intercepts calls and changes the callsite."
-    )
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-    def test_profiler_extra_cuda_copy_pattern(self):
-        cases = (
-            (0, lambda: torch.ones((100, 100), device="cuda")),
-            (1, lambda: torch.ones((100, 100)).to("cuda")),
-            (1, lambda: torch.zeros((100, 100)).to("cuda")),
-            (1, lambda: torch.empty((100, 100)).fill_(5).to("cuda")),
-            (1, lambda: torch.ones((100, 100)).cuda()),
-            (1, lambda: torch.zeros((100, 100)).cuda()),
-            (1, lambda: torch.empty((100, 100)).fill_(5).cuda()),
-            (1, lambda: torch.rand((100, 100)).cuda()),
-            (1, lambda: torch.randn((100, 100)).cuda()),
-            (1, lambda: torch.full((100, 100), 10).cuda()),
-            (0, lambda: torch.rand((100, 100)).to(dtype=torch.float16)),
-            (0, lambda: torch.rand((100, 100)).half()),
-            (0, lambda: torch.rand((100, 100), device="cuda").half()),
-        )
-        num_matched = []
-        for _, fn in cases:
-            with profile(with_stack=True, record_shapes=True) as prof:
-                fn()
-            pattern = ExtraCUDACopyPattern(prof)
-            num_matched.append(len(pattern.matched_events()))
-        self.assertEqual(num_matched, [i for i, _ in cases])
-
-    @unittest.skipIf(
-        TEST_WITH_CROSSREF, "crossref intercepts calls and changes the callsite."
-    )
-    def test_profiler_for_loop_indexing_pattern(self):
-        x = torch.ones((100, 100))
-
-        def case1():
-            for i in range(100):
-                x[i] = i
-
-        def case2():
-            y = 0
-            for i in range(100):
-                y += x[i]
-
-        def case3():
-            y = 1
-            for i in range(100):
-                y *= x[i]
-
-        def case4():
-            y = x
-            for _ in range(100):
-                y = y @ x
-
-        def case5():
-            for i in range(100):
-                x[i, :] = torch.arange(100) + i
-
-        cases = ((1, case1), (1, case2), (1, case3), (0, case4), (1, case5))
-        num_matched = []
-        for _, fn in cases:
-            with profile(with_stack=True) as prof:
-                fn()
-            pattern = ForLoopIndexingPattern(prof)
-            num_matched.append(len(pattern.matched_events()))
-        self.assertEqual(num_matched, [i for i, _ in cases])
-
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-    def test_profiler_fp32_matmul_pattern(self):
-        x = torch.ones((100, 100), device="cuda")
-        with profile(with_stack=True) as prof:
-            x = x @ x
-        pattern = FP32MatMulPattern(prof)
-        has_tf32 = 0 if pattern.skip else 1
-        num_matched = len(pattern.matched_events())
-        self.assertEqual(num_matched, has_tf32)
-
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-    def test_profiler_extra_cuda_copy_pattern_benchmark(self):
-        with profile(with_stack=True, record_shapes=True) as prof:
-            x = torch.ones((100, 100)).to("cuda")
-            x = torch.ones((50, 50)).to("cuda")
-        pattern = ExtraCUDACopyPattern(prof)
-        shapes_factor_map = pattern.benchmark(pattern.matched_events())
-        self.assertEqual(len(shapes_factor_map), 2)
-
-    @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/165949")
-    def test_profiler_optimizer_single_tensor_pattern(self):
-        x = torch.ones((100, 100))
-        cases = (
-            (1, lambda: torch.optim.Adam(model.parameters())),
-            (1, lambda: torch.optim.SGD(model.parameters(), lr=0.01)),
-            (1, lambda: torch.optim.AdamW(model.parameters())),
-            (0, lambda: torch.optim.Adam(model.parameters(), foreach=True)),
-            (0, lambda: torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)),
-            (0, lambda: torch.optim.AdamW(model.parameters(), foreach=True)),
-        )
-        num_matched = []
-        for _, fn in cases:
-            with profile(with_stack=True) as prof:
-                model = nn.Sequential(
-                    nn.Linear(100, 100),
-                    nn.ReLU(),
-                    nn.Linear(100, 10),
-                )
-                optimizer = fn()
-                optimizer.zero_grad()
-                y_hat = model(x)
-                loss = torch.nn.functional.cross_entropy(
-                    y_hat, torch.randint(0, 10, (100,))
-                )
-                loss.backward()
-                optimizer.step()
-            pattern = OptimizerSingleTensorPattern(prof)
-            num_matched.append(len(pattern.matched_events()))
-        self.assertEqual(num_matched, [i for i, _ in cases])
-
-    def test_profiler_synchronized_dataloader_pattern(self):
-        dataset = torch.rand((100, 100))
-        sync_dataloader = torch.utils.data.DataLoader(dataset, batch_size=10)
-        async_dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=10, num_workers=4
-        )
-        with profile(with_stack=True) as prof:
-            next(iter(sync_dataloader))
-            next(iter(async_dataloader))
-        pattern = SynchronizedDataLoaderPattern(prof)
-        num_matched = len(pattern.matched_events())
-        self.assertEqual(num_matched, 1)
-
-    @skipIfTorchDynamo(
-        "pattern checks for aten::_zero op which might not be there with torch.compile'd graph"
-    )
-    def test_profiler_grad_not_set_to_none_pattern(self):
-        x = torch.ones((100, 100))
-        model = nn.Sequential(
-            nn.Linear(100, 100),
-            nn.ReLU(),
-            nn.Linear(100, 10),
-        )
-        optimizer = torch.optim.Adam(model.parameters())
-        cases = (
-            (0, lambda: optimizer.zero_grad()),
-            (0, lambda: model.zero_grad()),
-            (1, lambda: optimizer.zero_grad(set_to_none=False)),
-            (1, lambda: model.zero_grad(set_to_none=False)),
-        )
-        num_matched = []
-        for _, fn in cases:
-            with profile(with_stack=True) as prof:
-                y_hat = model(x)
-                loss = torch.nn.functional.cross_entropy(
-                    y_hat, torch.randint(0, 10, (100,))
-                )
-                loss.backward()
-                optimizer.step()
-                fn()
-            pattern = GradNotSetToNonePattern(prof)
-            num_matched.append(len(pattern.matched_events()))
-        self.assertEqual(num_matched, [i for i, _ in cases])
-
-    def test_profiler_conv2d_bias_followed_by_batchnorm2d_pattern(self):
-        x = torch.randn((1, 3, 32, 32))
-        cases = (
-            (1, nn.Sequential(nn.Conv2d(3, 3, 3, 1, 1), nn.BatchNorm2d(3))),
-            (0, nn.Sequential(nn.Conv2d(3, 3, 3, 1, 1, bias=False), nn.BatchNorm2d(3))),
-            (0, nn.Sequential(nn.Conv2d(3, 3, 3, 1, 1))),
-        )
-        num_matched = []
-        for _, model in cases:
-            with profile(with_stack=True, record_shapes=True) as prof:
-                model(x)
-            pattern = Conv2dBiasFollowedByBatchNorm2dPattern(prof)
-            num_matched.append(len(pattern.matched_events()))
-        self.assertEqual(num_matched, [i for i, _ in cases])
-
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-    def test_profiler_matmul_dim_fp16_pattern(self):
-        cases = (
-            (1, torch.randn((201, 201), device="cuda", dtype=torch.float16)),
-            (1, torch.randn((3, 97, 97), device="cuda", dtype=torch.float16)),
-            (0, torch.randn((200, 200), device="cuda", dtype=torch.float16)),
-            (0, torch.randn((3, 200, 200), device="cuda", dtype=torch.float16)),
-        )
-        num_matched = []
-        for _, x in cases:
-            with profile(with_stack=True, record_shapes=True) as prof:
-                x @ x
-            pattern = MatMulDimInFP16Pattern(prof)
-            num_matched.append(len(pattern.matched_events()))
-        self.assertEqual(num_matched, [i for i, _ in cases])
-
-    @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
-    def test_profiler_pattern_matcher_json_report(self):
-        x = torch.ones((100, 100))
-        model = nn.Sequential(
-            nn.Linear(100, 100),
-            nn.ReLU(),
-            nn.Linear(100, 10),
-        )
-        optimizer = torch.optim.Adam(model.parameters())
-        with profile(with_stack=True, record_shapes=True) as prof:
-            y_hat = model(x)
-            loss = torch.nn.functional.cross_entropy(
-                y_hat, torch.randint(0, 10, (100,))
-            )
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            report_all_anti_patterns(prof, json_report_dir=tmpdir, print_enable=False)
-
-            with open(os.path.join(tmpdir, "torchtidy_report.json")) as f:
-                report = json.load(f)
-
-            # It is platform dependent whether the path will include "profiler/"
-            keys = [k for k in report if k.endswith("test_profiler.py")]
-            self.assertEqual(len(keys), 1, f"{keys}")
-            entry = report[keys[0]]
-
-            self.assertTrue(len(entry) > 0)
-            expected_fields = sorted(["line_number", "name", "url", "message"])
-            for event in entry:
-                actual_fields = sorted(event.keys())
-                self.assertEqual(expected_fields, actual_fields)
 
     @unittest.skipIf(
         not IS_LINUX or not (IS_X86 or IS_ARM64), "linux x86/aarch64 only cpp unwinding"

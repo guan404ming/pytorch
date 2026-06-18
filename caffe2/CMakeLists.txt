@@ -1004,6 +1004,9 @@ elseif(USE_CUDA)
     target_link_libraries(torch_cuda PRIVATE __caffe2_nccl)
     target_compile_definitions(torch_cuda PRIVATE USE_NCCL)
   endif()
+  if(USE_NCCL_EP)
+    target_compile_definitions(torch_cuda PRIVATE USE_NCCL_EP)
+  endif()
 
   # Compile with NVSHMEM
   # Default value of `USE_NVSHMEM` is set in CMakeLists.txt under root, to ON.
@@ -1918,7 +1921,9 @@ if(BUILD_TEST)
             if(TARGET Sanitizer::address)
               target_link_libraries(${test_name}_${CPU_CAPABILITY} Sanitizer::address)
             endif()
-            if(TARGET Sanitizer::undefined)
+            # Skip UBSan on ROCm: see cmake/Dependencies.cmake (UBSan + ASAN
+            # on ROCm Clang produces misaligned ASAN globals that abort).
+            if(TARGET Sanitizer::undefined AND NOT USE_ROCM)
               target_link_libraries(${test_name}_${CPU_CAPABILITY} Sanitizer::undefined)
             endif()
           endif()
