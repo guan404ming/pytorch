@@ -331,6 +331,10 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
     def open_window(self) -> None:
         """Mark the start of a trace window. Records before this point are excluded
         from it (so prepare-phase activity doesn't leak into the trace)."""
+        # Capture the thread starting the trace, so its RUNTIME/DRIVER records map to
+        # the OS tid (matching its cpu_ops) even without a record_function region --
+        # otherwise CUPTI's raw (pthread-style) threadId lands them on a phantom lane.
+        self._record_calling_thread()
         with self._lock:
             self._open_start = self._boundary_clock_ns()
 
