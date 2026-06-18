@@ -4,6 +4,7 @@
 import collections
 import contextlib
 import copy
+import functools
 import gc
 import gzip
 import json
@@ -130,6 +131,48 @@ def setUpModule():
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]):
             x + x
             torch.cuda.synchronize()
+        # Priming leaves libkineto holding the single process-wide CUPTI subscriber, so a
+        # later cupti_monitor session can't subscribe (MULTIPLE_SUBSCRIBERS). Release it
+        # via the documented cuptiFinalize hand-off -- no monitor exists yet, so this is
+        # safe; libkineto re-subscribes on its next profile, so kineto tests are
+        # unaffected. See pylibcupti().finalize.
+        if TEST_CUPTI_V13_3:
+            from torch.profiler._cupti.cupti_python import pylibcupti
+
+            try:
+                pylibcupti().finalize()
+            except Exception:
+                pass
+
+
+def _isolated(test_fn):
+    """Run a cupti_monitor test in a fresh subprocess. The monitor needs the single
+    process-wide CUPTI subscriber, but libkineto grabs it for the process lifetime once
+    any kineto-CUDA profile runs (setUpModule's prime, or another test in a full run),
+    and decoded-record native state can leak between tests. Re-running the test alone in
+    a child gives it a clean process: setUpModule's finalize releases the child's own
+    prime, so the monitor subscribes, with no cross-test interference."""
+
+    @functools.wraps(test_fn)
+    def wrapper(self):
+        if os.environ.get("PYTORCH_CUPTI_ISOLATED_CHILD") == "1":
+            return test_fn(self)
+        test_id = f"{type(self).__name__}.{test_fn.__name__}"
+        env = {**os.environ, "PYTORCH_CUPTI_ISOLATED_CHILD": "1"}
+        proc = subprocess.run(
+            [sys.executable, __file__, test_id],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if proc.returncode != 0:
+            self.fail(
+                f"isolated subprocess for {test_id} failed (rc={proc.returncode})\n"
+                f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+            )
+
+    return wrapper
 
 
 # if tqdm is not shutdown properly, it will leave the monitor thread alive.
@@ -540,11 +583,12 @@ _cupti_monitor.enable_hes_early()
         )
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_collection_smoke(self):
         from torch.profiler._cupti import monitor as _cupti_monitor
-        from torch.profiler._cupti.observers.profiler import ProfilerObserver
+        from torch.profiler._cupti.observers.node_timer import NodeTimerObserver
 
-        obs = ProfilerObserver()
+        obs = NodeTimerObserver()
         self.assertTrue(obs.available)
 
         x = torch.randn(64, 64, device="cuda")
@@ -553,31 +597,31 @@ _cupti_monitor.enable_hes_early()
         torch.cuda.synchronize()
 
         monitor = _cupti_monitor.instance()
-        monitor.flush(forced=True, sync=True)
+        monitor.flush(sync=True)
         stats = monitor.stats()
-        window = obs.drain()
+        _gnode, start, _end = obs.drain()
         obs.close()
 
         # The native C++ pool must actually have been exercised: catches a silent
         # regression to a no-op (e.g. broken callback registration or symbol
         # export) that would still pass if the worker never saw a buffer. The
-        # monitor demuxes to columns and the observer builds events, so a real
-        # kernel event must come out the other end.
+        # monitor demuxes to columns and the observer drains spans, so real kernel
+        # spans (NodeTimerObserver collects CONCURRENT_KERNEL) must come out.
         self.assertGreater(stats["buffers_allocated"], 0)
         self.assertGreater(stats["buffers_completed"], 0)
         self.assertEqual(stats["buffers_pending"], 0)
-        self.assertGreater(len(window["events"]), 0)
-        self.assertTrue(any(e["kind"] == "kernel" for e in window["events"]))
+        self.assertGreater(len(start), 0)
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_collection_repeated_lifecycle(self):
         from torch.profiler._cupti import monitor as _cupti_monitor
-        from torch.profiler._cupti.observers.profiler import ProfilerObserver
+        from torch.profiler._cupti.observers.node_timer import NodeTimerObserver
 
         # Register/collect/unregister twice: the last observer leaving stops the
         # monitor, so the second pass exercises the start-after-stop restart path.
         for _ in range(2):
-            obs = ProfilerObserver()
+            obs = NodeTimerObserver()
             self.assertTrue(obs.available)
 
             x = torch.randn(32, 32, device="cuda")
@@ -586,13 +630,14 @@ _cupti_monitor.enable_hes_early()
             torch.cuda.synchronize()
 
             monitor = _cupti_monitor.instance()
-            monitor.flush(forced=True, sync=True)
-            window = obs.drain()
+            monitor.flush(sync=True)
+            _gnode, start, _end = obs.drain()
             obs.close()
 
-            self.assertGreater(len(window["events"]), 0)
+            self.assertGreater(len(start), 0)
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_multithread_runtime_thread_assignment(self):
         x1 = torch.randn(256, 256, device="cuda")
         x2 = torch.randn(256, 256, device="cuda")
@@ -635,10 +680,16 @@ _cupti_monitor.enable_hes_early()
                     thread.join()
 
             prof.export_chrome_trace(trace_path)
-
-            opener = gzip.open if trace_path.endswith(".gz") else open
-            with opener(trace_path, "rt") as f:
-                data = json.load(f)
+            # cupti_monitor writes the trace deferred + gzipped at <path>.gz; wait for the
+            # async write, then read it (.gz when present, else the plain path).
+            prof.wait_for_exports()
+            gz = trace_path + ".gz"
+            if os.path.exists(gz):
+                with gzip.open(gz, "rt") as f:
+                    data = json.load(f)
+            else:
+                with open(trace_path) as f:
+                    data = json.load(f)
 
         events = data["traceEvents"]
         worker_tids = sorted(
@@ -667,6 +718,65 @@ _cupti_monitor.enable_hes_early()
         self.assertTrue(set(launch_tids).issubset(set(worker_tids)))
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
+    def test_cupti_monitor_runtime_thread_without_record_function(self):
+        # Regression: CPU-side CUPTI records (cuda_runtime/cuda_driver) must land on the
+        # issuing OS thread -- the same lane as their cpu_ops, matching kineto -- even
+        # with NO record_function region. The thread map is otherwise only populated by
+        # push_annotation (record_function); open_window captures the starting thread so
+        # the bare path works too. A cuBLAS GEMM surfaces CUPTI's raw pthread-style
+        # threadId, which without the capture lands on a phantom lane.
+        import torch.nn as nn
+
+        mlp = (
+            nn.Sequential(nn.Linear(512, 2048), nn.GELU(), nn.Linear(2048, 512))
+            .cuda()
+            .eval()
+        )
+        x = torch.randn(32, 512, device="cuda")
+        cfg = _ExperimentalConfig(
+            custom_profiler_config='{"backend":"cupti_monitor"}',
+        )
+        with TemporaryFileName(mode="w+") as trace_path:
+            with (
+                torch.no_grad(),
+                profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    experimental_config=cfg,
+                ) as prof,
+            ):
+                for _ in range(3):
+                    mlp(x)
+                torch.cuda.synchronize()
+            prof.export_chrome_trace(trace_path)
+            prof.wait_for_exports()
+            gz = trace_path + ".gz"
+            if os.path.exists(gz):
+                with gzip.open(gz, "rt") as f:
+                    events = json.load(f)["traceEvents"]
+            else:
+                with open(trace_path) as f:
+                    events = json.load(f)["traceEvents"]
+
+        def tids(cat):
+            return {
+                e["tid"]
+                for e in events
+                if e.get("ph") == "X"
+                and e.get("cat") == cat
+                and isinstance(e.get("tid"), int)
+            }
+
+        cpu_tids = tids("cpu_op")
+        runtime_tids = tids("cuda_runtime")
+        self.assertGreater(len(cpu_tids), 0)
+        self.assertGreater(len(runtime_tids), 0)
+        # The CPU-side CUPTI records share the issuing thread with the cpu_ops (no
+        # phantom CUPTI-threadId lane).
+        self.assertTrue(runtime_tids.issubset(cpu_tids))
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_trace_has_expected_events(self):
         cfg = _ExperimentalConfig(
             custom_profiler_config='{"backend":"cupti_monitor"}',
@@ -683,8 +793,15 @@ _cupti_monitor.enable_hes_early()
                     _ = c.cpu()
                     torch.cuda.synchronize()
             prof.export_chrome_trace(trace_path)
-            with open(trace_path) as f:
-                events = json.load(f)["traceEvents"]
+            # cupti_monitor writes the trace deferred + gzipped at <path>.gz.
+            prof.wait_for_exports()
+            gz = trace_path + ".gz"
+            if os.path.exists(gz):
+                with gzip.open(gz, "rt") as f:
+                    events = json.load(f)["traceEvents"]
+            else:
+                with open(trace_path) as f:
+                    events = json.load(f)["traceEvents"]
 
         cats = {e.get("cat") for e in events if e.get("ph") == "X"}
         for expected in (
@@ -717,6 +834,7 @@ _cupti_monitor.enable_hes_early()
         self.assertIn("monitor_region", user_names)
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_record_shapes(self):
         cfg = _ExperimentalConfig(
             custom_profiler_config='{"backend":"cupti_monitor"}',
@@ -733,8 +851,15 @@ _cupti_monitor.enable_hes_early()
                     (a @ a).relu()
                     torch.cuda.synchronize()
                 prof.export_chrome_trace(trace_path)
-                with open(trace_path) as f:
-                    events = json.load(f)["traceEvents"]
+                # cupti_monitor writes the trace deferred + gzipped at <path>.gz.
+                prof.wait_for_exports()
+                gz = trace_path + ".gz"
+                if os.path.exists(gz):
+                    with gzip.open(gz, "rt") as f:
+                        events = json.load(f)["traceEvents"]
+                else:
+                    with open(trace_path) as f:
+                        events = json.load(f)["traceEvents"]
             return [
                 e
                 for e in events
@@ -747,6 +872,7 @@ _cupti_monitor.enable_hes_early()
         self.assertGreater(len(shaped_cpu_ops(record_shapes=True)), 0)
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_matches_stock_op_and_kernel_names(self):
         # Run in a FRESH process. This test needs a stock (Kineto) CUDA baseline and
         # then a cupti_monitor session, so it must start from a process that hasn't
@@ -825,6 +951,7 @@ _cupti_monitor.enable_hes_early()
         self.assertIn("OK", p.stdout)
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_kineto_parity(self):
         # In a FRESH process (clean CUPTI), profile a couple of representative models
         # under stock (Kineto) and then the cupti_monitor backend, eager AND graphed,
@@ -1018,6 +1145,7 @@ _cupti_monitor.enable_hes_early()
             )
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_observed_kinds_present(self):
         # Every activity kind the ProfilerObserver subscribes to must surface in the
         # exported chrome trace. One workload exercises kernels, H2D/D2H memcpy, memset,
