@@ -10,8 +10,10 @@ import torch.fx.experimental._config as _fx_experimental_config
 import torch.utils._pytree as pytree
 from torch.export import export
 from torch.export._trace import (
+    _export_to_aten_ir,
     _export_to_aten_ir_make_fx,
     _export_to_torch_ir,
+    _non_strict_export,
     _strict_export,
 )
 from torch.fx.experimental.dynamic_spec import (
@@ -364,6 +366,216 @@ Range constraints: {u0: VR[0, int_oo], u1: VR[0, int_oo]}""",
         shape = _first_tensor_placeholder_shape(ep.graph_module)
         self.assertEqual(tuple(shape), (8, 3))
 
+    def test_named_dims_vs_shapes_spec(self):
+        from torch.export import Dim
+
+        class M(torch.nn.Module):
+            def forward(self, x):
+                return x.sum(0)
+
+        ep_legacy = export(
+            M(),
+            (torch.randn(8, 3),),
+            dynamic_shapes={"x": (Dim("B"), None)},
+            strict=self.strict,
+        )
+        ep_new = export(
+            M(),
+            (torch.randn(8, 3),),
+            dynamic_shapes=PARAMS({"x": T([VAR("B"), STATIC])}),
+            strict=self.strict,
+        )
+
+        # Snapshot legacy graph (backed s* symbol, range constraint).
+        # Strict uses s6; non-strict uses s77 (different fresh-symbol counters).
+        legacy_sym = "s6" if self.strict else "s77"
+        self.assertExpectedInline(
+            str(ep_legacy).strip(),
+            f"""\
+ExportedProgram:
+    class GraphModule(torch.nn.Module):
+        def forward(self, x: "f32[{legacy_sym}, 3]"):
+            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
+            return (sum_1,)
+Graph signature:
+    x: USER_INPUT
+    sum_1: USER_OUTPUT
+Range constraints: {{{legacy_sym}: VR[0, int_oo]}}""",
+            ignore_comments=True,
+            ignore_empty_lines=True,
+        )
+        # Snapshot new-API graph (unbacked u* symbol, range constraint).
+        self.assertExpectedInline(
+            str(ep_new).strip(),
+            """\
+ExportedProgram:
+    class GraphModule(torch.nn.Module):
+        def forward(self, x: "f32[u0, 3]"):
+            sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(x, 0)
+            ge: "Sym(u0 >= 0)" = sym_size_int >= 0;  sym_size_int = None
+            _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
+            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
+            return (sum_1,)
+Graph signature:
+    x: USER_INPUT
+    sum_1: USER_OUTPUT
+Range constraints: {u0: VR[0, int_oo]}""",
+            ignore_comments=True,
+            ignore_empty_lines=True,
+        )
+
+        for ep in (ep_legacy, ep_new):
+            shape = _first_tensor_placeholder_shape(ep.graph_module)
+            self.assertIsInstance(shape[0], torch.SymInt)
+            self.assertIsInstance(shape[1], int)
+            self.assertEqual(int(shape[1]), 3)
+            ep.module()(torch.randn(20, 3))
+            ep.module()(torch.randn(64, 3))
+
+    def test_named_dims_vs_shapes_spec2(self):
+        """Parity: forward(x, y, z=None) with x positional, y as kwarg,
+        z omitted. Both APIs mark x and y dim 0 dynamic; z stays out
+        of the graph."""
+        from torch.export import Dim
+
+        class M(torch.nn.Module):
+            def forward(self, x, y, z=None):
+                return x.sum(0) + y.sum(0) * (z if z is not None else 1)
+
+        ep_legacy = export(
+            M(),
+            args=(torch.randn(8, 3),),
+            kwargs={"y": torch.randn(5, 3)},
+            dynamic_shapes={"x": (Dim("X"), None), "y": (Dim("Y"), None)},
+            strict=self.strict,
+        )
+        ep_new = export(
+            M(),
+            args=(torch.randn(8, 3),),
+            kwargs={"y": torch.randn(5, 3)},
+            dynamic_shapes=PARAMS(
+                {
+                    "x": T([VAR("X"), STATIC]),
+                    "y": T([VAR("Y"), STATIC]),
+                }
+            ),
+            strict=self.strict,
+        )
+
+        # Snapshot legacy: placeholders are (x, y) in signature order.
+        sx, sy = ("s6", "s27") if self.strict else ("s77", "s17")
+        self.assertExpectedInline(
+            str(ep_legacy).strip(),
+            f"""\
+ExportedProgram:
+    class GraphModule(torch.nn.Module):
+        def forward(self, x: "f32[{sx}, 3]", y: "f32[{sy}, 3]"):
+            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
+            sum_2: "f32[3]" = torch.ops.aten.sum.dim_IntList(y, [0]);  y = None
+            mul: "f32[3]" = torch.ops.aten.mul.Tensor(sum_2, 1);  sum_2 = None
+            add: "f32[3]" = torch.ops.aten.add.Tensor(sum_1, mul);  sum_1 = mul = None
+            return (add,)
+Graph signature:
+    x: USER_INPUT
+    y: USER_INPUT
+    add: USER_OUTPUT
+Range constraints: {{{sx}: VR[0, int_oo], {sy}: VR[0, int_oo]}}""",
+            ignore_comments=True,
+            ignore_empty_lines=True,
+        )
+        # Snapshot new-API: same placeholder names in same order — proves the
+        # translator preserved (x, y) ordering through the wrapper.
+        self.assertExpectedInline(
+            str(ep_new).strip(),
+            """\
+ExportedProgram:
+    class GraphModule(torch.nn.Module):
+        def forward(self, x: "f32[u0, 3]", y: "f32[u1, 3]"):
+            sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(x, 0)
+            ge: "Sym(u0 >= 0)" = sym_size_int >= 0;  sym_size_int = None
+            _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
+            sym_size_int_1: "Sym(u1)" = torch.ops.aten.sym_size.int(y, 0)
+            ge_1: "Sym(u1 >= 0)" = sym_size_int_1 >= 0;  sym_size_int_1 = None
+            _assert_scalar_default_1 = torch.ops.aten._assert_scalar.default(ge_1, "Runtime assertion failed for expression u1 >= 0 on node 'ge_1'");  ge_1 = _assert_scalar_default_1 = None
+            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
+            sum_2: "f32[3]" = torch.ops.aten.sum.dim_IntList(y, [0]);  y = None
+            mul: "f32[3]" = torch.ops.aten.mul.Tensor(sum_2, 1);  sum_2 = None
+            add: "f32[3]" = torch.ops.aten.add.Tensor(sum_1, mul);  sum_1 = mul = None
+            return (add,)
+Graph signature:
+    x: USER_INPUT
+    y: USER_INPUT
+    add: USER_OUTPUT
+Range constraints: {u0: VR[0, int_oo], u1: VR[0, int_oo]}""",
+            ignore_comments=True,
+            ignore_empty_lines=True,
+        )
+
+        # Graphs are pinned above; just verify both run at varying shapes.
+        for ep in (ep_legacy, ep_new):
+            ep.module()(torch.randn(20, 3), y=torch.randn(99, 3))
+
+    def test_legacy_parity_default_kwarg_omitted(self):
+        from torch.export import Dim
+
+        class M(torch.nn.Module):
+            def forward(self, x, y=None):
+                if y is None:
+                    return x.sum(0)
+                return x.sum(0) + y.sum(0)
+
+        ep_legacy = export(
+            M(),
+            args=(torch.randn(8, 3),),
+            dynamic_shapes={"x": (Dim("X"), None)},
+            strict=self.strict,
+        )
+        ep_new = export(
+            M(),
+            args=(torch.randn(8, 3),),
+            dynamic_shapes=PARAMS({"x": T([VAR("X"), STATIC])}),
+            strict=self.strict,
+        )
+
+        # Legacy: only x in graph signature, no y placeholder.
+        legacy_sym = "s6" if self.strict else "s77"
+        self.assertExpectedInline(
+            str(ep_legacy).strip(),
+            f"""\
+ExportedProgram:
+    class GraphModule(torch.nn.Module):
+        def forward(self, x: "f32[{legacy_sym}, 3]"):
+            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
+            return (sum_1,)
+Graph signature:
+    x: USER_INPUT
+    sum_1: USER_OUTPUT
+Range constraints: {{{legacy_sym}: VR[0, int_oo]}}""",
+            ignore_comments=True,
+            ignore_empty_lines=True,
+        )
+        # New API: same — y dropped from graph signature.
+        self.assertExpectedInline(
+            str(ep_new).strip(),
+            """\
+ExportedProgram:
+    class GraphModule(torch.nn.Module):
+        def forward(self, x: "f32[u0, 3]"):
+            sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(x, 0)
+            ge: "Sym(u0 >= 0)" = sym_size_int >= 0;  sym_size_int = None
+            _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
+            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
+            return (sum_1,)
+Graph signature:
+    x: USER_INPUT
+    sum_1: USER_OUTPUT
+Range constraints: {u0: VR[0, int_oo]}""",
+            ignore_comments=True,
+            ignore_empty_lines=True,
+        )
+
+
+
     def test_user_varargs_in_forward_marked_dynamic_via_varargs_spec(self):
         class M(torch.nn.Module):
             def forward(self, *args):
@@ -661,214 +873,41 @@ class <lambda>(torch.nn.Module):
             ignore_empty_lines=True,
         )
 
+    def test_non_strict_export_shapes_spec_direct(self):
+        # Non-strict-only internal-API test; skip in strict mode.
+        # Verifies ``_non_strict_export`` with ``_to_aten_func=_export_to_aten_ir``
+        # accepts ShapesSpec (replaces the old NotImplementedError gate test).
+        if self.strict:
+            return
+        args = (torch.randn(8, 3),)
+        _, in_spec = pytree.tree_flatten((args, {}))
+        artifact = _non_strict_export(
+            mod=_ModX(),
+            args=args,
+            kwargs={},
+            dynamic_shapes=PARAMS({"x": T([VAR("batch"), STATIC])}),
+            preserve_module_call_signature=(),
+            orig_in_spec=in_spec,
+            prefer_deferred_runtime_asserts_over_guards=False,
+            _to_aten_func=_export_to_aten_ir,
+        )
+        self.assertExpectedInline(
+            artifact.aten.gm.print_readable(print_output=False),
+            """\
+class <lambda>(torch.nn.Module):
+    def forward(self, x: "f32[u0, 3]"):
+        sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(x, 0)
+        ge: "Sym(u0 >= 0)" = sym_size_int >= 0;  sym_size_int = None
+        _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
+        sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
+        return (sum_1,)""",
+            ignore_comments=True,
+            ignore_empty_lines=True,
+        )
+
 
 class TestExportDynamicSpecStrict(_TestExportDynamicSpecBase):
     strict = True
-
-    def test_named_dims_vs_shapes_spec(self):
-        from torch.export import Dim
-
-        class M(torch.nn.Module):
-            def forward(self, x):
-                return x.sum(0)
-
-        ep_legacy = export(
-            M(),
-            (torch.randn(8, 3),),
-            dynamic_shapes={"x": (Dim("B"), None)},
-            strict=self.strict,
-        )
-        ep_new = export(
-            M(),
-            (torch.randn(8, 3),),
-            dynamic_shapes=PARAMS({"x": T([VAR("B"), STATIC])}),
-            strict=self.strict,
-        )
-
-        # Snapshot legacy graph (backed s* symbol, range constraint).
-        self.assertExpectedInline(
-            str(ep_legacy).strip(),
-            """\
-ExportedProgram:
-    class GraphModule(torch.nn.Module):
-        def forward(self, x: "f32[s6, 3]"):
-            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
-            return (sum_1,)
-Graph signature:
-    x: USER_INPUT
-    sum_1: USER_OUTPUT
-Range constraints: {s6: VR[0, int_oo]}""",
-            ignore_comments=True,
-            ignore_empty_lines=True,
-        )
-        # Snapshot new-API graph (unbacked u* symbol, range constraint).
-        self.assertExpectedInline(
-            str(ep_new).strip(),
-            """\
-ExportedProgram:
-    class GraphModule(torch.nn.Module):
-        def forward(self, x: "f32[u0, 3]"):
-            sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(x, 0)
-            ge: "Sym(u0 >= 0)" = sym_size_int >= 0;  sym_size_int = None
-            _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
-            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
-            return (sum_1,)
-Graph signature:
-    x: USER_INPUT
-    sum_1: USER_OUTPUT
-Range constraints: {u0: VR[0, int_oo]}""",
-            ignore_comments=True,
-            ignore_empty_lines=True,
-        )
-
-        for ep in (ep_legacy, ep_new):
-            shape = _first_tensor_placeholder_shape(ep.graph_module)
-            self.assertIsInstance(shape[0], torch.SymInt)
-            self.assertIsInstance(shape[1], int)
-            self.assertEqual(int(shape[1]), 3)
-            ep.module()(torch.randn(20, 3))
-            ep.module()(torch.randn(64, 3))
-
-    def test_named_dims_vs_shapes_spec2(self):
-        """Parity: forward(x, y, z=None) with x positional, y as kwarg,
-        z omitted. Both APIs mark x and y dim 0 dynamic; z stays out
-        of the graph."""
-        from torch.export import Dim
-
-        class M(torch.nn.Module):
-            def forward(self, x, y, z=None):
-                return x.sum(0) + y.sum(0) * (z if z is not None else 1)
-
-        ep_legacy = export(
-            M(),
-            args=(torch.randn(8, 3),),
-            kwargs={"y": torch.randn(5, 3)},
-            dynamic_shapes={"x": (Dim("X"), None), "y": (Dim("Y"), None)},
-            strict=self.strict,
-        )
-        ep_new = export(
-            M(),
-            args=(torch.randn(8, 3),),
-            kwargs={"y": torch.randn(5, 3)},
-            dynamic_shapes=PARAMS(
-                {
-                    "x": T([VAR("X"), STATIC]),
-                    "y": T([VAR("Y"), STATIC]),
-                }
-            ),
-            strict=self.strict,
-        )
-
-        # Snapshot legacy: placeholders are (x, y) in signature order.
-        self.assertExpectedInline(
-            str(ep_legacy).strip(),
-            """\
-ExportedProgram:
-    class GraphModule(torch.nn.Module):
-        def forward(self, x: "f32[s6, 3]", y: "f32[s27, 3]"):
-            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
-            sum_2: "f32[3]" = torch.ops.aten.sum.dim_IntList(y, [0]);  y = None
-            mul: "f32[3]" = torch.ops.aten.mul.Tensor(sum_2, 1);  sum_2 = None
-            add: "f32[3]" = torch.ops.aten.add.Tensor(sum_1, mul);  sum_1 = mul = None
-            return (add,)
-Graph signature:
-    x: USER_INPUT
-    y: USER_INPUT
-    add: USER_OUTPUT
-Range constraints: {s6: VR[0, int_oo], s27: VR[0, int_oo]}""",
-            ignore_comments=True,
-            ignore_empty_lines=True,
-        )
-        # Snapshot new-API: same placeholder names in same order — proves the
-        # translator preserved (x, y) ordering through the wrapper.
-        self.assertExpectedInline(
-            str(ep_new).strip(),
-            """\
-ExportedProgram:
-    class GraphModule(torch.nn.Module):
-        def forward(self, x: "f32[u0, 3]", y: "f32[u1, 3]"):
-            sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(x, 0)
-            ge: "Sym(u0 >= 0)" = sym_size_int >= 0;  sym_size_int = None
-            _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
-            sym_size_int_1: "Sym(u1)" = torch.ops.aten.sym_size.int(y, 0)
-            ge_1: "Sym(u1 >= 0)" = sym_size_int_1 >= 0;  sym_size_int_1 = None
-            _assert_scalar_default_1 = torch.ops.aten._assert_scalar.default(ge_1, "Runtime assertion failed for expression u1 >= 0 on node 'ge_1'");  ge_1 = _assert_scalar_default_1 = None
-            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
-            sum_2: "f32[3]" = torch.ops.aten.sum.dim_IntList(y, [0]);  y = None
-            mul: "f32[3]" = torch.ops.aten.mul.Tensor(sum_2, 1);  sum_2 = None
-            add: "f32[3]" = torch.ops.aten.add.Tensor(sum_1, mul);  sum_1 = mul = None
-            return (add,)
-Graph signature:
-    x: USER_INPUT
-    y: USER_INPUT
-    add: USER_OUTPUT
-Range constraints: {u0: VR[0, int_oo], u1: VR[0, int_oo]}""",
-            ignore_comments=True,
-            ignore_empty_lines=True,
-        )
-
-        # Graphs are pinned above; just verify both run at varying shapes.
-        for ep in (ep_legacy, ep_new):
-            ep.module()(torch.randn(20, 3), y=torch.randn(99, 3))
-
-    def test_legacy_parity_default_kwarg_omitted(self):
-        from torch.export import Dim
-
-        class M(torch.nn.Module):
-            def forward(self, x, y=None):
-                if y is None:
-                    return x.sum(0)
-                return x.sum(0) + y.sum(0)
-
-        ep_legacy = export(
-            M(),
-            args=(torch.randn(8, 3),),
-            dynamic_shapes={"x": (Dim("X"), None)},
-            strict=self.strict,
-        )
-        ep_new = export(
-            M(),
-            args=(torch.randn(8, 3),),
-            dynamic_shapes=PARAMS({"x": T([VAR("X"), STATIC])}),
-            strict=self.strict,
-        )
-
-        # Legacy: only x in graph signature, no y placeholder.
-        self.assertExpectedInline(
-            str(ep_legacy).strip(),
-            """\
-ExportedProgram:
-    class GraphModule(torch.nn.Module):
-        def forward(self, x: "f32[s6, 3]"):
-            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
-            return (sum_1,)
-Graph signature:
-    x: USER_INPUT
-    sum_1: USER_OUTPUT
-Range constraints: {s6: VR[0, int_oo]}""",
-            ignore_comments=True,
-            ignore_empty_lines=True,
-        )
-        # New API: same — y dropped from graph signature.
-        self.assertExpectedInline(
-            str(ep_new).strip(),
-            """\
-ExportedProgram:
-    class GraphModule(torch.nn.Module):
-        def forward(self, x: "f32[u0, 3]"):
-            sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(x, 0)
-            ge: "Sym(u0 >= 0)" = sym_size_int >= 0;  sym_size_int = None
-            _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
-            sum_1: "f32[3]" = torch.ops.aten.sum.dim_IntList(x, [0]);  x = None
-            return (sum_1,)
-Graph signature:
-    x: USER_INPUT
-    sum_1: USER_OUTPUT
-Range constraints: {u0: VR[0, int_oo]}""",
-            ignore_comments=True,
-            ignore_empty_lines=True,
-        )
-
 
 class TestExportDynamicSpecNonStrict(_TestExportDynamicSpecBase):
     strict = False
