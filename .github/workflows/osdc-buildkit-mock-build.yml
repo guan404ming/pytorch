@@ -34,6 +34,10 @@ jobs:
       matrix:
         group: [meta-staging-aws-uw1, meta-staging-aws-ue1]
     name: grouped-${{ matrix.group }}
+    # GHCR_PAT is a docker-build environment secret. NOTE: that environment's
+    # branch policy (main, nightly, release/2.*, v2.* tags) gates secret
+    # injection -- on other branches GHCR_PAT is empty.
+    environment: docker-build
     runs-on:
       group: ${{ matrix.group }}
       labels: c-mt-rel-l-x86iavx512-8-64
@@ -46,6 +50,17 @@ jobs:
           set -eu
           echo "runner: ${RUNNER_NAME:-?}  hostname: $(hostname)"
           echo "buildkitd-amd64.buildkit -> $(getent hosts buildkitd-amd64.buildkit || echo 'UNRESOLVED')"
+
+      # On release runners (osdc.io/runner-class=release) cache-enforcer does
+      # NOT block ghcr.io egress, so this login is expected to SUCCEED -- the
+      # positive counterpart to the regular mt-l-* pool, where it is reset.
+      # Requires GHCR_PAT, gated by the docker-build env branch policy.
+      - name: Login to GHCR (egress test)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: pytorch
+          password: ${{ secrets.GHCR_PAT }}
 
       - name: Install buildctl
         run: |
@@ -93,6 +108,7 @@ jobs:
   # scheduling (the label exists on both staging clusters).
   label-only:
     name: label-only
+    environment: docker-build
     runs-on: c-mt-rel-l-x86iavx512-8-64
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -103,6 +119,17 @@ jobs:
           set -eu
           echo "runner: ${RUNNER_NAME:-?}  hostname: $(hostname)"
           echo "buildkitd-amd64.buildkit -> $(getent hosts buildkitd-amd64.buildkit || echo 'UNRESOLVED')"
+
+      # On release runners (osdc.io/runner-class=release) cache-enforcer does
+      # NOT block ghcr.io egress, so this login is expected to SUCCEED -- the
+      # positive counterpart to the regular mt-l-* pool, where it is reset.
+      # Requires GHCR_PAT, gated by the docker-build env branch policy.
+      - name: Login to GHCR (egress test)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: pytorch
+          password: ${{ secrets.GHCR_PAT }}
 
       - name: Install buildctl
         run: |
