@@ -196,7 +196,7 @@ class SuperVariable(VariableTracker):
         # not just AttrSource).
         value, source = self._resolved_getattr_and_source(tx, name)
         if not variables.ConstantVariable.is_literal(value):
-            return GetAttrVariable(self, name, py_type=type(value))
+            return MethodTrampolineVariable(self, name)
         if source:
             install_guard(source.make_guard(GuardBuilder.CONSTANT_MATCH))
         return variables.ConstantVariable.create(value, source=source)
@@ -1714,9 +1714,7 @@ class TypingVariable(VariableTracker):
         from .builder import SourcelessBuilder, VariableBuilder
 
         if name in cmp_name_to_op_mapping:
-            return variables.GetAttrVariable(
-                self, name, py_type=type(getattr(self.value, name))
-            )
+            return MethodTrampolineVariable(self, name)
 
         if tx.output.side_effects.has_pending_mutation_of_attr(self, name):
             return tx.output.side_effects.load_attr(self, name)
@@ -2348,7 +2346,9 @@ class ConstantLikeVariable(VariableTracker):
             return NumpyVariable(result)
         if variables.ConstantVariable.is_literal(result):
             return VariableTracker.build(tx, result)
-        return GetAttrVariable(self, name, py_type=type(result))
+        if callable(result):
+            return MethodTrampolineVariable(self, name)
+        return VariableTracker.build(tx, result)
 
 
 class NumpyDTypeVariable(ConstantLikeVariable):

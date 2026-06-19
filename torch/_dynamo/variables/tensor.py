@@ -482,11 +482,9 @@ class TensorVariable(VariableTracker):
         # but unfortunately id(real_value.__self__) is not id(<original value>)
         if is_bound_tensor_method(real_value):
             # No need to install the guard because its a bound tensor method
-            from .misc import GetAttrVariable
+            from .misc import MethodTrampolineVariable
 
-            return GetAttrVariable(
-                self, name, source=attr_source, py_type=type(real_value)
-            )
+            return MethodTrampolineVariable(self, name, source=attr_source)
 
         install_guard(
             self.source.make_guard(functools.partial(GuardBuilder.HASATTR, attr=name))

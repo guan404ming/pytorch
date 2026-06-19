@@ -345,11 +345,16 @@ class BaseBuiltinVariable(VariableTracker):
     def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        from .misc import MethodTrampolineVariable
+
         source = self.source and AttrSource(self.source, name)
-        attr = getattr(self._fn, name, None)
-        return variables.GetAttrVariable(
-            self, name, py_type=type(attr) if attr is not None else None, source=source
-        )
+        try:
+            attr = getattr(self._fn, name)
+        except AttributeError:
+            raise_observed_exception(AttributeError, tx)
+        if callable(attr):
+            return MethodTrampolineVariable(self, name, source=source)
+        return VariableTracker.build(tx, attr, source)
 
     def call_obj_hasattr(
         self, tx: "InstructionTranslatorBase", name: str
@@ -2390,21 +2395,18 @@ class BuiltinVariable(BaseBuiltinVariable):
     def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        from .misc import MethodTrampolineVariable
+
         source = self.source and AttrSource(self.source, name)
         if name == "__name__":
             return VariableTracker.build(tx, self.fn.__name__, source)
-        if self.fn is object:
-            # for object, we can just directly read the attribute
-            try:
-                value = getattr(self.fn, name)
-            except AttributeError:
-                raise_observed_exception(AttributeError, tx)
-            if not callable(value):
-                return VariableTracker.build(tx, value, source)
-        attr = getattr(self.fn, name, None)
-        return variables.GetAttrVariable(
-            self, name, py_type=type(attr) if attr is not None else None, source=source
-        )
+        try:
+            attr = getattr(self.fn, name)
+        except AttributeError:
+            raise_observed_exception(AttributeError, tx)
+        if callable(attr):
+            return MethodTrampolineVariable(self, name, source=source)
+        return VariableTracker.build(tx, attr, source)
 
     def call_delattr(
         self,
