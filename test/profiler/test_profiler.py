@@ -2384,12 +2384,15 @@ class TestProfiler(TestCase):
 
     def test_profiler_correlation_id(self):
         """
-        Correlation ids must be unique within a single profiling session so CPU
-        launch records can be matched to their GPU kernel records. They are not
-        required to be unique across sessions: older CUPTI used a process-global
-        monotonic counter, but newer CUPTI resets the counter per session, so we
-        check uniqueness per profile() invocation.
+        We expect the correlation_id of CPU operator events to be unique across
+        multiple invocations of the profiler, so we will reuse id_uniqueness_set.
+        Only cpu_op events are checked: with CUDA available, profile() also
+        collects CUDA activities, and CUPTI's device-enumeration calls at startup
+        (cudaGetDeviceCount, etc.) are recorded as cuda_runtime events whose
+        correlation ids come from a separate counter (also starting at 1) and
+        would otherwise collide with the operator ids.
         """
+        id_uniqueness_set = set()
         model = torch.nn.Sequential(
             nn.Conv2d(16, 33, 18),
             nn.ReLU(),
@@ -2399,12 +2402,12 @@ class TestProfiler(TestCase):
         inputs = torch.randn(40, 16, 18, 260)
         uint32_max = 2**32 - 1
         for _ in range(5):
-            id_uniqueness_set = set()
             with profile() as prof:
                 model(inputs)
             for event in prof.profiler.kineto_results.events():
                 corr_id = event.correlation_id()
-                if (corr_id) and event.device_type() == DeviceType.CPU:
+                is_cpu = event.device_type() == DeviceType.CPU
+                if corr_id and is_cpu and event.activity_type() == "cpu_op":
                     self.assertTrue(corr_id not in id_uniqueness_set)
                     id_uniqueness_set.add(corr_id)
                     self.assertTrue(corr_id < uint32_max)
