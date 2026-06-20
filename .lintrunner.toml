@@ -792,6 +792,7 @@ exclude_patterns = [
     '**/git-pre-commit',
     '**/git-clang-format',
     '**/gradlew',
+    'tools/testing/testintro',
     'fb/**',
     '**/fb/**',
 ]
