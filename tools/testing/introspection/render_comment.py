@@ -15,10 +15,14 @@ import hashlib
 import json
 import os
 import sys
-from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tools.testing.introspection import diff as diff_mod
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 MARKER = "<!-- testintro-diff -->"
