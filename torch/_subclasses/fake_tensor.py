@@ -190,10 +190,14 @@ class FakeTensorTLS(threading.local):
     # Default to None, otherwise it'll be used to override _all_
     # `FakeTensorMode.allow_non_fake_inputs` in this thread.
     allow_non_fake_inputs_override: bool | None
+    # Used when callers need fakification without concretizing 0-D real tensor
+    # item reads into FakeTensor.item_memo.
+    suppress_real_tensor_item_memo: bool
     non_strict_export_fake_tensor_tracker: weakref.WeakSet[FakeTensor]
 
     def __init__(self) -> None:
         self.allow_non_fake_inputs_override = None
+        self.suppress_real_tensor_item_memo = False
         self.non_strict_export_fake_tensor_tracker = weakref.WeakSet()
 
 
@@ -546,6 +550,7 @@ class FakeTensorConverter:
         value = None
         if (
             not self.export
+            and not fake_tensor_tls.suppress_real_tensor_item_memo
             and _is_plain_tensor(t)  # mostly, we want to know if item() works
             and t.dim() == 0
             and t.device.type == "cpu"
