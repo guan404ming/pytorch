@@ -151,12 +151,10 @@ def _stub_macos_probes() -> None:
 
     # MPS C APIs are macOS-only and absent from a non-Mac build; fake the ones test
     # files call at import/decorator time (in method bodies they don't run here).
-    for name, ret in {
-        "_mps_isCaptureEnabled": False,
-        "_mps_maxBufferLength": 1 << 34,
-    }.items():
-        if not hasattr(torch._C, name):
-            setattr(torch._C, name, (lambda r: lambda *a, **k: r)(ret))
+    if not hasattr(torch._C, "_mps_isCaptureEnabled"):
+        torch._C._mps_isCaptureEnabled = lambda *a, **k: False
+    if not hasattr(torch._C, "_mps_maxBufferLength"):
+        torch._C._mps_maxBufferLength = lambda *a, **k: 1 << 34
 
 
 def _patch_has_triton() -> None:
