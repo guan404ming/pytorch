@@ -118,9 +118,7 @@ def pytest_configure(config: Config) -> None:
         config.pluginmanager.register(PytestShardPlugin(config), "pytestshardplugin")
     min_gpu = int(os.environ.get("PYTORCH_TEST_MIN_GPU", "0"))
     if min_gpu > 0:
-        config.pluginmanager.register(
-            MinGpuFilterPlugin(min_gpu), "mingpufilterplugin"
-        )
+        config.pluginmanager.register(MinGpuFilterPlugin(min_gpu), "mingpufilterplugin")
 
 
 def pytest_unconfigure(config: Config) -> None:
@@ -399,11 +397,7 @@ class MinGpuFilterPlugin:
             MultiProcessTestCase,
             MultiThreadedTestCase,
         )
-        from torch.testing._internal.common_utils import (
-            TEST_CUDA,
-            TEST_HPU,
-            TEST_XPU,
-        )
+        from torch.testing._internal.common_utils import TEST_CUDA, TEST_HPU, TEST_XPU
 
         self.threshold = threshold
         self._torch = torch
