@@ -21427,6 +21427,8 @@ op_db: list[OpInfo] = [
                # JIT tests don't work with Tensor keyword arguments
                # https://github.com/pytorch/pytorch/issues/58507
                DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit'),
+               # Not implemented on XPU
+               DecorateInfo(unittest.expectedFailure, 'TestCompositeCompliance', 'test_cow_input', device_type='xpu'),
            )),
     OpInfo('histc',
            dtypes=floating_types_and(torch.bfloat16, torch.float16),
@@ -25515,9 +25517,12 @@ python_ref_db = [
         torch_opinfo_name="nn.functional.threshold",
         supports_out=True,
         skips=(
-            # RuntimeError: [srcBuf length] > 0
-            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_python_ref', device_type='mps'),
-            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_python_ref_torch_fallback', device_type='mps'),
+            # MPS threshold maps NaN to `value` (uses x > threshold), but the
+            # reference keeps NaN; mismatch only on float dtypes.
+            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_python_ref',
+                         device_type='mps', dtypes=(torch.float16, torch.bfloat16, torch.float32)),
+            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_python_ref_torch_fallback',
+                         device_type='mps', dtypes=(torch.float16, torch.bfloat16, torch.float32)),
         ),
     ),
     PythonRefInfo(

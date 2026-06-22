@@ -70,7 +70,6 @@ from ..utils import (
     dict_methods,
     extract_fake_example_value,
     get_fake_value,
-    guard_if_dyn,
     is_tensor_getset_descriptor,
     istype,
     numpy_operator_wrapper,
@@ -111,6 +110,7 @@ from .object_protocol import (
     generic_bool,
     generic_float,
     generic_getiter,
+    generic_hash,
     generic_inplace_multiply,
     generic_int,
     generic_invert,
@@ -1746,6 +1746,14 @@ class BuiltinVariable(BaseBuiltinVariable):
             # e.g., int.__invert__(4) → ~4
             return generic_invert(tx, args[0])
 
+        if name == "__hash__" and len(args) == 1 and not kwargs:
+            arg = args[0]
+            if (
+                isinstance(arg, variables.UserDefinedConstantVariable)
+                and arg._base_vt is not None
+            ):
+                return generic_hash(tx, arg._base_vt)
+
         return super().call_method(tx, name, args, kwargs)
 
     def call_int(
@@ -2001,20 +2009,15 @@ class BuiltinVariable(BaseBuiltinVariable):
         tx: "InstructionTranslatorBase",
         *args: VariableTracker,
         **kwargs: VariableTracker,
-    ) -> VariableTracker | None:
+    ) -> VariableTracker:
         if kwargs:
             raise_type_error(tx, "range() takes no keyword arguments")
         if len(args) == 0:
             raise_type_error(tx, "range expected at least 1 argument, got 0")
         if len(args) > 3:
             raise_type_error(tx, f"range expected at most 3 arguments, got {len(args)}")
-        if check_unspec_or_constant_args(args, {}):
-            return variables.RangeVariable(list(args))
-        elif self._dynamic_args(*args):
-            args = tuple(VariableTracker.build(tx, guard_if_dyn(arg)) for arg in args)
-            return variables.RangeVariable(list(args))
-        # None no-ops this handler and lets the driving function proceed
-        return None
+        args = tuple(VariableTracker.build(tx, arg.nb_index_impl(tx)) for arg in args)
+        return variables.RangeVariable(list(args))
 
     def _dynamic_args(self, *args: VariableTracker, **kwargs: VariableTracker) -> bool:
         return any(isinstance(x, SymNodeVariable) for x in args) or any(
@@ -2173,7 +2176,13 @@ class BuiltinVariable(BaseBuiltinVariable):
             # CPython: frozenset(existing_frozenset) returns the same object.
             return args[0]
 
-        items = unpack_iterable(tx, args[0])
+        # Reuse existing HashableTracker keys from a set/frozenset/dict operand
+        # instead of re-hashing, mirroring CPython's set_update_internal fast
+        # path (do-not-rehash-dict-keys).
+        if isinstance(args[0], (variables.SetVariable, variables.ConstDictVariable)):
+            items = list(args[0].items.keys())
+        else:
+            items = unpack_iterable(tx, args[0])
         fs = FrozensetVariable(items, mutation_type=ValueMutationNew())
         return fs
 
@@ -3016,6 +3025,13 @@ class DictBuiltinVariable(BaseBuiltinVariable):
             else:
                 return ConstDictVariable(items, mutation_type=ValueMutationNew())
 
+        # Reuse the operand's existing HashableTracker keys instead of
+        # re-wrapping (and thus re-hashing) the underlying VTs, mirroring
+        # CPython's do-not-rehash-dict-keys behavior when building a dict from
+        # an existing set/frozenset/dict.
+        if isinstance(arg, (variables.SetVariable, ConstDictVariable)):
+            # HashableTracker keys are accepted by ConstDictVariable.__init__.
+            return _make_result(dict.fromkeys(arg.items.keys(), value))  # type: ignore[arg-type]
         if isinstance(arg, dict):
             arg_list = [VariableTracker.build(tx, k) for k in arg]
             return _make_result(dict.fromkeys(arg_list, value))
