@@ -116,6 +116,11 @@ def pytest_configure(config: Config) -> None:
         config.pluginmanager.register(StepcurrentPlugin(config), "stepcurrentplugin")
     if config.getoption("num_shards"):
         config.pluginmanager.register(PytestShardPlugin(config), "pytestshardplugin")
+    min_gpu = int(os.environ.get("PYTORCH_TEST_MIN_GPU", "0"))
+    if min_gpu > 0:
+        config.pluginmanager.register(
+            MinGpuFilterPlugin(min_gpu), "mingpufilterplugin"
+        )
 
 
 def pytest_unconfigure(config: Config) -> None:
@@ -365,3 +370,140 @@ class StepcurrentPlugin:
             self.cache.set(self.lastrun_location, self.initial_val)
         if exitstatus != 0:
             self.cache.set(self.made_failing_xml_location, True)
+
+
+class MinGpuFilterPlugin:
+    """Deselect tests whose resolved accelerator requirement is below
+    ``PYTORCH_TEST_MIN_GPU`` so a CI job (e.g. a 4-GPU-only distributed job) can
+    run strictly the tests that need at least that many accelerators, with no
+    per-test list to maintain. Registered only when ``PYTORCH_TEST_MIN_GPU > 0``.
+
+    The requirement is resolved from existing signals (no new annotations):
+      - ``skip_if_lt_x_gpu(n)`` (stamps ``_min_gpus_required``) and
+        ``requires_world_size(n)`` (stamps ``_required_world_size``);
+      - the ``world_size`` of the multi-process base classes, gated by a
+        backend/device check so CPU/gloo ``world_size>=N`` tests are dropped;
+      - for thread-based tests, the accelerator-targeting test id plus
+        ``world_size``, since a thread count is not a physical GPU count.
+    An explicit decorator always overrides the backend/device gate. When the
+    requirement cannot be determined the test is kept (favor coverage).
+    """
+
+    # File basenames whose distributed backend is CPU-only (no accelerator).
+    _CPU_BACKEND_MODULES = ("gloo", "mpi", "ucc")
+
+    def __init__(self, threshold: int) -> None:
+        import torch
+        from torch.testing._internal.common_distributed import (
+            MultiProcContinuousTest,
+            MultiProcessTestCase,
+            MultiThreadedTestCase,
+        )
+        from torch.testing._internal.common_utils import (
+            TEST_CUDA,
+            TEST_HPU,
+            TEST_XPU,
+        )
+
+        self.threshold = threshold
+        self._torch = torch
+        self._process_based = (MultiProcessTestCase, MultiProcContinuousTest)
+        self._thread_based = MultiThreadedTestCase
+        tokens = []
+        if TEST_CUDA:
+            tokens.append("cuda")
+        if TEST_XPU:
+            tokens.append("xpu")
+        if TEST_HPU:
+            tokens.append("hpu")
+        self._accel_tokens = tuple(tokens)
+
+    def pytest_collection_modifyitems(self, config: Config, items: list[Any]) -> None:
+        deselected = []
+        kept = []
+        for item in items:
+            if self._required_gpus(item) >= self.threshold:
+                kept.append(item)
+            else:
+                deselected.append(item)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
+
+    def _required_gpus(self, item: Any) -> int:
+        try:
+            return self._resolve(item)
+        except Exception:
+            # Uncertain at collection time -> keep (favor coverage).
+            return self.threshold
+
+    def _resolve(self, item: Any) -> int:
+        func = getattr(item, "obj", None)
+        dec = max(
+            int(getattr(func, "_min_gpus_required", 0) or 0),
+            int(getattr(func, "_required_world_size", 0) or 0),
+        )
+        cls = getattr(item, "cls", None)
+        if cls is None:
+            # Not a class-based test; rely on an explicit decorator, else keep.
+            return dec if dec else self.threshold
+        if issubclass(cls, self._process_based):
+            required = max(dec, self._world_size(item))
+            # A CPU-backed multi-process test uses ranks, not GPUs; drop it
+            # unless an explicit decorator asserts the GPU requirement.
+            if (
+                required >= self.threshold
+                and dec < self.threshold
+                and self._is_cpu_backed(item)
+            ):
+                return 0
+            return required
+        if issubclass(cls, self._thread_based):
+            if dec:
+                return dec
+            # Thread count is not a GPU count: keep only accelerator-targeting
+            # variants that also spawn at least `threshold` ranks.
+            if (
+                self._id_targets_accelerator(item)
+                and self._world_size(item) >= self.threshold
+            ):
+                return self.threshold
+            return 0
+        # Plain TestCase: needs an explicit decorator to qualify as multi-GPU.
+        return dec if dec else 1
+
+    def _world_size(self, item: Any) -> int:
+        return int(item.instance.world_size)
+
+    def _id_targets_accelerator(self, item: Any) -> bool:
+        if not self._accel_tokens:
+            return False
+        parts = item.name.lower().split("_")
+        return any(tok in parts for tok in self._accel_tokens)
+
+    def _is_cpu_backed(self, item: Any) -> bool:
+        inst = item.instance
+        try:
+            dev = inst.device
+        except Exception:
+            dev = None
+        verdict = self._device_is_cpu(dev)
+        if verdict is not None:
+            return verdict
+        dtype = getattr(inst, "device_type", None)
+        if isinstance(dtype, str):
+            return dtype.lower() == "cpu"
+        module = getattr(item, "module", None)
+        base = (getattr(module, "__name__", "") or "").rsplit(".", 1)[-1].lower()
+        return any(b in base for b in self._CPU_BACKEND_MODULES)
+
+    def _device_is_cpu(self, dev: Any) -> "bool | None":
+        if dev is None:
+            return None
+        if isinstance(dev, self._torch.device):
+            return dev.type == "cpu"
+        if isinstance(dev, str):
+            return dev.lower().split(":")[0] == "cpu"
+        if isinstance(dev, int):
+            return False  # a device index implies an accelerator
+        return None

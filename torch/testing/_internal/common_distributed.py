@@ -152,10 +152,13 @@ ACCELERATOR_DIST_BACKENDS = ["nccl", "xccl", "hccl"]
 DDP_RANK_DEVICES = ["cuda", "xpu"]
 HAS_ACCELERATOR = TEST_CUDA or TEST_HPU or TEST_XPU
 
-# When set (e.g. PYTORCH_TEST_MIN_GPU=4), skip_if_lt_x_gpu(n) skips any test
-# whose required accelerator count n is below this threshold. This lets a CI job
-# run only the tests that require at least this many accelerators (e.g. a
-# 4-GPU-only distributed job) without maintaining an explicit test list.
+# When set (e.g. PYTORCH_TEST_MIN_GPU=4), the collection-time filter in
+# test/conftest.py (MinGpuFilterPlugin) keeps only tests whose resolved
+# accelerator requirement is at least this threshold and deselects the rest.
+# The requirement is resolved from existing signals (skip_if_lt_x_gpu, which
+# stamps `_min_gpus_required`; requires_world_size; and the `world_size` of the
+# multi-process base classes, gated by backend/device), so a CI job can run only
+# the >=N-GPU tests without maintaining an explicit test list.
 TEST_MIN_GPU = int(os.environ.get("PYTORCH_TEST_MIN_GPU", "0"))
 
 
@@ -322,15 +325,6 @@ def skip_if_lt_x_gpu(x, *, allow_cpu=False):
     """
 
     def decorator(func):
-        # Opt-in lower bound: when running a job that should only exercise tests
-        # requiring at least TEST_MIN_GPU accelerators, skip everything gated
-        # below that threshold at collection time (no subprocess spawned).
-        if TEST_MIN_GPU and x < TEST_MIN_GPU:
-            return unittest.skip(
-                f"Only running tests that require >= {TEST_MIN_GPU} accelerators "
-                "(PYTORCH_TEST_MIN_GPU)"
-            )(func)
-
         @wraps(func)
         def wrapper(*args, **kwargs):
             if torch.cuda.is_available() and torch.cuda.device_count() >= x:
@@ -345,6 +339,9 @@ def skip_if_lt_x_gpu(x, *, allow_cpu=False):
             if not _maybe_handle_skip_if_lt_x_gpu(args, test_skip.message):
                 sys.exit(test_skip.exit_code)
 
+        # Record the accelerator requirement so the collection-time min-GPU
+        # filter (PYTORCH_TEST_MIN_GPU) can resolve it without running the test.
+        wrapper._min_gpus_required = x
         return wrapper
 
     return decorator

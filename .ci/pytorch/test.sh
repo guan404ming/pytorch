@@ -1616,11 +1616,14 @@ test_distributed() {
 
 test_distributed_4gpu() {
   # Run only the distributed tests that require >= 4 GPUs, for runners with
-  # 4-GPU labels (e.g. ROCm gfx950.4). PYTORCH_TEST_MIN_GPU makes
-  # skip_if_lt_x_gpu(n) skip any test gated below 4 GPUs at collection time.
-  # run_test.py --distributed-tests discovers every distributed test file
-  # dynamically, so a new @skip_if_lt_x_gpu(4) test added anywhere under
-  # test/distributed is picked up automatically with no list to maintain.
+  # 4-GPU labels (e.g. ROCm gfx950.4). PYTORCH_TEST_MIN_GPU activates the
+  # collection-time filter in test/conftest.py (MinGpuFilterPlugin): it resolves
+  # each test's accelerator requirement from existing signals (skip_if_lt_x_gpu,
+  # requires_world_size, and the world_size of the multi-process base classes,
+  # gated by backend/device) and deselects anything below 4 GPUs. run_test.py
+  # --distributed-tests discovers every distributed test file dynamically, so a
+  # new 4-GPU test added anywhere under test/distributed is picked up
+  # automatically with no list to maintain.
   export PYTORCH_TEST_MIN_GPU=4
   echo "Testing distributed python tests that require 4 GPUs"
   # shellcheck disable=SC2086
