@@ -360,7 +360,7 @@ class SubgraphInfo:
     loads: IndentedBuffer = dataclasses.field(default_factory=IndentedBuffer)
     stores: IndentedBuffer = dataclasses.field(default_factory=IndentedBuffer)
     ops_handler: V.WrapperHandler | None = None  # type: ignore[name-defined]
-    cse: Optional["CSE[Any]"] = None
+    cse: Optional["CSE[Any, str]"] = None
 
     # only copied over if not None
     range_trees: list["IterationRangesRoot"] | None = None
@@ -1761,7 +1761,7 @@ class TritonTemplateKernel(TritonKernel):
     def make_load(self, name, indices, mask):
         """
         Optional helper called from template code to generate the code
-        needed to load from an tensor.
+        needed to load from a tensor.
         """
         if not isinstance(indices, (list, tuple)):
             raise AssertionError(
@@ -6010,7 +6010,12 @@ def clear_preprocessing_fns(clear_defaults: bool = False):
 
 def realize_inputs(*args):
     if len(args) == 1:
-        return ir.ExternKernel.require_stride1(ir.ExternKernel.realize_input(args[0]))
+        realized = ir.ExternKernel.realize_input(args[0])
+        # Shape scalars are represented as scalar IR, e.g. ShapeAsConstantBuffer.
+        # Tensor layout constraints such as stride-1 only apply to tensor IR.
+        if not realized.has_tensor_output():
+            return realized
+        return ir.ExternKernel.require_stride1(realized)
     return [realize_inputs(x) for x in args]
 
 

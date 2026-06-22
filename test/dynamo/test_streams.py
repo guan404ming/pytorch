@@ -344,12 +344,12 @@ class <lambda>(torch.nn.Module):
         # Annotation: {'stream': 2}
         add: "f32[2, 2]" = torch.ops.aten.add.Tensor(arg0_1, arg1_1)
 
-        # Annotation: {'stream': 2}
-        add_1: "f32[2, 2]" = torch.ops.aten.add.Tensor(add, 2);  add = None
-
         # Annotation: {'stream': 3}
-        add_2: "f32[2, 2]" = torch.ops.aten.add.Tensor(arg0_1, arg1_1);  arg0_1 = arg1_1 = None
-        return (add_2, add_1)
+        add_1: "f32[2, 2]" = torch.ops.aten.add.Tensor(arg0_1, arg1_1);  arg0_1 = arg1_1 = None
+
+        # Annotation: {'stream': 2}
+        add_2: "f32[2, 2]" = torch.ops.aten.add.Tensor(add, 2);  add = None
+        return (add_1, add_2)
 """,
         )
 

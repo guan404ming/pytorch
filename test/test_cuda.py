@@ -918,7 +918,7 @@ print(t.is_pinned())
                 default_workspace_size = 4096 * 8 * 1024
 
         def check_workspace_size(inp):
-            torch._C._cuda_clearCublasWorkspaces()
+            torch.cuda._clear_cublas_workspaces()
             start = torch.cuda.memory_stats()["active_bytes.all.allocated"]
             with torch.no_grad():
                 torch.matmul(inp, inp)
@@ -943,7 +943,7 @@ print(t.is_pinned())
         torch._C._cuda_resetCublasWorkspaceSize()
         self.assertLess(abs(check_workspace_size(a) - default_workspace_size), 524288)
 
-        torch._C._cuda_clearCublasWorkspaces()
+        torch.cuda._clear_cublas_workspaces()
 
     @unittest.skipIf(TEST_CUDAMALLOCASYNC, "temporarily disabled for async")
     @unittest.skipIf(IS_FBCODE, "not enabled by default on fbcode")
@@ -1053,7 +1053,7 @@ print(t.is_pinned())
         torch.backends.cuda.preferred_blas_library("cublas")
 
         original_size = torch.backends.cuda.cublas_workspace_size()
-        torch._C._cuda_clearCublasWorkspaces()
+        torch.cuda._clear_cublas_workspaces()
 
         # Trigger initial allocation with matmul
         a = torch.randn(7, 7, device="cuda", requires_grad=False)
@@ -2526,6 +2526,28 @@ torch.cuda.synchronize()
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_to_numpy(self):
         self.assertRaises(TypeError, lambda: torch.empty(1, device="cuda").numpy())
+
+    def test_accelerator_default_generator(self):
+        torch.cuda.init()
+        for index in range(torch.accelerator.device_count()):
+            cuda_default_generator = torch.cuda.default_generators[index]
+            acc_default_generator = torch._C._accelerator_getDefaultGenerator(index)
+            self.assertEqual(
+                cuda_default_generator.device, acc_default_generator.device
+            )
+            # Verify they share the same underlying GeneratorImpl
+            self.assertEqual(
+                cuda_default_generator.get_state(),
+                acc_default_generator.get_state(),
+            )
+            cuda_default_generator.manual_seed(42)
+            self.assertEqual(acc_default_generator.initial_seed(), 42)
+            # Verify state stays in sync after reseeding
+            cuda_default_generator.seed()
+            self.assertEqual(
+                cuda_default_generator.get_state(),
+                acc_default_generator.get_state(),
+            )
 
     def test_graph_is_current_stream_capturing(self):
         self.assertFalse(torch.cuda.is_current_stream_capturing())
@@ -4081,7 +4103,6 @@ exit(2)
             model_graphed({"x": real_inputs[0]}), model_control({"x": real_inputs[0]})
         )
 
-    @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/179961")
     @unittest.skipIf(
         not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
     )
@@ -5456,7 +5477,7 @@ class TestCudaAllocator(TestCase):
     def test_memory_plots_free_segment_stack(self):
         for context in ["alloc", "all", "state"]:
             try:
-                torch._C._cuda_clearCublasWorkspaces()
+                torch.cuda._clear_cublas_workspaces()
                 torch.cuda.memory.empty_cache()
                 torch.cuda.memory._record_memory_history(context=context)
                 x = torch.rand(3, 4, device="cuda")
@@ -5475,7 +5496,7 @@ class TestCudaAllocator(TestCase):
     def test_memory_plots_metadata(self):
         for context in ["alloc", "all", "state"]:
             try:
-                torch._C._cuda_clearCublasWorkspaces()
+                torch.cuda._clear_cublas_workspaces()
                 torch.cuda.memory.empty_cache()
                 torch.cuda.memory._set_memory_metadata("metadata test")
                 torch.cuda.memory._record_memory_history(context=context)
@@ -5495,7 +5516,7 @@ class TestCudaAllocator(TestCase):
     )
     def test_memory_snapshot_script(self):
         try:
-            torch._C._cuda_clearCublasWorkspaces()
+            torch.cuda._clear_cublas_workspaces()
             torch.cuda.memory.empty_cache()
             torch.cuda.memory._record_memory_history("state", stacks="python")
 
