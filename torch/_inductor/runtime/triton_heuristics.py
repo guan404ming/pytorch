@@ -2707,6 +2707,62 @@ class CompileResult(Generic[_T]):
             runner_args = [desc_var if a == inner_name else a for a in runner_args]
         return pre_runner_lines, runner_args
 
+    def _host_tma_static_pre_runner_lines(
+        self, runner_args: list[str], call_args: list[str]
+    ) -> tuple[list[str], list[str], dict[str, Any]]:
+        """Static-launcher variant of host-side TMA descriptor setup. Instead of
+        rebuilding a TensorDescriptor every call, emit a cached expander
+        (expand_host_tma_descriptor) that returns the flat kernel params
+        (CUtensorMap + shape + strides) and reuses the encoded CUtensorMap when
+        the input address is unchanged -- skipping the descriptor build and
+        cuTensorMapEncodeTiled on the hot path. The expanded params are spliced
+        into the runner call. Returns (pre_runner_lines, runner_args, scope).
+        """
+        from .static_triton_launcher import expand_host_tma_descriptor
+
+        host_tma_args = self.inductor_meta.get("host_tma_descriptor_args")
+        pre_runner_lines: list[str] = []
+        scope_additions: dict[str, Any] = {}
+        if not host_tma_args:
+            return pre_runner_lines, runner_args, scope_additions
+        # See _host_tma_pre_runner_lines: fail clearly on a too-old Triton.
+        if not has_triton_stable_tma_api():
+            raise RuntimeError(
+                "host-side TMA requires a Triton with the stable TMA API "
+                "(triton.tools.tensor_descriptor.TensorDescriptor)"
+            )
+        cfg_kwargs = self.config.kwargs
+        all_constants = self.compile_meta["constants"]
+        meta = getattr(self.kernel, "tensordesc_meta", None)
+        pos = 0
+        for inner_name, desc_info in host_tma_args.items():
+            if inner_name not in call_args or not isinstance(desc_info, dict):
+                continue
+            block_shape_vals = _resolve_dims(
+                desc_info["block_shape"], cfg_kwargs, all_constants
+            )
+            shape_vals = _resolve_dims(desc_info["shape"], cfg_kwargs, all_constants)
+            stride_vals = _resolve_dims(desc_info["strides"], cfg_kwargs, all_constants)
+            if block_shape_vals is None or shape_vals is None or stride_vals is None:
+                continue
+            desc_var = f"{inner_name}_host_tma_desc"
+            pre_runner_lines.append(
+                f"{desc_var} = expand_host_tma_descriptor(_tma_cache, {pos}, "
+                f'{inner_name}, "{inner_name}", {shape_vals}, {stride_vals}, '
+                f"{block_shape_vals}, _tma_meta[{pos}])"
+            )
+            runner_args = [
+                f"*{desc_var}" if a == inner_name else a for a in runner_args
+            ]
+            pos += 1
+        if pre_runner_lines:
+            scope_additions = {
+                "expand_host_tma_descriptor": expand_host_tma_descriptor,
+                "_tma_cache": {},
+                "_tma_meta": list(meta) if meta else [None] * pos,
+            }
+        return pre_runner_lines, runner_args, scope_additions
+
     def _gen_launcher_code(
         self, scope, def_args, runner_args, pre_runner_lines=None
     ) -> LauncherType:
@@ -2938,12 +2994,8 @@ class StaticTritonCompileResult(CompileResult[_T]):
         if device is None:
             device = 0
         self.kernel.load_kernel(device)
-        import triton as triton_lib
-
         scope = {
             "runner": self.kernel.run,
-            # Needed by host-side TMA pre_runner_lines (TensorDescriptor build).
-            "triton": triton_lib,
         }
 
         # NOTE: Constexpr handling for triton and static cuda launcher
@@ -2980,13 +3032,10 @@ class StaticTritonCompileResult(CompileResult[_T]):
 
         # StaticallyLaunchedCudaKernel.run takes in order grid_0, grid_1, grid_2, stream, and call_args
         runner_args = ["grid_0", "grid_1", "grid_2", "stream", *call_args]
-        # Host-side TMA: build TensorDescriptors and substitute them for the raw
-        # tensor args (StaticallyLaunchedTritonKernel.run expands them).
-        if self.inductor_meta.get("host_tma_descriptor_args"):
-            scope["_host_tma_aligned"] = _host_tma_aligned
-        pre_runner_lines, runner_args = self._host_tma_pre_runner_lines(
-            runner_args, call_args
+        pre_runner_lines, runner_args, tma_scope = (
+            self._host_tma_static_pre_runner_lines(runner_args, call_args)
         )
+        scope.update(tma_scope)
         launcher = self._gen_launcher_code(
             scope, def_args, runner_args, pre_runner_lines=pre_runner_lines
         )
