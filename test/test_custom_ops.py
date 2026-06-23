@@ -639,8 +639,7 @@ class TestCustomOp(CustomOpTestCaseBase):
 
         op = self.ns().pyobject_dispatch_composite.default
         x = torch.ones(2)
-        state = op._pyobj_dispatcher
-        self.assertTrue(state is None or not state.enabled)
+        self.assertFalse(op._is_pyobj_dispatcher_enabled())
         self.assertEqual(op(x), x + 1)
         self.assertEqual(calls, ["composite"])
 
@@ -658,7 +657,7 @@ class TestCustomOp(CustomOpTestCaseBase):
 
         op = self.ns().pyobject_dispatch_cpu.default
         op._enable_pyobj_dispatch(True)
-        self.assertTrue(op._pyobj_dispatcher.enabled)
+        self.assertTrue(op._is_pyobj_dispatcher_enabled())
 
         x = torch.ones(2)
         self.assertEqual(op(x), x + 1)
@@ -683,7 +682,7 @@ class TestCustomOp(CustomOpTestCaseBase):
 
         op = self.ns().pyobject_dispatch_autograd_fallthrough.default
         op._enable_pyobj_dispatch(True)
-        self.assertTrue(op._pyobj_dispatcher.enabled)
+        self.assertTrue(op._is_pyobj_dispatcher_enabled())
 
         x = torch.ones(2)
         self.assertEqual(op(x), x + 1)
@@ -700,7 +699,7 @@ class TestCustomOp(CustomOpTestCaseBase):
             return x + 1
 
         op = self.ns().pyobject_dispatch_custom_op.default
-        self.assertTrue(op._pyobj_dispatcher.enabled)
+        self.assertTrue(op._is_pyobj_dispatcher_enabled())
 
         x = torch.ones(2)
         self.assertEqual(f(x), x + 1)
