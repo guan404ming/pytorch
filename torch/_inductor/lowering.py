@@ -653,6 +653,33 @@ def promote_constants(
     return out
 
 
+def _is_cpu_low_precision_tensor(x: Any) -> bool:
+    if not isinstance(x, (TensorBox, ExpandView, ir.Constant)):
+        return False
+    device = x.get_device()
+    return (
+        x.get_dtype() in (torch.bfloat16, torch.float16)
+        and device is not None
+        and device.type == "cpu"
+    )
+
+
+def _round_low_precision_pointwise_output(x: TensorBox) -> TensorBox:
+    dtype = x.get_dtype()
+    loader = x.make_loader()
+
+    def inner_fn(index):
+        downcast = ops.to_dtype(loader(index), dtype, use_compute_types=False)
+        return ops.to_dtype(downcast, dtype)
+
+    return Pointwise.create(
+        device=x.get_device(),
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+    )
+
+
 def _add_with_alpha_fma(a, b, alpha):
     """Compute a + alpha * b using FMA for CUDA floating-point precision."""
     dtype = get_promoted_dtype(
@@ -718,6 +745,7 @@ def make_pointwise(
     override_fn_when_input_bool: Callable[..., Any] | None = None,
     allow_alpha: bool = False,
     use_fma_for_alpha: bool = False,
+    round_cpu_low_precision_scalar: bool = False,
     triton_fallback: Callable[..., _T] | None = None,
 ) -> Callable[..., TensorBox | _T]:
     """Wraps a pointwise fn and returns a function representing the pointwise in
@@ -731,10 +759,26 @@ def make_pointwise(
                 raise AssertionError("expected: not allow_alpha")
             return triton_fallback(*inputs)
 
+        round_scalar_constants = round_cpu_low_precision_scalar and any(
+            _is_cpu_low_precision_tensor(inp) for inp in inputs
+        )
         # pyrefly: ignore [bad-assignment]
-        inputs = promote_constants(inputs, override_return_dtype)
+        inputs = promote_constants(
+            inputs,
+            override_return_dtype,
+            round_scalar_constants=round_scalar_constants,
+        )
         if allow_alpha:
             if alpha is not None and alpha != 1:
+                round_alpha_output = False
+                if round_cpu_low_precision_scalar and isinstance(alpha, (int, float)):
+                    alpha_input = inputs[-1]
+                    if _is_cpu_low_precision_tensor(alpha_input):
+                        alpha = torch.tensor(
+                            alpha, dtype=alpha_input.get_dtype()
+                        ).item()
+                        round_alpha_output = True
+
                 # Use FMA for add-with-alpha on CUDA floating-point.
                 # Eager CUDA computes a + alpha * b as fma(b, alpha, a).
                 if use_fma_for_alpha and isinstance(inputs[0], IRNode):
@@ -747,10 +791,31 @@ def make_pointwise(
                     ):
                         return _add_with_alpha_fma(inputs[0], inputs[1], alpha)
 
-                # pyrefly: ignore [bad-assignment]
-                inputs = list(inputs)
-                # pyrefly: ignore [unsupported-operation]
-                inputs[-1] = mul(inputs[-1], alpha)
+                inputs_list = list(inputs)
+                alpha_input = inputs_list[-1]
+                alpha_product = None
+                if round_alpha_output:
+                    alpha_constant = get_constant_value(alpha_input)
+                    if alpha_constant is not None:
+                        alpha_product = ExpandView.create(
+                            ir.Constant(
+                                value=torch.tensor(
+                                    alpha_constant.value * alpha,
+                                    dtype=alpha_input.get_dtype(),
+                                ).item(),
+                                dtype=alpha_input.get_dtype(),
+                                device=alpha_input.get_device_or_error(),
+                            ),
+                            list(alpha_input.get_size()),
+                        )
+                if alpha_product is None:
+                    alpha_product = mul(alpha_input, alpha)
+                    if round_alpha_output:
+                        alpha_product = _round_low_precision_pointwise_output(
+                            alpha_product
+                        )
+                inputs_list[-1] = alpha_product
+                inputs = tuple(inputs_list)
         else:
             if alpha is not None:
                 raise AssertionError("expected: alpha is None")
@@ -1083,6 +1148,7 @@ def register_pointwise(
     override_fn_when_input_bool=None,
     allow_alpha=False,
     use_fma_for_alpha=False,
+    round_cpu_low_precision_scalar=False,
     triton_fallback=None,
 ):
     """A pointwise function that maps ops.{name} to inputs"""
@@ -1102,6 +1168,7 @@ def register_pointwise(
         override_fn_when_input_bool=override_fn_when_input_bool,
         allow_alpha=allow_alpha,
         use_fma_for_alpha=use_fma_for_alpha,
+        round_cpu_low_precision_scalar=round_cpu_low_precision_scalar,
         triton_fallback=triton_fallback,
     )
     fn = register_lowering(
@@ -7869,6 +7936,7 @@ add = register_pointwise(
     allow_alpha=True,
     use_fma_for_alpha=True,
     override_fn_when_input_bool="logical_or",
+    round_cpu_low_precision_scalar=True,
 )
 
 sort_fallback = fallback_handler(aten.sort.stable, add_to_fallback_set=False)
@@ -8147,7 +8215,11 @@ relu = register_pointwise(aten.relu)
 sigmoid = register_pointwise_numeric_ldf64(aten.sigmoid)
 sqrt = register_pointwise_numeric_ldf64(aten.sqrt)
 square = register_pointwise(aten.square)
-sub = register_pointwise(aten.sub, allow_alpha=True)
+sub = register_pointwise(
+    aten.sub,
+    allow_alpha=True,
+    round_cpu_low_precision_scalar=True,
+)
 
 
 @register_lowering(aten.addcmul, broadcast=True)
