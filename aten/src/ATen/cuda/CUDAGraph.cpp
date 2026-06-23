@@ -35,6 +35,15 @@ bool is_graph_capture_active() {
 }
 #endif // defined(USE_ROCM)
 
+CUDAGraph* get_graph_from_capture_id(CaptureId_t capture_id) {
+  std::lock_guard<std::mutex> lock(_currently_capturing_graphs_mutex);
+  auto it = _currently_capturing_graphs.find(capture_id);
+  if (it != _currently_capturing_graphs.end()) {
+    return it->second;
+  }
+  return nullptr;
+}
+
 MempoolId_t graph_pool_handle() {
   // Sets just the second value, to distinguish it from MempoolId_ts created from
   // cudaStreamGetCaptureInfo id_s in capture_begin.
@@ -73,14 +82,6 @@ void CUDAGraph::register_generator_state(
   captured_generator_states_[std::move(state)] = 0;
 }
 
-void CUDAGraph::register_generator_state(const at::Generator& generator) {
-  c10::intrusive_ptr<CUDAGeneratorImpl> cuda_gen =
-      dynamic_intrusive_pointer_cast<CUDAGeneratorImpl>(
-          generator.getIntrusivePtr());
-  cuda_gen->register_graph(this);
-}
-
-
 template <>
 std::function<bool(cudaStream_t)> CUDAGraph::create_allocate_filter<cudaStream_t>() const {
   return [this](cudaStream_t stream) {
@@ -104,11 +105,6 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
               "To capture a new graph, create a new instance.");
 
   capture_mode_ = capture_mode;
-
-  // default generator is always registered
-  auto* gen = get_generator_or_default<CUDAGeneratorImpl>(
-      std::nullopt, cuda::detail::getDefaultCUDAGenerator());
-  gen->register_graph(this);
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -167,14 +163,14 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
     std::lock_guard<std::mutex> lock(_currently_capturing_graphs_mutex);
     _currently_capturing_graphs.emplace(capture_id_, this);
   }
-
-  for (auto& [generator_state, wholegraph_increment] :
-       captured_generator_states_) {
-    generator_state->init_capture_state(capture_id_);
-  }
 }
 
-void CUDAGraph::capture_end() {
+// capture_end is split so callers can run work on the captured cudaGraph_t
+// (e.g. read its id, dump it, transform it) in the window between the end of
+// capture and finalization, when graph_ is live for both keep_graph modes.
+// capture_end_post finalizes (instantiate + destroy for keep_graph=false);
+// capture_end runs the two back to back for callers that don't need the window.
+void CUDAGraph::capture_end_pre() {
   auto stream = at::cuda::getCurrentCUDAStream();
 
   TORCH_CHECK(stream.stream() == capture_stream_.stream(),
@@ -193,6 +189,11 @@ void CUDAGraph::capture_end() {
     _currently_capturing_graphs.erase(capture_id_);
   }
 
+  // End pool allocation before checking the capture error. This ensures
+  // captures_underway is cleaned up even if cudaStreamEndCapture failed
+  // (e.g. due to an illegal operation during capture). These calls are
+  // safe regardless of whether the capture succeeded — they simply
+  // remove the pool routing entry added by beginAllocateToPool.
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
   at::getHostAllocator(at::kCUDA)->end_allocate_to_pool(mempool_id_);
   AT_CUDA_CHECK(endCaptureErr);
@@ -213,6 +214,9 @@ void CUDAGraph::capture_end() {
 
   capture_ended_ = true;
   has_graph_ = true;
+}
+
+void CUDAGraph::capture_end_post() {
   if (!keep_graph_) {
     instantiate();
     if (!_cuda_graphs_debug) {
@@ -220,6 +224,11 @@ void CUDAGraph::capture_end() {
     }
     has_graph_ = false;
   }
+}
+
+void CUDAGraph::capture_end() {
+  capture_end_pre();
+  capture_end_post();
 }
 
 void CUDAGraph::instantiate() {
@@ -255,11 +264,11 @@ void CUDAGraph::instantiate() {
 void CUDAGraph::replay() {
   TORCH_CHECK(capture_ended_,
               "Called CUDAGraph::replay without a preceding successful capture.");
-
-  if (!has_graph_exec_) {
-    TORCH_INTERNAL_ASSERT(keep_graph_);
-    instantiate();
-  }
+  // Instantiating on demand is handled by the Python replay() wrapper (which
+  // can do so for keep_graph=true). At this level the exec graph must exist.
+  TORCH_CHECK(has_graph_exec_,
+              "Called CUDAGraph::replay before the graph was instantiated; "
+              "call instantiate() first.");
 
   c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
 
@@ -292,8 +301,10 @@ void CUDAGraph::debug_dump(const std::string& debug_path) {
 }
 
 cudaGraph_t CUDAGraph::raw_cuda_graph() {
-  TORCH_CHECK(keep_graph_, "You cannot access the raw cudaGraph_t instance unless CUDAGraph was initialized with keep_graph=true");
-  TORCH_CHECK(has_graph_, "You cannot access the raw cudaGraph_t instance until capture_end() has been called");
+  TORCH_CHECK(has_graph_,
+      "No cudaGraph_t is available: either capture_end() has not been called, "
+      "or the underlying cudaGraph_t was destroyed (keep_graph=false, and "
+      "capture has been finalized).");
   return graph_;
 }
 
@@ -325,6 +336,9 @@ void CUDAGraph::reset() {
   // If the user catches the failure exception in a script, or is running in REPL or (god forbid)
   // a Jupyter notebook, I don't see an easy way for reset() to gracefully fix all such possible error states.
 
+  // See Note [RNG state tensor lifetime and recordStream] in
+  // CUDAGeneratorImpl.cpp — recordStream in setup_for_replay ensures the
+  // allocator won't recycle these tensors until in-flight replays finish.
   if (capture_id_ != 0) {
     for (auto& [generator_state, wholegraph_increment] : captured_generator_states_) {
       generator_state->remove_capture_state(capture_id_);

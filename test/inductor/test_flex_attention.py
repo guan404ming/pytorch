@@ -7049,6 +7049,70 @@ class TestBlockMask(InductorTestCase):
         self.assertEqual(block_mask.shape, (B, H, Q_LEN, KV_LEN))
 
     @supported_platform
+    def test_getitem_query_slice_updates_shape(self, device):
+        def causal_mask(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        block_mask = create_block_mask(
+            causal_mask,
+            B=None,
+            H=None,
+            Q_LEN=8,
+            KV_LEN=9,
+            BLOCK_SIZE=4,
+            device=device,
+        )
+
+        first_q_block = block_mask[:, :, :1]
+        self.assertEqual(first_q_block.shape, (1, 1, 4, 9))
+        self.assertEqual(first_q_block.seq_lengths, (4, 9))
+        self.assertEqual(block_mask[:, :, 0].shape, (1, 1, 4, 9))
+
+        second_q_block = block_mask[:, :, 1]
+        self.assertEqual(second_q_block.shape, (1, 1, 4, 9))
+        self.assertEqual(second_q_block.to_dense(), block_mask.to_dense()[:, :, 1:2, :])
+
+        q = torch.empty(1, 1, 8, 2, device=device)
+        self.assertEqual(q[:, :, :4, :].shape[-2], first_q_block.shape[-2])
+        self.assertEqual(q[:, :, 4:8, :].shape[-2], second_q_block.shape[-2])
+
+        with self.assertRaisesRegex(IndexError, "batch, head, and Q-block"):
+            block_mask[:, :, :, :1]
+
+        block_mask = create_block_mask(
+            causal_mask,
+            B=None,
+            H=None,
+            Q_LEN=9,
+            KV_LEN=10,
+            BLOCK_SIZE=4,
+            device=device,
+        )
+
+        self.assertEqual(block_mask[:, :, :].shape, (1, 1, 9, 10))
+        self.assertEqual(block_mask[:, :, 1].shape, (1, 1, 4, 10))
+        self.assertEqual(block_mask[:, :, 1:].shape, (1, 1, 5, 10))
+        self.assertEqual(block_mask[:, :, :0].shape, (1, 1, 0, 10))
+        self.assertEqual(block_mask[:, :, ::2].shape, (1, 1, 5, 10))
+        self.assertEqual(
+            block_mask[:, :, ::2].to_dense(), block_mask.to_dense()[:, :, ::2, :]
+        )
+
+        tail_q_block = block_mask[:, :, 2]
+        self.assertEqual(tail_q_block.shape, (1, 1, 1, 10))
+        self.assertEqual(block_mask[:, :, -1].shape, tail_q_block.shape)
+        self.assertEqual(tail_q_block.seq_lengths, (1, 10))
+        self.assertEqual(tail_q_block.to_dense(), block_mask.to_dense()[:, :, 2:3, :])
+        if tail_q_block.q_indices is None:
+            raise AssertionError("Expected q_indices to be recomputed")
+        self.assertEqual(
+            tail_q_block.q_indices, torch.zeros_like(tail_q_block.q_indices)
+        )
+
+        tail_q_block_tensor_index = block_mask[:, :, torch.tensor([2], device=device)]
+        self.assertEqual(tail_q_block_tensor_index.shape, (1, 1, 4, 10))
+
+    @supported_platform
     def test_getitem(self, device):
         offset = torch.zeros(8, device=device)
 
@@ -8732,6 +8796,36 @@ def get_params(dtypes: list[torch.dtype]) -> list[Params]:
     return params
 
 
+ROCM_FLAKY_LEARNABLE_BIAS_CASES = {
+    "head_specific_gate": {
+        (2, 4, 37, 16, torch.float16, "max-autotune-no-cudagraphs"),
+        (2, 4, 37, 16, torch.float32, "max-autotune-no-cudagraphs"),
+        (2, 4, 256, 16, torch.bfloat16, "max-autotune-no-cudagraphs"),
+        (2, 4, 256, 16, torch.float16, "max-autotune-no-cudagraphs"),
+        (2, 4, 256, 16, torch.float32, "max-autotune-no-cudagraphs"),
+        (2, 4, 277, 16, torch.bfloat16, "max-autotune-no-cudagraphs"),
+        (2, 4, 277, 16, torch.float32, "max-autotune-no-cudagraphs"),
+    },
+    "relative_1d_bias": {
+        (2, 4, 37, 16, torch.bfloat16, "max-autotune-no-cudagraphs"),
+        (2, 4, 256, 16, torch.bfloat16, "max-autotune-no-cudagraphs"),
+        (2, 4, 256, 16, torch.float16, "max-autotune-no-cudagraphs"),
+        (2, 4, 277, 16, torch.bfloat16, "max-autotune-no-cudagraphs"),
+        (2, 4, 277, 16, torch.float16, "max-autotune-no-cudagraphs"),
+        (2, 4, 277, 16, torch.float32, "max-autotune-no-cudagraphs"),
+    },
+    "symmetric_bias": {
+        (2, 4, 37, 16, torch.bfloat16, "max-autotune-no-cudagraphs"),
+        (2, 4, 37, 16, torch.float16, "max-autotune-no-cudagraphs"),
+        (2, 4, 37, 16, torch.float32, "max-autotune-no-cudagraphs"),
+        (2, 4, 256, 16, torch.float16, "max-autotune-no-cudagraphs"),
+        (2, 4, 277, 16, torch.bfloat16, "max-autotune-no-cudagraphs"),
+        (2, 4, 277, 16, torch.float16, "max-autotune-no-cudagraphs"),
+        (2, 4, 277, 16, torch.float32, "max-autotune-no-cudagraphs"),
+    },
+}
+
+
 supports_learnable_bias = unittest.skipUnless(
     (
         (torch.xpu.is_available() and has_triton())
@@ -8764,6 +8858,23 @@ class TestLearnableBiases(InductorTestCase):
             requires_grad=True,
         )
         return (make_tensor(), make_tensor(), make_tensor())
+
+    def skip_rocm_flaky_learnable_bias_case(
+        self, test_name: str, params: Params, mode: str
+    ):
+        """Skips parameterized ROCm flakes tracked by disabled-test issues."""
+        case = (
+            params.batch_size,
+            params.num_heads,
+            params.seq_length,
+            params.head_dim,
+            params.dtype,
+            mode,
+        )
+        if TEST_WITH_ROCM and case in ROCM_FLAKY_LEARNABLE_BIAS_CASES[test_name]:
+            self.skipTest(
+                "Flaky on ROCm: https://github.com/pytorch/pytorch/issues/167271 and https://github.com/pytorch/pytorch/issues/167296"
+            )
 
     @torch.no_grad()
     def _gold_check(self, eager, compiled, gold, tensor_name, fudge_factor=1.35):
@@ -8822,6 +8933,7 @@ class TestLearnableBiases(InductorTestCase):
     )
     @common_utils.parametrize("mode", ["default", "max-autotune-no-cudagraphs"])
     def test_relative_1d_bias(self, device, params, mode: str):
+        self.skip_rocm_flaky_learnable_bias_case("relative_1d_bias", params, mode)
         query, key, value = self._init_tensors(params, device=device)
         bias = torch.randn(
             2 * params.seq_length,
@@ -9139,6 +9251,7 @@ class TestLearnableBiases(InductorTestCase):
     )
     @common_utils.parametrize("mode", ["default", "max-autotune-no-cudagraphs"])
     def test_symmetric_bias(self, device, params, mode: str):
+        self.skip_rocm_flaky_learnable_bias_case("symmetric_bias", params, mode)
         query, key, value = self._init_tensors(params, device=device)
         bias = torch.randn(
             params.seq_length,
@@ -9211,6 +9324,7 @@ class TestLearnableBiases(InductorTestCase):
     )
     @common_utils.parametrize("mode", ["default", "max-autotune-no-cudagraphs"])
     def test_head_specific_gate(self, device, params, mode: str):
+        self.skip_rocm_flaky_learnable_bias_case("head_specific_gate", params, mode)
         query, key, value = self._init_tensors(params, device=device)
         gate_score = torch.randn(
             params.num_heads,
