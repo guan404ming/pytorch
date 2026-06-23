@@ -621,6 +621,88 @@ class TestCustomOpTesting(CustomOpTestCaseBase):
 class TestCustomOp(CustomOpTestCaseBase):
     test_ns = "_test_custom_op"
 
+    def test_pyobject_dispatch_composite_implicit_autograd(self):
+        lib = self.lib()
+        lib.define("pyobject_dispatch_composite(Tensor x) -> Tensor")
+
+        calls = []
+
+        def composite_impl(x):
+            calls.append("composite")
+            return x + 1
+
+        lib.impl(
+            "pyobject_dispatch_composite",
+            composite_impl,
+            "CompositeImplicitAutograd",
+        )
+
+        op = self.ns().pyobject_dispatch_composite.default
+        x = torch.ones(2)
+        self.assertTrue(op._pyobj_dispatcher.enabled)
+        self.assertEqual(op(x), x + 1)
+        self.assertEqual(calls, ["composite"])
+
+    def test_pyobject_dispatch_preserves_cpp_autograd_fallback(self):
+        lib = self.lib()
+        lib.define("pyobject_dispatch_cpu(Tensor x) -> Tensor")
+
+        calls = []
+
+        def cpu_impl(x):
+            calls.append("cpu")
+            return x + 1
+
+        lib.impl("pyobject_dispatch_cpu", cpu_impl, "CPU")
+
+        op = self.ns().pyobject_dispatch_cpu.default
+        self.assertTrue(op._pyobj_dispatcher.enabled)
+
+        x = torch.ones(2)
+        self.assertEqual(op(x), x + 1)
+        self.assertEqual(calls, ["cpu"])
+
+    def test_pyobject_dispatch_autograd_fallthrough(self):
+        lib = self.lib()
+        lib.define("pyobject_dispatch_autograd_fallthrough(Tensor x) -> Tensor")
+
+        calls = []
+
+        def cpu_impl(x):
+            calls.append("cpu")
+            return x + 1
+
+        lib.impl("pyobject_dispatch_autograd_fallthrough", cpu_impl, "CPU")
+        lib.impl(
+            "pyobject_dispatch_autograd_fallthrough",
+            torch.library.fallthrough_kernel,
+            "Autograd",
+        )
+
+        op = self.ns().pyobject_dispatch_autograd_fallthrough.default
+        self.assertTrue(op._pyobj_dispatcher.enabled)
+
+        x = torch.ones(2)
+        self.assertEqual(op(x), x + 1)
+        self.assertEqual(calls, ["cpu"])
+
+    def test_pyobject_dispatch_custom_op_enabled_by_default(self):
+        calls = []
+
+        @torch.library.custom_op(
+            f"{self.test_ns}::pyobject_dispatch_custom_op", mutates_args=()
+        )
+        def f(x: Tensor) -> Tensor:
+            calls.append("custom")
+            return x + 1
+
+        op = self.ns().pyobject_dispatch_custom_op.default
+        self.assertTrue(op._pyobj_dispatcher.enabled)
+
+        x = torch.ones(2)
+        self.assertEqual(f(x), x + 1)
+        self.assertEqual(calls, ["custom"])
+
     @requires_compile
     def test_functionalize_error(self):
         with torch.library._scoped_library(self.test_ns, "FRAGMENT") as lib:

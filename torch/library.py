@@ -57,6 +57,22 @@ _defs: set[str] = set()
 _reserved_namespaces = ["prim"]
 
 
+def _lookup_defined_python_op(qualname: str) -> OpOverload | None:
+    try:
+        op = torch._library.utils.lookup_op(qualname)
+    except (AttributeError, RuntimeError):
+        return None
+    if op.__qualname__ in _defs:
+        op._defined_in_python = True
+    return op if op._defined_in_python else None
+
+
+def _enable_pyobject_dispatch_if_needed(qualname: str) -> None:
+    op = _lookup_defined_python_op(qualname)
+    if op is not None and torch._C._dispatch_has_python_kernel(op._handle):
+        op._enable_pyobj_dispatch(True)
+
+
 def fallthrough_kernel():
     """
     A dummy function to pass to ``Library.impl`` in order to register a fallthrough.
@@ -323,6 +339,7 @@ class Library:
 
         self._op_defs.add(qualname)
         _defs.add(qualname)
+        _enable_pyobject_dispatch_if_needed(qualname)
         return result
 
     def _register_fake(self, op_name, fn, _stacklevel=1, *, allow_override=True):
@@ -508,6 +525,11 @@ class Library:
             fn,
             with_keyset,
         )
+
+        qualname = name if "::" in name else f"{self.ns}::{name}"
+        op = _lookup_defined_python_op(qualname)
+        if op is not None and fn is not fallthrough_kernel:
+            op._enable_pyobj_dispatch(True)
 
         _impls.add(key)
         self._op_impls.add(key)
