@@ -621,7 +621,7 @@ class TestCustomOpTesting(CustomOpTestCaseBase):
 class TestCustomOp(CustomOpTestCaseBase):
     test_ns = "_test_custom_op"
 
-    def test_pyobject_dispatch_composite_implicit_autograd(self):
+    def test_library_impl_does_not_enable_pyobject_dispatch_by_default(self):
         lib = self.lib()
         lib.define("pyobject_dispatch_composite(Tensor x) -> Tensor")
 
@@ -639,7 +639,8 @@ class TestCustomOp(CustomOpTestCaseBase):
 
         op = self.ns().pyobject_dispatch_composite.default
         x = torch.ones(2)
-        self.assertTrue(op._pyobj_dispatcher.enabled)
+        state = op._pyobj_dispatcher
+        self.assertTrue(state is None or not state.enabled)
         self.assertEqual(op(x), x + 1)
         self.assertEqual(calls, ["composite"])
 
@@ -656,6 +657,7 @@ class TestCustomOp(CustomOpTestCaseBase):
         lib.impl("pyobject_dispatch_cpu", cpu_impl, "CPU")
 
         op = self.ns().pyobject_dispatch_cpu.default
+        op._enable_pyobj_dispatch(True)
         self.assertTrue(op._pyobj_dispatcher.enabled)
 
         x = torch.ones(2)
@@ -680,6 +682,7 @@ class TestCustomOp(CustomOpTestCaseBase):
         )
 
         op = self.ns().pyobject_dispatch_autograd_fallthrough.default
+        op._enable_pyobj_dispatch(True)
         self.assertTrue(op._pyobj_dispatcher.enabled)
 
         x = torch.ones(2)

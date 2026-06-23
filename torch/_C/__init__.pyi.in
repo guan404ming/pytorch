@@ -1766,7 +1766,6 @@ def _dispatch_make_pyobject_dispatchers(
     handle: _DispatchOperatorHandle,
     redispatch_cpp: Callable,
 ) -> tuple[Callable, Callable]: ...
-def _dispatch_has_python_kernel(handle: _DispatchOperatorHandle) -> _bool: ...
 def _dispatch_find_schema_or_throw(
     name: str,
     overload_name: str,

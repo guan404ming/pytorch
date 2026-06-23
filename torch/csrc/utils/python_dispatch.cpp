@@ -216,17 +216,6 @@ static py::object ophandle_call_boxed(
   return torch::jit::createPyObjectForStack(std::move(stack));
 }
 
-template <typename Predicate>
-static std::vector<c10::DispatchKey> dispatch_keys_matching(Predicate pred) {
-  std::vector<c10::DispatchKey> keys;
-  for (const auto key : c10::DispatchKeySet(c10::DispatchKeySet::FULL)) {
-    if (pred(key)) {
-      keys.push_back(key);
-    }
-  }
-  return keys;
-}
-
 // PyObjectDispatchHandle is the C vectorcall object installed into
 // OpOverload._op. It owns the C++ dispatcher handles needed by the hot path;
 // the Python _PyObjectDispatcher dataclass only groups this handle with its
@@ -249,31 +238,9 @@ struct PyObjectDispatchHandle {
   vectorcallfunc vectorcall;
 };
 
-static const std::vector<c10::DispatchKey>& all_dispatch_keys() {
-  static const auto keys = []() {
-    return dispatch_keys_matching([](c10::DispatchKey) { return true; });
-  }();
-  return keys;
-}
-
 static const PythonKernelHolder* get_python_kernel_holder(
     const c10::KernelFunction& kernel) {
   return kernel.boxedKernelFunctor<PythonKernelHolder>();
-}
-
-static bool has_computed_python_kernel(const c10::OperatorHandle& handle) {
-  for (const auto key : all_dispatch_keys()) {
-    if (!handle.hasComputedKernelForDispatchKey(key)) {
-      continue;
-    }
-    auto safe_kernel = handle.getComputedKernelForDispatchKey(key);
-    const auto* holder =
-        get_python_kernel_holder(safe_kernel.kernelFunction());
-    if (holder != nullptr && !holder->with_op()) {
-      return true;
-    }
-  }
-  return false;
 }
 
 static void pyobject_dispatch_collect_keys(
@@ -740,7 +707,6 @@ void initDispatchBindings(PyObject* module) {
 
   m.def("_dispatch_call_boxed", &ophandle_call_boxed);
   m.def("_dispatch_make_pyobject_dispatchers", &make_pyobject_dispatchers);
-  m.def("_dispatch_has_python_kernel", &has_computed_python_kernel);
 
   // TODO: figure out how to do chaining
   py::class_<torch::Library>(m, "_DispatchModule")
