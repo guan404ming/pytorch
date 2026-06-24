@@ -354,7 +354,9 @@ static bool pyobject_dispatch_has_torch_function(
   if (!torch::torch_function_enabled()) {
     return false;
   }
-  if (torch::consume_should_skip_torch_function()) {
+  // Do not consume this here: PyObject dispatch may still hand off to the C++
+  // Dispatcher, which must see the one-hop skip flag.
+  if (torch::peek_should_skip_torch_function()) {
     return false;
   }
   if (at::impl::torch_function_mode_enabled()) {
@@ -468,6 +470,9 @@ static PyObject* pyobject_dispatch_with_keyset(
   // Otherwise, just directly invoke the Python kernel.
   auto* kernel = holder->func(self->interpreter);
   TORCH_INTERNAL_ASSERT(kernel != nullptr);
+  if (C10_UNLIKELY(torch::peek_should_skip_torch_function())) {
+    torch::consume_should_skip_torch_function();
+  }
   if (C10_UNLIKELY(holder->with_keyset())) {
     return pyobject_dispatch_call_python_with_keyset(
         kernel, key_set, args, nargs, nkwargs, kwnames, op_args_start);

@@ -621,6 +621,7 @@ class TestCustomOpTesting(CustomOpTestCaseBase):
 class TestCustomOp(CustomOpTestCaseBase):
     test_ns = "_test_custom_op"
 
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
     def test_library_impl_does_not_enable_pyobject_dispatch_by_default(self):
         lib = self.lib()
         lib.define("pyobject_dispatch_composite(Tensor x) -> Tensor")
@@ -644,6 +645,7 @@ class TestCustomOp(CustomOpTestCaseBase):
         self.assertTrue(calls)
         self.assertTrue(all(call == "composite" for call in calls))
 
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
     def test_pyobject_dispatch_custom_op_enabled_by_default(self):
         calls = []
 
@@ -661,6 +663,7 @@ class TestCustomOp(CustomOpTestCaseBase):
         self.assertEqual(f(x), x + 1)
         self.assertEqual(calls, ["custom"])
 
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
     def test_pyobject_dispatch_normalizes_tensor_list_input(self):
         @torch.library.custom_op(
             f"{self.test_ns}::pyobject_dispatch_tensor_list", mutates_args=()
@@ -679,6 +682,7 @@ class TestCustomOp(CustomOpTestCaseBase):
         f(xs)
         self.assertEqual(len(xs), 1)
 
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
     def test_pyobject_dispatch_respects_torch_function_mode(self):
         import torch._refs
         from torch._prims.context import TorchRefsMode
@@ -690,6 +694,22 @@ class TestCustomOp(CustomOpTestCaseBase):
         expected = x.abs()
         with TorchRefsMode():
             self.assertEqual(torch._refs.abs(x), expected)
+
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
+    def test_pyobject_dispatch_respects_torch_function_redispatch(self):
+        from torch.testing._internal.common_subclass import RedispatchTensor
+
+        @torch.library.custom_op(
+            f"{self.test_ns}::pyobject_dispatch_torch_function_redispatch",
+            mutates_args=(),
+        )
+        def f(x: Tensor) -> Tensor:
+            return x + 1
+
+        x = RedispatchTensor(torch.ones(2))
+        y = f(x)
+        self.assertIsInstance(y, RedispatchTensor)
+        self.assertEqual(y, torch.full((2,), 2.0))
 
     @requires_compile
     def test_functionalize_error(self):
