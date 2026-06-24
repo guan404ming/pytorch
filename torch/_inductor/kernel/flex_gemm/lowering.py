@@ -20,7 +20,13 @@ from ...lowering import process_subgraph_nodes, register_lowering
 def flex_gemm_tensor_placeholders(
     graph_module: torch.fx.GraphModule,
 ) -> list[torch.fx.Node]:
-    """Return tensor-valued body placeholders, excluding scalar SymInt inputs."""
+    """Return placeholders QuACK can bind as tensor epilogue arguments.
+
+    FlexGEMM identifies the GEMM A/B inputs from the mm node, then treats the
+    remaining tensor-valued placeholders as closed-over epilogue tensors. Scalar
+    SymInt placeholders are shape values, not tensor arguments; the current QuACK
+    FlexGEMM entrypoint has no scalar epilogue-argument slots for them.
+    """
     return [
         node
         for node in graph_module.graph.nodes
