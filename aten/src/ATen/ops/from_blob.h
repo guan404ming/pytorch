@@ -80,7 +80,7 @@ class TORCH_API TensorMaker {
   explicit TensorMaker(void* data, IntArrayRef sizes) noexcept
       : data_{data}, sizes_{sizes} {}
 
-  std::size_t computeStorageSize() const C10_NOEXCEPT_ON_MOBILE;
+  std::size_t computeStorageSize() const;
 
   DataPtr makeDataPtrFromDeleter() noexcept;
 

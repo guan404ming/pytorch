@@ -537,13 +537,16 @@ TEST(BasicTest, TestForBlobStridesResizeCPU) {
   ASSERT_EQ(te[1][1].item<int32_t>(), 5);
 }
 
-#ifndef C10_MOBILE
-TEST(BasicTest, TestForBlobStridesOverflowCPU) {
-  // Strides large enough to overflow the storage size computation must throw.
-  // Overflow checks are compiled out on mobile, hence the guard above.
+TEST(BasicTest, TestForBlobStridesOverflow) {
   std::array<int32_t, 6> storage;
+  // Mismatched sizes/strides dimensionality throws on all builds.
+  ASSERT_THROWS(
+      at::for_blob(storage.data(), {2, 3}).strides({1,}).options(c10::TensorOptions(kInt)).make_tensor());
+#ifndef C10_MOBILE
+  // Strides large enough to overflow the storage size computation also throw;
+  // overflow checks are compiled out on mobile.
   const auto huge = std::numeric_limits<int64_t>::max();
   ASSERT_THROWS(
       at::for_blob(storage.data(), {2,}).strides({huge,}).options(c10::TensorOptions(kInt)).make_tensor());
-}
 #endif
+}
