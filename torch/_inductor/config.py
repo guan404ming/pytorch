@@ -1850,6 +1850,15 @@ class triton:
     # Emit objgraph backref dumps for leaked cudagraph pool tensors
     cudagraph_trees_objgraph = False
 
+    # Which live cudagraph tree storages to clone before starting a new
+    # generation. None keeps the existing stale-output error behavior.
+    # "user_visible" clones live user-visible output storages out of
+    # the graph pool. Backward graph outputs are not selected for cloning.
+    # This mode can add overhead because live outputs that cross generations
+    # are explicitly copied and stop using cached TensorImpl outputs. Users
+    # can leave this unset and manually clone/copy those outputs instead.
+    cudagraph_trees_generation_cloning: Literal["user_visible"] | None = None
+
     # Enable cudagraph support for mutated inputs from prior cudagraph pool
     cudagraph_support_input_mutation = not is_fbcode()
 
@@ -1859,6 +1868,11 @@ class triton:
     # i.e., allow num_recording <= cudagraph_unexpected_rerecord_limit
     # note: we are conservative here and choose a large limit.
     cudagraph_unexpected_rerecord_limit = 128
+
+    # Number of cudagraph-managed input pointer-change re-records allowed for
+    # a parent/function edge before future recordings copy that input instead
+    # of specializing on its graph-pool address.
+    cudagraph_managed_input_rerecord_limit = 3
 
     # Warn loudly when the number of cudagraphs due to dynamic shape
     # exceeds this limit

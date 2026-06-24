@@ -8973,9 +8973,9 @@ class Scheduler:
         name_to_graph_input_index = {
             name: idx for idx, name in enumerate(V.graph.graph_inputs)
         }
-        name_to_graph_output_index = {
-            name: idx for idx, name in enumerate(V.graph.get_output_names())
-        }
+        name_to_graph_output_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, name in enumerate(V.graph.get_output_names()):
+            name_to_graph_output_indices[name].append(idx)
 
         V.graph.partition_maps = []
         for partition_id, signature in enumerate(signatures):
@@ -8992,7 +8992,9 @@ class Scheduler:
 
             output_mapping = []
             for node in signature.output_nodes:
-                output_mapping.append(name_to_graph_output_index.get(node.get_name()))
+                output_mapping.append(
+                    name_to_graph_output_indices.get(node.get_name(), [])
+                )
 
             V.graph.partition_maps.append(
                 GraphPartitionMap(
