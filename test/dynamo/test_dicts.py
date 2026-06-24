@@ -3223,6 +3223,29 @@ class DunderDictVariableTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(keys, ["x", "z", "y"])
         self.assertEqual(value, 42)
 
+    def test_dunder_dict_pop_reinsert_order_with_other_mutations(self):
+        # Mutating other keys after a pop must not disturb their relative order;
+        # only the re-inserted popped key moves to the end. Updating an existing
+        # key keeps its slot, a brand-new key appends, and the reinserted key
+        # lands last.
+        class MyClass:
+            pass
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn():
+            obj = MyClass()
+            obj.a, obj.b, obj.c = 1, 2, 3
+            d = obj.__dict__
+            d.pop("b")  # a, c
+            d["c"] = 30  # update existing -> stays in place: a, c
+            d["e"] = 5  # new key -> appended: a, c, e
+            d["b"] = 20  # reinsert popped -> end: a, c, e, b
+            return list(d), dict(d)
+
+        keys, value = fn()
+        self.assertEqual(keys, ["a", "c", "e", "b"])
+        self.assertEqual(value, {"a": 1, "c": 30, "e": 5, "b": 20})
+
     def test_dunder_dict_pop_missing_raises_keyerror(self):
         class MyClass:
             pass
