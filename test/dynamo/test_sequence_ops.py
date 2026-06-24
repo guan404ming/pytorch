@@ -256,6 +256,35 @@ class TestSqConcat(torch._dynamo.test_case.TestCase):
         # Result respects maxlen of 3
         self.assertEqual(list(d), [2, 3, 4])
 
+    # --- list re-init (list.__init__) ---
+
+    @make_dynamo_test
+    def test_list_reinit_clears_and_extends(self):
+        x = list(range(-5, 0))
+        x.__init__(range(3))
+        self.assertEqual(x, [0, 1, 2])
+
+    @make_dynamo_test
+    def test_list_reinit_empty(self):
+        x = [1, 2, 3]
+        x.__init__()
+        self.assertEqual(x, [])
+
+    @make_dynamo_test
+    def test_list_reinit_self_referential(self):
+        # CPython clears before extending, so a.__init__(a) yields [].
+        x = [1, 2, 3]
+        x.__init__(x)
+        self.assertEqual(x, [])
+
+    @make_dynamo_test
+    def test_list_reinit_non_iterable_clears_then_raises(self):
+        # clear happens before extend, so the TypeError leaves the list empty.
+        x = [1, 2, 3]
+        with self.assertRaises(TypeError):
+            x.__init__(5)
+        self.assertEqual(x, [])
+
     # --- deque re-init (deque.__init__) ---
 
     @make_dynamo_test
@@ -802,8 +831,12 @@ class TestSqAssItem(torch._dynamo.test_case.TestCase):
     @make_dynamo_test
     def test_error_slice_non_iterable_simple(self):
         lst = [1, 2, 3]
+        # CPython 3.12.5+ reports "must assign iterable to extended slice" even
+        # for simple slices; earlier versions say "can only assign an iterable".
+        # See https://github.com/pytorch/pytorch/issues/187774.
         with self.assertRaisesRegex(
-            TypeError, "must assign iterable to extended slice"
+            TypeError,
+            "must assign iterable to extended slice|can only assign an iterable",
         ):
             lst[1:2] = 99  # type: ignore[assignment]
 
