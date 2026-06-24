@@ -188,6 +188,11 @@ class CuptiMonitorBuffer:
                     )
                     continue
                 if size not in (1, 2, 4, 8):
+                    # Oversized field (the 20-byte CUpti_ActivityEnvironment union): keep its
+                    # first 8 bytes (the primary metric pair), split downstream by kind.
+                    if size > 8:
+                        idx = pos_arr[:, None] + np.arange(off, off + 8)
+                        cols[fid] = raw[idx].copy().view("<u8").ravel()
                     continue
                 idx = pos_arr[:, None] + np.arange(off, off + size)
                 cols[fid] = raw[idx].copy().view(f"<u{size}").ravel()
@@ -978,6 +983,17 @@ class CuptiMonitor:
                 # frombuffer view is read-only over the transient bytes), matching
                 # CuptiMonitorBuffer.decode's contract.
                 cols[fid] = np.frombuffer(raw, dtype=f"<u{size}").copy()
+            elif size > 8:
+                # Oversized field (the 20-byte CUpti_ActivityEnvironment union): keep its
+                # first 8 bytes as u8 -- the primary metric pair (power+powerLimit / smClock+
+                # memoryClock / temperature / fanSpeed), split downstream by ENVIRONMENT_KIND.
+                cols[fid] = (
+                    np.frombuffer(raw, dtype=np.uint8)
+                    .reshape(-1, size)[:, :8]
+                    .copy()
+                    .view("<u8")
+                    .ravel()
+                )
         return cols
 
     def _maybe_warn_backpressure(self) -> None:

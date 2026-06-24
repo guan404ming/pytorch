@@ -319,6 +319,8 @@ class _CuptiMonitorModule:
         tracks: list[tuple[int, int, bool, int, int, str]],
         name_table: list[str],
         groups: list[tuple],
+        render: tuple | None = None,
+        counters: tuple | None = None,
     ) -> bytes: ...
 
 _cupti_monitor: _CuptiMonitorModule

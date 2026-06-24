@@ -287,8 +287,14 @@ void initCuptiMonitorBindings(py::module& m) {
       "encode_pftrace",
       [](const py::list& tracks,
          const py::list& name_table,
-         const py::list& groups) -> py::bytes {
+         const py::list& groups,
+         const py::object& render,
+         const py::object& counters) -> py::bytes {
+        using torch::profiler::impl::PftraceGfxContext;
+        using torch::profiler::impl::PftraceGpuCounter;
+        using torch::profiler::impl::PftraceGpuSpec;
         using torch::profiler::impl::PftraceGroup;
+        using torch::profiler::impl::PftraceRenderStages;
         using torch::profiler::impl::PftraceTrack;
 
         constexpr auto kFlags = py::array::c_style | py::array::forcecast;
@@ -311,6 +317,13 @@ void initCuptiMonitorBindings(py::module& m) {
         auto i32 = [&](const py::handle& h) -> const int32_t* {
           A32 a = py::cast<A32>(h);
           const int32_t* p = a.data();
+          keepalive.push_back(std::move(a));
+          return p;
+        };
+        using AF64 = py::array_t<double, kFlags>;
+        auto f64 = [&](const py::handle& h) -> const double* {
+          AF64 a = py::cast<AF64>(h);
+          const double* p = a.data();
           keepalive.push_back(std::move(a));
           return p;
         };
@@ -384,20 +397,128 @@ void initCuptiMonitorBindings(py::module& m) {
             pg.json_annos.push_back({offsets, PyBytes_AS_STRING(blob.ptr())});
           }
           pg.flow = g[8].is_none() ? nullptr : i64(g[8]);
+          pg.gpu_corr = py::len(g) > 9 && !g[9].is_none() ? i64(g[9]) : nullptr;
           group_vec.push_back(std::move(pg));
+        }
+
+        // render: None, or (gpu_specs, gfx_contexts, stage_cols, extra, launch,
+        // tables):
+        //   gpu_specs    = [(iid, name, category), ...]
+        //   gfx_contexts = [(iid, pid), ...]
+        //   stage_cols   = (ts, dur, event_id, gpu_id, hw_queue_iid, stage_iid,
+        //                   context) | None
+        //   extra        = [(key, int64_col, skip_zero), ...]  (-> extra_data)
+        //   launch       = (gx, gy, gz, bx, by, bz, kernel_iid_col, args) |
+        //   None
+        //                   (args = [(name_iid, int64_col, skip_zero), ...])
+        //   tables       = (compute_kernels, compute_arg_names); each
+        //                   [(iid, name), ...]
+        std::vector<PftraceGpuSpec> spec_vec;
+        std::vector<PftraceGfxContext> ctx_vec;
+        PftraceRenderStages stages{};
+        auto extras_from = [&](const py::handle& h) {
+          std::vector<PftraceRenderExtra> v;
+          for (const auto& e : h.cast<py::list>()) {
+            auto t = e.cast<py::tuple>();
+            v.push_back(
+                {t[0].cast<std::string>(), i64(t[1]), t[2].cast<bool>()});
+          }
+          return v;
+        };
+        auto names_from = [&](const py::handle& h) {
+          std::vector<torch::profiler::impl::PftraceComputeName> v;
+          for (const auto& e : h.cast<py::list>()) {
+            auto t = e.cast<py::tuple>();
+            v.push_back({t[0].cast<uint64_t>(), t[1].cast<std::string>()});
+          }
+          return v;
+        };
+        if (!render.is_none()) {
+          auto r = render.cast<py::tuple>();
+          for (const auto& s : r[0].cast<py::list>()) {
+            auto t = s.cast<py::tuple>();
+            spec_vec.push_back(
+                {t[0].cast<uint64_t>(),
+                 t[1].cast<std::string>(),
+                 t[2].cast<int32_t>()});
+          }
+          for (const auto& s : r[1].cast<py::list>()) {
+            auto t = s.cast<py::tuple>();
+            ctx_vec.push_back({t[0].cast<uint64_t>(), t[1].cast<int32_t>()});
+          }
+          if (!r[2].is_none()) {
+            auto sc = r[2].cast<py::tuple>();
+            stages.ts = i64(sc[0]);
+            stages.dur = i64(sc[1]);
+            stages.event_id = u64(sc[2]);
+            stages.gpu_id = i64(sc[3]);
+            stages.hw_queue_iid = u64(sc[4]);
+            stages.stage_iid = u64(sc[5]);
+            stages.context = u64(sc[6]);
+            stages.name_iid =
+                py::len(sc) > 7 && !sc[7].is_none() ? u64(sc[7]) : nullptr;
+            stages.n = static_cast<size_t>(py::len(sc[0]));
+            stages.extra = extras_from(r[3]);
+            if (!r[4].is_none()) {
+              auto lc = r[4].cast<py::tuple>();
+              stages.grid_x = i64(lc[0]);
+              stages.grid_y = i64(lc[1]);
+              stages.grid_z = i64(lc[2]);
+              stages.block_x = i64(lc[3]);
+              stages.block_y = i64(lc[4]);
+              stages.block_z = i64(lc[5]);
+              stages.kernel_iid = u64(lc[6]);
+              for (const auto& e : lc[7].cast<py::list>()) {
+                auto t = e.cast<py::tuple>();
+                stages.launch_args.push_back(
+                    {t[0].cast<uint64_t>(), i64(t[1]), t[2].cast<bool>()});
+              }
+            }
+            if (py::len(r) > 5 && !r[5].is_none()) {
+              auto tb = r[5].cast<py::tuple>();
+              stages.compute_kernels = names_from(tb[0]);
+              stages.compute_arg_names = names_from(tb[1]);
+            }
+          }
+        }
+
+        // counters: None, or (specs, gpu_id_col, ts_col, counter_id_col,
+        // value_col) where specs = [(counter_id, name), ...] ->
+        // GpuCounterEvents.
+        PftraceGpuCounter gpu_counters{};
+        if (!counters.is_none()) {
+          auto c = counters.cast<py::tuple>();
+          for (const auto& s : c[0].cast<py::list>()) {
+            auto t = s.cast<py::tuple>();
+            gpu_counters.specs.emplace_back(
+                t[0].cast<uint32_t>(), t[1].cast<std::string>());
+          }
+          gpu_counters.gpu_id = i32(c[1]);
+          gpu_counters.ts = i64(c[2]);
+          gpu_counters.counter_id = i32(c[3]);
+          gpu_counters.value = f64(c[4]);
+          gpu_counters.n = static_cast<size_t>(py::len(c[2]));
         }
 
         std::string out;
         {
           py::gil_scoped_release release;
           out = torch::profiler::impl::cuptiMonitorEncodePftrace(
-              track_vec, name_vec, group_vec);
+              track_vec,
+              name_vec,
+              group_vec,
+              spec_vec,
+              ctx_vec,
+              stages,
+              gpu_counters);
         }
         return py::bytes(out);
       },
       py::arg("tracks"),
       py::arg("name_table"),
-      py::arg("groups"));
+      py::arg("groups"),
+      py::arg("render") = py::none(),
+      py::arg("counters") = py::none());
 }
 
 } // namespace torch::profiler::impl

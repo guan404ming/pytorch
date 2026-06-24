@@ -7,9 +7,11 @@
 // and calls cuptiMonitorEncodePftrace, which emits a concatenated stream of
 // perfetto TracePackets via protozero (the perfetto SDK amalgamation under
 // third_party/perfetto). Each slice becomes a SLICE_BEGIN (carrying its
-// debug_annotations + flow) and a SLICE_END. Returns the raw, uncompressed
-// trace bytes; the caller gzips. perfetto.h is pulled in only by the .cpp, and
-// this stays free of any Python/pybind dependency so it can live in torch_cpu.
+// debug_annotations + flow) and a SLICE_END. Returns the gzip-compressed trace
+// bytes (ready to write as .pftrace.gz); gzipping here keeps the uncompressed
+// buffer (tens of MB) off the pybind boundary. perfetto.h is pulled in only by
+// the .cpp, and this stays free of any Python/pybind dependency so it lives in
+// torch_cpu.
 
 #include <c10/macros/Macros.h>
 
@@ -70,6 +72,88 @@ struct PftraceJsonAnno {
   const char* buffer;
 };
 
+// An interned gpu_specifications entry: a render stage (Kernel/Memcpy/Memset)
+// or a hardware-queue lane (Channel #N). Stages and queues share one iid space,
+// as in Perfetto's GpuRenderStageEvent format. category is the
+// InternedGpuRenderStageSpecification::RenderStageCategory enum (0=OTHER,
+// 1=GRAPHICS, 2=COMPUTE).
+struct PftraceGpuSpec {
+  uint64_t iid;
+  std::string name;
+  int32_t category;
+};
+
+// An interned graphics_contexts entry: a GPU context handle -> owning pid.
+struct PftraceGfxContext {
+  uint64_t iid;
+  int32_t pid;
+};
+
+// One GpuRenderStageEvent extra_data column: emits name=key,
+// value=to_string(vals[i]); skipped where skip_zero && vals[i]==0 (so
+// kernel-only fields are absent on memcpy/memset).
+struct PftraceRenderExtra {
+  std::string key;
+  const int64_t* vals;
+  bool skip_zero;
+};
+
+// One ComputeKernelLaunch.args column. The arg name is interned
+// (InternedComputeArgName, field 1001 on InternedData) and referenced by
+// name_iid -- this is what the viewer's "Launch Statistics" panel reads (see
+// the trace_processor ParseExtraComputeArg name_iid -> InternedComputeArgName
+// join).
+struct PftraceComputeArg {
+  uint64_t name_iid;
+  const int64_t* vals;
+  bool skip_zero;
+};
+
+// An interned entry (iid + name) for the compute-kernel / arg-name tables, raw-
+// emitted onto InternedData at field 1000 (InternedComputeKernel) and 1001
+// (InternedComputeArgName) respectively -- the v56.1 amalgamation defines the
+// message types but not the InternedData accessors, so they go in by field id.
+struct PftraceComputeName {
+  uint64_t iid;
+  std::string name;
+};
+
+// GpuRenderStageEvent columns: one event per element, each with its own
+// duration (no SLICE_BEGIN/END pairing), so overlaps are fine and durations are
+// exact. gpu_id + hw_queue_iid select the lane; stage_iid tags the op kind;
+// context indexes graphics_contexts. n == 0 means no render stages.
+//
+// Compute kernels (grid_x != null && grid_x[i] > 0) get a structured
+// ComputeKernelLaunch (grid_size/workgroup_size Dim3 + launch_args) plus a
+// kernel_iid -> InternedComputeKernel (kernel name) -- this is what drives the
+// viewer's GPU Compute "Launch Statistics" panel and names the lane slice.
+// extra carries generic extra_data for the non-kernel kinds (memcpy/memset
+// bytes). compute_kernels / compute_arg_names are the interned tables
+// referenced by kernel_iid and launch_args[].name_iid.
+struct PftraceRenderStages {
+  const int64_t* ts;
+  const int64_t* dur;
+  const uint64_t* event_id;
+  const int64_t* gpu_id;
+  const uint64_t* hw_queue_iid;
+  const uint64_t* stage_iid;
+  const uint64_t* context;
+  size_t n;
+  const int64_t* grid_x; // nullable; > 0 marks a compute-kernel launch
+  const int64_t* grid_y;
+  const int64_t* grid_z;
+  const int64_t* block_x;
+  const int64_t* block_y;
+  const int64_t* block_z;
+  const uint64_t* kernel_iid; // nullable; -> InternedComputeKernel (0 = none)
+  const uint64_t* name_iid; // nullable; -> EventName, the timeline slice label
+  std::vector<PftraceComputeArg> launch_args; // -> ComputeKernelLaunch.args
+  std::vector<PftraceRenderExtra> extra; // -> GpuRenderStageEvent.extra_data
+  std::vector<PftraceComputeName> compute_kernels; // -> InternedData field 1000
+  std::vector<PftraceComputeName>
+      compute_arg_names; // -> InternedData field 1001
+};
+
 // One per-kind group of slices sharing an annotation schema. ts / end /
 // track_uuid / name_iid are length-n parallel columns; flow (nullable) is a
 // per- slice ac2g flow id (0 = no flow). name_iid indexes the global name
@@ -85,14 +169,42 @@ struct PftraceGroup {
   std::vector<PftraceArrAnno> arr_annos;
   std::vector<PftraceJsonAnno> json_annos;
   const int64_t* flow; // nullable
+  // nullable: per-slice GpuTrackEvent.gpu_correlation (field 3000) ->
+  // GpuCorrelation.render_stage_submission_event_ids, linking a host launch to
+  // its GPU render-stage (event_id == this value). 0 = no link.
+  const int64_t* gpu_corr;
+};
+
+// GPU counters from the sampled CUpti_ActivityEnvironment records (power /
+// temperature / clocks). Emitted as Perfetto GpuCounterEvents so the viewer
+// renders them under "GPU / Counters / <gpu>" -- a sibling of the render-stage
+// "GPU / Hardware Queues" -- rather than as process-tree counter tracks. specs
+// is the GpuCounterDescriptor (counter_id -> display name), emitted once; then
+// one GpuCounterEvent sample per row: at ts[i], gpu_id[i]'s counter_id[i] takes
+// value[i]. n == 0 means no GPU counters.
+struct PftraceGpuCounter {
+  std::vector<std::pair<uint32_t, std::string>> specs;
+  const int32_t* gpu_id;
+  const int64_t* ts;
+  const int32_t* counter_id;
+  const double* value;
+  size_t n;
 };
 
 // tracks -> TrackDescriptor packets; name_table -> one interned EventName table
 // (iid == index + 1). Emits each group's SLICE_BEGINs (with debug_annotations +
-// flow) then SLICE_ENDs. trace_processor reorders by timestamp.
+// flow) then SLICE_ENDs. trace_processor reorders by timestamp. gpu_specs +
+// gfx_contexts are interned alongside the name table, and stages -> one
+// GpuRenderStageEvent packet each (the native "GPU Render Stages"
+// hardware-queue lanes; additive to the track_event slices, which keep the
+// flows + args). counters -> counter tracks + their samples.
 TORCH_API std::string cuptiMonitorEncodePftrace(
     const std::vector<PftraceTrack>& tracks,
     const std::vector<std::string>& name_table,
-    const std::vector<PftraceGroup>& groups);
+    const std::vector<PftraceGroup>& groups,
+    const std::vector<PftraceGpuSpec>& gpu_specs,
+    const std::vector<PftraceGfxContext>& gfx_contexts,
+    const PftraceRenderStages& stages,
+    const PftraceGpuCounter& counters);
 
 } // namespace torch::profiler::impl

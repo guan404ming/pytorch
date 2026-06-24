@@ -1359,6 +1359,10 @@ target_sources(torch_cpu PRIVATE
 set_source_files_properties(
   ${TORCH_ROOT}/third_party/perfetto/sdk/perfetto.cc
   PROPERTIES COMPILE_FLAGS "-w")
+# zlib for monitor_pftrace.cpp: it gzips the assembled trace in C++ so the
+# uncompressed buffer never crosses the pybind boundary back to Python.
+find_package(ZLIB REQUIRED)
+target_link_libraries(torch_cpu PRIVATE ZLIB::ZLIB)
 
 install(DIRECTORY
   "${TORCH_SRC_DIR}/csrc"

@@ -211,6 +211,31 @@ def _driver_requires_flow(name: str) -> bool:
     return name in _DRIVER_FLOW_NAMES
 
 
+# Eager kernel/transfer launches (NOT cudaGraphLaunch). These 1:1 correlate to an eager GPU
+# op, so they drive the host-launch -> render-stage gpu_correlation link (event_id == corr).
+# Syncs are excluded -- they correlate to no kernel, so a link on them would point nowhere
+# pointing nowhere.
+_RUNTIME_LAUNCH_NAMES = {
+    "cudaLaunchKernel",
+    "cudaLaunchCooperativeKernel",
+    "cudaLaunchCooperativeKernelMultiDevice",
+    "cudaLaunchKernelExC",
+}
+
+
+def _runtime_is_eager_launch(name: str) -> bool:
+    return name in _RUNTIME_LAUNCH_NAMES or name.startswith(
+        ("cudaMemcpy", "cudaMemset")
+    )
+
+
+def _runtime_is_launch(name: str) -> bool:
+    # The set for the gpu_correlation channel link: eager launches plus cudaGraphLaunch
+    # (links to the replayed kernels; gpu_correlation is a per-selection details link, so the
+    # fan-out does not spiderweb).
+    return _runtime_is_eager_launch(name) or name == "cudaGraphLaunch"
+
+
 _RUNTIME_DROPPED_CBIDS: frozenset[int] | None = None
 _DRIVER_KEPT_CBIDS: frozenset[int] | None = None
 
@@ -779,6 +804,320 @@ def _gpu_user_annotation_events(
 # flat arrays + track list it consumes.
 
 
+def _nest_track_slices(groups: list, track_uuids: set) -> None:
+    """Make each track's slices nest, so Perfetto can pair them.
+
+    Perfetto's TrackEvent model pairs SLICE_BEGIN/SLICE_END per track with a stack, so a
+    track cannot represent partially-overlapping (non-nested) slices. CUPTI reports serial
+    GPU-stream slices whose start/end can jitter into ~ns overlaps; left as-is the viewer's
+    stack pairing mis-pairs them into 0-duration / inflated slices. For each track in
+    ``track_uuids`` (GPU stream tracks, whose slices are serial), walk its slices in start
+    order and truncate any still-open slice that a later overlapping slice extends past --
+    serial slices become adjacent, genuine nesting is preserved. Only ``end`` is mutated
+    (in place), so per-slice annotation/flow alignment is untouched."""
+    if not track_uuids:
+        return
+    want = np.fromiter(
+        (np.uint64(u) for u in track_uuids), dtype=np.uint64, count=len(track_uuids)
+    )
+    ts_p, end_p, uu_p, gi_p, li_p = [], [], [], [], []
+    for gi, g in enumerate(groups):
+        idx = np.nonzero(np.isin(g["uuid"], want))[0]
+        if not len(idx):
+            continue
+        ts_p.append(g["ts"][idx])
+        end_p.append(g["end"][idx])
+        uu_p.append(g["uuid"][idx])
+        gi_p.append(np.full(len(idx), gi, dtype=np.int64))
+        li_p.append(idx.astype(np.int64))
+    if not ts_p:
+        return
+    ts, end, uu = np.concatenate(ts_p), np.concatenate(end_p), np.concatenate(uu_p)
+    gi, li = np.concatenate(gi_p), np.concatenate(li_p)
+    # Per track, parents before nested children: sort by (track, start asc, end desc).
+    order = np.lexsort((-end, ts, uu))
+    tsl, endl, uul = ts[order].tolist(), end[order].tolist(), uu[order].tolist()
+    stack: list = []
+    prev = None
+    for k in range(len(tsl)):
+        if uul[k] != prev:
+            stack.clear()
+            prev = uul[k]
+        s_ts, s_end = tsl[k], endl[k]
+        while stack:
+            p = stack[-1]
+            if endl[p] <= s_ts:
+                stack.pop()
+            elif endl[p] < s_end:
+                # partial overlap: truncate the open parent to this slice's start so the
+                # two serialize instead of mis-pairing.
+                endl[p] = s_ts
+                stack.pop()
+            else:
+                break  # endl[p] >= s_end: this slice nests within the parent
+        stack.append(k)
+    new_end = np.empty(len(endl), dtype=np.int64)
+    new_end[order] = np.asarray(endl, dtype=np.int64)  # undo the sort permutation
+    for gv in np.unique(gi):
+        m = gi == gv
+        groups[int(gv)]["end"][li[m]] = new_end[m]
+
+
+# GPU render-stage definitions: (column key, stage iid, stage name, RenderStageCategory).
+# COMPUTE == 2 (matches the reference); the rest are OTHER (0). Stage iids are small and
+# share the gpu_specifications iid space with the hardware-queue lanes below.
+_RENDER_STAGES = (
+    ("kernel", 1, "Kernel", 2),
+    ("gpu_memcpy", 2, "Memcpy", 0),
+    ("gpu_memset", 3, "Memset", 0),
+    # GPU-side user annotations (collective/phase ranges) on the stream lane; not a kernel
+    # (no launch), so they render as a range nesting over the kernels they span.
+    ("gpu_annotation", 4, "Annotation", 0),
+)
+_HW_QUEUE_IID_BASE = 100  # hardware-queue iids start past the stage iids
+
+# Chrome-trace categories NOT rendered as CPU track_event slices: "Trace" metadata, and the
+# GPU-side kinds we emit from the columnar window instead (kernels/transfers as GPU Render
+# Stages, runtime/driver remapped onto their CPU thread). gpu_user_annotation in particular
+# is a GPU-stream-side mirror of a CPU user_annotation -- rendering it here would put duplicate
+# stream-named tracks (forward_backward, all_reduce, ...) under the CPU process.
+_NON_CPU_CATS = frozenset(
+    {
+        "Trace",
+        "kernel",
+        "gpu_memcpy",
+        "gpu_memset",
+        "gpu_user_annotation",
+        "cuda_runtime",
+        "cuda_driver",
+        "cuda_sync",
+        "overhead",
+    }
+)
+
+# ComputeKernelLaunch.args, interned as InternedComputeArgName (field 1001 on InternedData).
+# Stable iids + the names the viewer's GPU Compute panel joins on (ExtraComputeArg.name_iid ->
+# InternedComputeArgName.name). value getter maps a kind's column dict to the per-event column
+# (None -> 0 / skipped, e.g. on memcpy/memset).
+_COMPUTE_ARGS = (
+    (1, "registers_per_thread", lambda c: c.get("registers_per_thread")),
+    (2, "shared_mem_dynamic", lambda c: c.get("dynamic_shared_memory")),
+    (
+        3,
+        "thread_count",
+        lambda c: (
+            c["block_x"] * c["block_y"] * c["block_z"] if "block_x" in c else None
+        ),
+    ),
+)
+# Per-event GpuRenderStageEvent.extra_data: the scalar args that used to live on the
+# track_event GPU slices, now that the render stage is the single GPU representation.
+# (key, getter, skip_zero); skip_zero drops 0 for fields where 0 means absent (so kernel-
+# only / memcpy-only fields don't show up on the other kinds). grid/block/registers/shared/
+# thread_count ride the structured ComputeKernelLaunch instead; collective metadata is
+# carried separately as JSON extra_data.
+# NB: device/stream/context are kept under " id"-suffixed keys, not the bare names. The
+# GPU-by-process viewer plugin reads extract_arg(arg_set, 'device'/'stream') and requires
+# them to be NUM, but GpuRenderStageEvent.extra_data.value is always a string -- the bare
+# names would collide with that numeric expectation and crash the plugin. (device == the
+# render stage's gpu_id and stream == the lane, so this is detail-panel only.)
+_RENDER_EXTRA = (
+    ("device id", lambda c: c.get("device_id"), False),
+    ("context id", lambda c: c.get("context_id"), False),
+    ("stream id", lambda c: c.get("stream_id"), False),
+    ("correlation", lambda c: c.get("correlation_id"), True),
+    ("priority", lambda c: c.get("priority"), True),
+    ("queued", lambda c: c.get("queued"), True),
+    ("channel", lambda c: c.get("channel"), True),
+    ("channel_type", lambda c: c.get("channel_type"), True),
+    ("graph id", lambda c: c.get("graph_id"), True),
+    ("graph node id", lambda c: c.get("graph_node_id"), True),
+    ("bytes", lambda c: c.get("bytes"), True),
+    ("value", lambda c: c.get("value"), True),
+    ("memory kind", lambda c: c.get("memory_kind"), True),
+)
+# Grid + workgroup dimension columns (kernels only; 0 elsewhere -> no launch emitted).
+_LAUNCH_DIMS = ("grid_x", "grid_y", "grid_z", "block_x", "block_y", "block_z")
+
+
+def _build_render_stages(columns: dict, gfx_pid: int, iid_of: dict, name_table: list):
+    """Build the GpuRenderStageEvent payload (gpu_specs, gfx_contexts, stage_cols, extra,
+    launch, tables) for the native GPU Render Stages hardware-queue lanes, or None if there are
+    no GPU ops. Each GPU op becomes one event on a (gpu_id, hardware-queue) lane tagged by stage
+    (kind). Compute kernels additionally carry kernel_iid -> InternedComputeKernel (which names
+    the slice) and a structured ComputeKernelLaunch (grid/workgroup Dim3 + args named via
+    name_iid -> InternedComputeArgName) -> the viewer's GPU Compute "Launch Statistics" panel;
+    memcpy/memset carry their byte count as generic extra_data. The hardware queue is the CUDA
+    stream (one lane per stream), so all streams are preserved; the scalar kernel args
+    (device/stream/correlation/channel/...) ride along as extra_data. Each event has its own
+    duration -- no stack pairing -- so durations are exact (no nesting)."""
+    ts_p, dur_p, gpu_p, stage_p, kname_p, corr_p = [], [], [], [], [], []
+    dim_p: dict[str, list] = {k: [] for k in _LAUNCH_DIMS}
+    arg_p: dict[int, list] = {iid: [] for iid, _n, _g in _COMPUTE_ARGS}
+    extra_p: dict[str, list] = {k: [] for k, _g, _s in _RENDER_EXTRA}
+    stream_p: list = []
+    for ks, stage_iid, _name, _cat in _RENDER_STAGES:
+        c = columns.get(ks)
+        if not c or not len(c.get("start_ns", ())):
+            continue
+        n = len(c["start_ns"])
+        z = np.zeros(n, dtype=np.int64)
+        ts_p.append(np.ascontiguousarray(c["start_ns"], dtype=np.int64))
+        dur_p.append(np.maximum(c["end_ns"] - c["start_ns"], 0).astype(np.int64))
+        corr_p.append(np.ascontiguousarray(c.get("correlation_id", z), dtype=np.int64))
+        gpu_p.append(np.ascontiguousarray(c["device_id"], dtype=np.int64))
+        # One lane per stream (the hardware queue); preserves all streams (channel is
+        # 0/unpopulated in many captures, which would otherwise collapse every stream
+        # into a single lane). The CUPTI channel is kept as extra_data instead.
+        stream_p.append(np.ascontiguousarray(c["stream_id"], dtype=np.int64))
+        stage_p.append(np.full(n, stage_iid, dtype=np.uint64))
+        # Per-event kernel name (only kernels have one) -> InternedComputeKernel + kernel_iid.
+        nm = c.get("name")
+        kname_p.append(nm if nm is not None else np.full(n, "", dtype=object))
+        for k in _LAUNCH_DIMS:
+            dim_p[k].append(np.ascontiguousarray(c.get(k, z), dtype=np.int64))
+        for iid, _n, getter in _COMPUTE_ARGS:
+            v = getter(c)
+            arg_p[iid].append(z if v is None else np.ascontiguousarray(v, np.int64))
+        for key, getter, _skip in _RENDER_EXTRA:
+            v = getter(c)
+            extra_p[key].append(z if v is None else np.ascontiguousarray(v, np.int64))
+    if not ts_p:
+        return None
+    ts, dur, gpu = np.concatenate(ts_p), np.concatenate(dur_p), np.concatenate(gpu_p)
+    stream, stage = np.concatenate(stream_p), np.concatenate(stage_p)
+    # Serialize overlapping kernel/memcpy/memset render stages per lane. A CUDA stream is
+    # serial, but CUPTI graph-replay timestamps overlap ~13%, which renders as messy multi-depth
+    # kernels instead of a clean depth-1 row beneath the spanning Annotation (which is the depth-0
+    # parent and must keep its full extent -- so it is excluded). Clamp each op's end to the next
+    # op's start on the same (gpu, stream) lane.
+    ann_iid = next(i for ks, i, _n, _c in _RENDER_STAGES if ks == "gpu_annotation")
+    end = ts + dur
+    sub = np.nonzero(stage != ann_iid)[0]
+    if len(sub):
+        lane = (gpu.astype(np.int64) << np.int64(32)) | (stream & 0xFFFFFFFF)
+        order = sub[np.lexsort((ts[sub], lane[sub]))]
+        nxt_ts = np.empty(len(order), dtype=np.int64)
+        nxt_ts[:-1] = ts[order][1:]
+        nxt_ts[-1] = np.iinfo(np.int64).max
+        same = np.zeros(len(order), dtype=bool)
+        same[:-1] = lane[order][1:] == lane[order][:-1]
+        cap = np.where(same, nxt_ts, np.iinfo(np.int64).max)
+        end[order] = np.maximum(ts[order], np.minimum(end[order], cap))
+        dur = end - ts
+    # One hardware-queue lane per stream; lanes are split per gpu_id by Perfetto from
+    # (gpu_id, hw_queue_iid).
+    # One hardware-queue lane per stream; the spanning annotation and its kernels share the lane
+    # and the viewer depth-nests them (annotation at depth 0, kernels at depth 1) once the kernels
+    # are clamped to not overlap each other. Zero-pad the stream number so the viewer's
+    # lexicographic lane sort is numeric (otherwise "stream 7" sorts after "stream 26674").
+    uniq, inv = np.unique(stream, return_inverse=True)
+    width = len(str(int(uniq.max()))) if len(uniq) else 1
+    specs = [(iid, name, cat) for _ks, iid, name, cat in _RENDER_STAGES]
+    specs += [
+        (_HW_QUEUE_IID_BASE + j, f"stream {int(k):0{width}d}", 0)
+        for j, k in enumerate(uniq.tolist())
+    ]
+    hw_queue_iid = (inv + _HW_QUEUE_IID_BASE).astype(np.uint64)
+    # event_id == the kernel's correlation id so the CPU launch's gpu_correlation
+    # (render_stage_submission_event_ids) links to this render stage (the cross-lane arrow).
+    event_id = np.concatenate(corr_p).astype(np.uint64)
+    # Graphics context 1 -> gfx_pid (the owning process), matching the reference traces
+    # (context_id 1 / upid 1). This also makes the GpuByProcess plugin label its per-process
+    # container "<proc> / GPU" rather than "Process 0"; disable that plugin in Perfetto if the
+    # native "GPU / Hardware Queues" view alone is wanted.
+    context = np.ones(len(ts), dtype=np.uint64)
+    # Per kernel: kernel_iid -> InternedComputeKernel (launch panel) and name_iid ->
+    # EventName (the timeline slice label). Both 0 for memcpy/memset (they fall back to
+    # the stage name). name_iid reuses the global interning so kernel names are shared
+    # with the track_event slices.
+    kernel_iid = np.zeros(len(ts), dtype=np.uint64)
+    name_iid = np.zeros(len(ts), dtype=np.uint64)
+    name_to_iid: dict[str, int] = {}
+    compute_kernels: list = []
+    for i, name in enumerate(np.concatenate(kname_p).tolist()):
+        if not name:
+            continue
+        kid = name_to_iid.get(name)
+        if kid is None:
+            kid = name_to_iid[name] = len(name_to_iid) + 1
+            compute_kernels.append((kid, name))
+        kernel_iid[i] = kid
+        j = iid_of.get(name)
+        if j is None:
+            j = iid_of[name] = len(name_table)
+            name_table.append(name)
+        name_iid[i] = j + 1
+    stage_cols = (ts, dur, event_id, gpu, hw_queue_iid, stage, context, name_iid)
+    extra = [(k, np.concatenate(extra_p[k]), s) for k, _g, s in _RENDER_EXTRA]
+    dims = tuple(np.concatenate(dim_p[k]) for k in _LAUNCH_DIMS)
+    launch_args = [
+        (iid, np.concatenate(arg_p[iid]), True) for iid, _n, _g in _COMPUTE_ARGS
+    ]
+    launch = (*dims, kernel_iid, launch_args)
+    arg_names = [(iid, name) for iid, name, _g in _COMPUTE_ARGS]
+    return (
+        specs,
+        [
+            (1, gfx_pid)
+        ],  # graphics context 1 -> gfx_pid (the lanes' owning process, upid 1)
+        stage_cols,
+        extra,
+        launch,
+        (compute_kernels, arg_names),
+    )
+
+
+# GPU counter specs over the environment union's first 8 bytes (data, u64): (counter_id, name,
+# environment_kind, value-from-data). POWER/SPEED pack two u32s (low | high<<32); TEMPERATURE/
+# COOLING are a single u32. powerLimit (the constant high half of POWER) is omitted. counter_id
+# is the GpuCounterDescriptor id; the viewer groups these per gpu_id under "GPU / Counters".
+_ENV_COUNTERS = (
+    (1, "Power (W)", 3, lambda d: (d & 0xFFFFFFFF).astype(np.float64) / 1000.0),
+    (2, "Temperature (C)", 2, lambda d: d.astype(np.float64)),
+    (3, "SM Clock (MHz)", 1, lambda d: (d & 0xFFFFFFFF).astype(np.float64)),
+    (4, "Memory Clock (MHz)", 1, lambda d: (d >> np.uint64(32)).astype(np.float64)),
+    (5, "Fan Speed (%)", 4, lambda d: d.astype(np.float64)),
+)
+
+
+def _build_gpu_counters(env: dict | None, active_devices: set):
+    """Build the GpuCounterEvent payload from the sampled environment column:
+    (specs, gpu_id[], ts[], counter_id[], value[]) or None. specs = [(counter_id, name), ...];
+    the viewer renders these under "GPU / Counters / <gpu>" (sibling of Hardware Queues), keyed
+    by gpu_id. Restricted to devices that ran GPU work so idle GPUs show no counters."""
+    if not env or not len(env.get("start_ns", ())):
+        return None
+    ek = np.asarray(env["environment_kind"])
+    data = np.asarray(env["data"], dtype=np.uint64)
+    ts = np.ascontiguousarray(env["start_ns"], dtype=np.int64)
+    dev = np.asarray(env["device_id"], dtype=np.int64)
+    base = (
+        np.isin(dev, list(active_devices))
+        if active_devices
+        else np.ones(len(dev), dtype=bool)
+    )
+    specs, gpu_l, ts_l, cid_l, val_l = [], [], [], [], []
+    for cid, name, kind_val, value_of in _ENV_COUNTERS:
+        m = base & (ek == kind_val)
+        if not m.any():
+            continue
+        specs.append((cid, name))
+        gpu_l.append(dev[m])
+        ts_l.append(ts[m])
+        cid_l.append(np.full(int(m.sum()), cid, dtype=np.int32))
+        val_l.append(value_of(data[m]))
+    if not specs:
+        return None
+    return (
+        specs,
+        np.concatenate(gpu_l).astype(np.int32),
+        np.concatenate(ts_l).astype(np.int64),
+        np.concatenate(cid_l).astype(np.int32),
+        np.concatenate(val_l).astype(np.float64),
+    )
+
+
 def _window_to_pftrace(
     cpu_data: dict, trace_window: dict, base_ns: int, output_path: str
 ) -> None:
@@ -798,6 +1137,7 @@ def _window_to_pftrace(
     thr_name: dict = {}
     tracks: list = []
     groups: list = []  # raw group dicts; name_iid filled in after global name interning
+    gpu_track_uuids: set = set()  # stream tracks to nest post-assembly (serial slices)
 
     def _col(ks):
         c = columns.get(ks)
@@ -836,9 +1176,10 @@ def _window_to_pftrace(
             )
         return uuids[key]
 
-    def gpu_uuids(pid_arr, tid_arr, proc_fmt, thr_fmt):
+    def gpu_uuids(pid_arr, tid_arr, proc_fmt, thr_fmt, is_gpu=True):
         # (pid, tid) -> uuid for whole columns: unique pairs (packed into one int64 key) each
-        # register a track; map back via the inverse index (no per-event Python).
+        # register a track; map back via the inverse index (no per-event Python). is_gpu marks
+        # GPU stream tracks (serial slices) for the post-assembly overlap nesting.
         key = (pid_arr.astype(np.int64) << np.int64(32)) | (
             tid_arr.astype(np.int64) & 0xFFFFFFFF
         )
@@ -850,6 +1191,8 @@ def _window_to_pftrace(
             if tid >= 0x80000000:  # sign-extend the packed int32 tid
                 tid -= 0x100000000
             ids[j] = track_for(pid, tid, proc_fmt.format(pid), thr_fmt.format(tid))
+            if is_gpu:
+                gpu_track_uuids.add(int(ids[j]))
         return ids[inv]
 
     def int_anno(key, col, skip_zero=False, present=None):
@@ -860,40 +1203,6 @@ def _window_to_pftrace(
             skip_zero,
             None if present is None else np.ascontiguousarray(present, dtype=np.uint8),
         )
-
-    def enum_anno(key, col, mapping):
-        # Match the chrome path's mapping.get(x, x): a name (string) where the value is in
-        # the map, the raw int otherwise. Returns (str_spec, int_spec|None): the string
-        # table covers the mapped values (idx -1 => slice skipped), and the int_spec (present
-        # only on the unmapped slices) carries the raw value, so a column with unmapped
-        # values stays a faithful mix of string + int annotations.
-        col = np.ascontiguousarray(col, dtype=np.int64)
-        uniq, inv = np.unique(col, return_inverse=True)
-        mapped_u = np.array([int(u) in mapping for u in uniq.tolist()], dtype=bool)
-        tab_pos = np.full(len(uniq), -1, dtype=np.int64)
-        table = []
-        for j, u in enumerate(uniq.tolist()):
-            if mapped_u[j]:
-                tab_pos[j] = len(table)
-                table.append(str(mapping[int(u)]))
-        str_spec = (key, tab_pos[inv], table)
-        if mapped_u.all():
-            return str_spec, None
-        return str_spec, int_anno(key, col, present=(~mapped_u)[inv])
-
-    def arr_anno(key, cols):
-        return (key, [np.ascontiguousarray(c, dtype=np.int64) for c in cols])
-
-    def collect_enums(pairs):
-        # (key, col, mapping) specs -> (str_specs, int_specs): each enum yields a string
-        # annotation plus, if any value is unmapped, an int annotation for those slices.
-        strs, ints = [], []
-        for k, col, m in pairs:
-            s, i = enum_anno(k, col, m)
-            strs.append(s)
-            if i is not None:
-                ints.append(i)
-        return strs, ints
 
     def json_anno(blobs):
         # blobs: per-slice str/bytes/None -> a CSR (offsets, buffer) varlen column; empty None.
@@ -906,24 +1215,18 @@ def _window_to_pftrace(
         np.cumsum(lengths, out=offsets[1:])
         return (offsets, b"".join(enc))
 
-    def graph_meta(c):
-        # graph ids + annotation + collective-metadata, patched onto every GPU op kind
-        # (kernel/memcpy/memset) exactly as the chrome path does -- sparse, present only
-        # where the column carries data.
-        extra, jsons = [], []
-        if c["graph_id"].any():
-            extra.append(int_anno("graph id", c["graph_id"], skip_zero=True))
-        if c["graph_node_id"].any():
-            extra.append(int_anno("graph node id", c["graph_node_id"], skip_zero=True))
-        ann = c.get("annotation")
-        if ann is not None and any(x is not None for x in ann.tolist()):
-            jsons.append(json_anno(ann.tolist()))
-        meta = c.get("metadata")
-        if meta is not None and any(x is not None for x in meta.tolist()):
-            jsons.append(json_anno(meta.tolist()))
-        return extra, jsons
-
-    def add_group(ts, end, uu, names, ints=(), strs=(), arrs=(), jsons=(), flow=None):
+    def add_group(
+        ts,
+        end,
+        uu,
+        names,
+        ints=(),
+        strs=(),
+        arrs=(),
+        jsons=(),
+        flow=None,
+        gpu_corr=None,
+    ):
         groups.append(
             {
                 "ts": np.ascontiguousarray(ts, dtype=np.int64),
@@ -937,6 +1240,9 @@ def _window_to_pftrace(
                 "flow": None
                 if flow is None
                 else np.ascontiguousarray(flow, dtype=np.int64),
+                "gpu_corr": None
+                if gpu_corr is None
+                else np.ascontiguousarray(gpu_corr, dtype=np.int64),
             }
         )
 
@@ -975,7 +1281,11 @@ def _window_to_pftrace(
     cpu_args: list = []
     has_args = False
     for e in cpu_data.get("traceEvents", []):
-        if not isinstance(e, dict) or e.get("ph") != "X" or e.get("cat") == "Trace":
+        if (
+            not isinstance(e, dict)
+            or e.get("ph") != "X"
+            or e.get("cat") in _NON_CPU_CATS
+        ):
             continue
         a = e.get("args") if isinstance(e.get("args"), dict) else {}
         if e.get("cat") in ("cpu_op", "user_annotation") and "External id" in a:
@@ -1016,99 +1326,9 @@ def _window_to_pftrace(
             if corr and eid in cpu_thread_by_external_id:
                 cpu_thread_by_correlation_id[corr] = cpu_thread_by_external_id[eid]
 
-    # --- kernel: pid=device, tid=stream; full launch args + flow + collective metadata ---
-    c = _col("kernel")
-    if c is not None:
-        uu = gpu_uuids(c["device_id"], c["stream_id"], "GPU {}", "stream {}")
-        ints = [
-            int_anno("device", c["device_id"]),
-            int_anno("context", c["context_id"]),
-            int_anno("stream", c["stream_id"]),
-            int_anno("correlation", c["correlation_id"]),
-            int_anno("registers per thread", c["registers_per_thread"]),
-            int_anno(
-                "shared memory", c["static_shared_memory"] + c["dynamic_shared_memory"]
-            ),
-            int_anno("priority", c["priority"]),
-            int_anno("queued", c["queued"]),
-            int_anno("channel", c["channel"]),
-            int_anno("channel_type", c["channel_type"]),
-        ]
-        arrs = [
-            arr_anno("grid", [c["grid_x"], c["grid_y"], c["grid_z"]]),
-            arr_anno("block", [c["block_x"], c["block_y"], c["block_z"]]),
-        ]
-        extra, jsons = graph_meta(c)
-        add_group(
-            c["start_ns"],
-            c["end_ns"],
-            uu,
-            c["name"].tolist(),
-            ints + extra,
-            (),
-            arrs,
-            jsons,
-            c["correlation_id"],
-        )
-
-    # --- memcpy / memset: pid=device, tid=stream; transfer args + flow ---
-    c = _col("gpu_memcpy")
-    if c is not None:
-        uu = gpu_uuids(c["device_id"], c["stream_id"], "GPU {}", "stream {}")
-        ints = [
-            int_anno("device", c["device_id"]),
-            int_anno("context", c["context_id"]),
-            int_anno("stream", c["stream_id"]),
-            int_anno("correlation", c["correlation_id"]),
-            int_anno("bytes", c["bytes"]),
-            int_anno("flags", c["flags"]),
-        ]
-        strs, enum_ints = collect_enums(
-            [
-                ("copy kind", c["copy_kind"], _MEMCPY_KIND_NAMES),
-                ("src kind", c["src_kind"], _MEMORY_KIND_NAMES),
-                ("dst kind", c["dst_kind"], _MEMORY_KIND_NAMES),
-            ]
-        )
-        extra, jsons = graph_meta(c)
-        names = ["Memcpy"] * len(c["start_ns"])
-        add_group(
-            c["start_ns"],
-            c["end_ns"],
-            uu,
-            names,
-            ints + extra + enum_ints,
-            strs,
-            jsons=jsons,
-            flow=c["correlation_id"],
-        )
-    c = _col("gpu_memset")
-    if c is not None:
-        uu = gpu_uuids(c["device_id"], c["stream_id"], "GPU {}", "stream {}")
-        # "memory kind" is a raw int in the chrome path (it name-maps only memcpy's
-        # src/dst kind, not memset's memory kind), so it stays an int annotation.
-        ints = [
-            int_anno("device", c["device_id"]),
-            int_anno("context", c["context_id"]),
-            int_anno("stream", c["stream_id"]),
-            int_anno("correlation", c["correlation_id"]),
-            int_anno("bytes", c["bytes"]),
-            int_anno("value", c["value"]),
-            int_anno("memory kind", c["memory_kind"]),
-            int_anno("flags", c["flags"]),
-        ]
-        extra, jsons = graph_meta(c)
-        names = ["Memset"] * len(c["start_ns"])
-        add_group(
-            c["start_ns"],
-            c["end_ns"],
-            uu,
-            names,
-            ints + extra,
-            (),
-            jsons=jsons,
-            flow=c["correlation_id"],
-        )
+    # GPU ops (kernel / memcpy / memset) are emitted only as native GPU Render Stages
+    # (one lane per stream, with launch stats + scalar args + collective metadata) by
+    # _build_render_stages -- not as duplicate track_event slices here.
 
     # --- runtime / driver API: registered names only, remapped onto their CPU thread ---
     for ks in ("cuda_runtime", "cuda_driver"):
@@ -1118,11 +1338,16 @@ def _window_to_pftrace(
         is_rt = ks == "cuda_runtime"
         namer = _runtime_cbid_name if is_rt else _driver_cbid_name
         is_reg = _runtime_is_registered if is_rt else _driver_is_registered
-        req_flow = _runtime_requires_flow if is_rt else _driver_requires_flow
+        # gpu_correlation (host launch -> its GPU render-stage kernel) on launches, by the
+        # kernel whose event_id == this correlation. Eager launches pair 1:1; cudaGraphLaunch
+        # shares one correlation across all of a graph's replayed kernels, so it links to the
+        # whole graph at once -- fine here because gpu_correlation only draws on selection (no
+        # spiderweb, unlike always-on flow_ids). Syncs are excluded (they match no kernel).
+        launch_pred = _runtime_is_launch if is_rt else _driver_requires_flow
         uniq_cb, inv = np.unique(c["cbid"], return_inverse=True)
         names_u = [namer(int(x)) for x in uniq_cb.tolist()]
         reg_u = np.array([is_reg(nm) for nm in names_u], dtype=bool)
-        flow_u = np.array([req_flow(nm) for nm in names_u], dtype=bool)
+        corr_u = np.array([launch_pred(nm) for nm in names_u], dtype=bool)
         keep = np.nonzero(reg_u[inv])[0]
         if not len(keep):
             continue
@@ -1142,11 +1367,20 @@ def _window_to_pftrace(
             dtype=np.int64,
             count=len(keep),
         )
-        uu = gpu_uuids(c["process_id"][keep], tid, "process {}", "thread {}")
+        uu = gpu_uuids(
+            c["process_id"][keep], tid, "process {}", "thread {}", is_gpu=False
+        )
         names = [names_u[i] for i in inv[keep].tolist()]
-        flow = np.where(flow_u[inv[keep]], corr, 0)
+        gpu_corr = np.where(corr_u[inv[keep]], corr, 0)
         ints = [int_anno("cbid", c["cbid"][keep]), int_anno("correlation", corr)]
-        add_group(c["start_ns"][keep], c["end_ns"][keep], uu, names, ints, flow=flow)
+        add_group(
+            c["start_ns"][keep],
+            c["end_ns"][keep],
+            uu,
+            names,
+            ints,
+            gpu_corr=gpu_corr,
+        )
 
     # --- overhead (own lane), dropping the trailing buffer-request artifact ---
     c = _col("overhead")
@@ -1238,6 +1472,8 @@ def _window_to_pftrace(
                 ]
             add_group(c["start_ns"][sub], c["end_ns"][sub], uu, names, ints, strs)
 
+    _nest_track_slices(groups, gpu_track_uuids)
+
     # Global name interning: one EventName table across all groups; each slice carries a
     # name_iid into it. A first-seen dict intern (O(n) hashes) beats np.unique here, whose
     # argsort over the object-array of names is the dominant assembly cost.
@@ -1265,12 +1501,68 @@ def _window_to_pftrace(
                 g["arrs"],
                 g["jsons"],
                 g["flow"],
+                g["gpu_corr"],
             )
         )
+    # GPU-side user annotations (gpu_user_annotation): emit as render stages on their stream's
+    # hardware-queue lane (an "Annotation" stage) so the collective/phase ranges show in the
+    # queues, nesting over the kernels they span. Their tid is the stream id; device comes from
+    # the stream -> device map (the kernels on that stream). They live in cpu_data (Kineto), not
+    # the columnar window, so build a synthetic render-stage column here.
+    render_columns = columns
+    gua = [
+        e
+        for e in cpu_data.get("traceEvents", [])
+        if isinstance(e, dict)
+        and e.get("ph") == "X"
+        and e.get("cat") == "gpu_user_annotation"
+    ]
+    if gua:
+        stream_to_dev: dict[int, int] = {}
+        kc = columns.get("kernel")
+        if kc is not None and len(kc.get("stream_id", ())):
+            for sdev, sstm in zip(kc["device_id"].tolist(), kc["stream_id"].tolist()):
+                stream_to_dev.setdefault(int(sstm), int(sdev))
+        a_ts = base_ns + np.round(
+            np.asarray([e.get("ts", 0.0) for e in gua], dtype=np.float64) * 1000.0
+        ).astype(np.int64)
+        a_dur = np.maximum(
+            np.round(
+                np.asarray([e.get("dur", 0.0) for e in gua], dtype=np.float64) * 1000.0
+            ).astype(np.int64),
+            0,
+        )
+        a_stream = np.asarray([int(e.get("tid", 0)) for e in gua], dtype=np.int64)
+        a_dev = np.asarray(
+            [stream_to_dev.get(int(t), 0) for t in a_stream.tolist()], dtype=np.int64
+        )
+        render_columns = {
+            **columns,
+            "gpu_annotation": {
+                "start_ns": a_ts,
+                "end_ns": a_ts + a_dur,
+                "device_id": a_dev,
+                "stream_id": a_stream,
+                "name": np.asarray([str(e.get("name", "")) for e in gua], dtype=object),
+            },
+        }
+    # Graphics context attaches the render stages to the main (first-registered => upid 1)
+    # process, matching the reference traces.
+    gfx_pid = next((k[1] for k in uuids if isinstance(k, tuple) and k[0] == "p"), 0)
+    render = _build_render_stages(render_columns, gfx_pid, iid_of, name_table)
+    active_devices = set()
+    for ks in ("kernel", "gpu_memcpy", "gpu_memset"):
+        c = columns.get(ks)
+        if c is not None and len(c.get("device_id", ())):
+            active_devices.update(np.unique(c["device_id"]).tolist())
+    # GPU counters (power/temp/clocks) -> GpuCounterEvents: the viewer renders them under
+    # "GPU / Counters / <gpu>", a sibling of the render-stage hardware queues, keyed by gpu_id.
+    counters = _build_gpu_counters(columns.get("environment"), active_devices)
+    # encode_pftrace returns gzip-compressed bytes (compressed in C++), so write as-is.
     out = torch._C._profiler._cupti_monitor.encode_pftrace(
-        tracks, name_table, group_tuples
+        tracks, name_table, group_tuples, render, counters
     )
-    with gzip.open(output_path, "wb", compresslevel=1) as f:
+    with open(output_path, "wb") as f:
         f.write(out)
 
 
