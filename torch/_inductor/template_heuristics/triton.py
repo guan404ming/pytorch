@@ -2097,7 +2097,7 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         device_type = kernel_inputs.device_type
         if device_type == "xpu":
             # XPU eager matmul takes TF32 from the oneDNN flag, not the CUDA one.
-            allow_tf32 = torch._C._get_onednn_allow_tf32()
+            allow_tf32 = torch.backends.mkldnn.allow_tf32
         elif device_type == "cuda":
             # allow_tf32 alignment heuristics based on reverse engineering
             # H100 CUDA 12.8 behavior
