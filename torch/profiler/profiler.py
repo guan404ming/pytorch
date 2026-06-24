@@ -350,6 +350,11 @@ class _KinetoProfile:
                 enable_pm_sampling=bool(
                     self._custom_profiler_config.get("enable_pm_sampling")
                 ),
+                # PM sampling interval (microseconds); finer = tighter counter-to-op
+                # alignment (less 1 ms-bucket lead) at more samples. Default 1 ms.
+                pm_sampling_interval_us=int(
+                    self._custom_profiler_config.get("pm_sampling_interval_us", 1000)
+                ),
                 # Synchronous export finalizes on the calling thread, so skip the poll thread.
                 defer_export=self._cupti_async_export,
             )

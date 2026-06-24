@@ -33,6 +33,7 @@ from torch.profiler._cupti.records import (
     Field,
     Kernel,
     Memcpy,
+    Memcpy2,
     Memset,
     Overhead,
     Sync,
@@ -102,6 +103,25 @@ PROFILER_FIELDS: dict[ActivityKind, set[Field]] = {
         Memcpy.SRC_KIND,
         Memcpy.DST_KIND,
         Memcpy.FLAGS,
+    },
+    # Peer-to-peer / cross-device copies (e.g. tensor.to(other_gpu), pipeline sends). CUPTI
+    # records these under MEMCPY2, NOT MEMCPY, so without this they never appear as GPU spans
+    # even though they drive NVLink. Folded into the same "gpu_memcpy" frame (see
+    # _memcpy2_columns) so they render as Memcpy spans on the issuing device's lane.
+    ActivityKind.MEMCPY2: {
+        Memcpy2.START,
+        Memcpy2.END,
+        Memcpy2.DEVICE_ID,
+        Memcpy2.CONTEXT_ID,
+        Memcpy2.STREAM_ID,
+        Memcpy2.CORRELATION_ID,
+        Memcpy2.GRAPH_NODE_ID,
+        Memcpy2.GRAPH_ID,
+        Memcpy2.BYTES,
+        Memcpy2.COPY_KIND,
+        Memcpy2.SRC_KIND,
+        Memcpy2.DST_KIND,
+        Memcpy2.FLAGS,
     },
     ActivityKind.MEMSET: {
         Memset.START,
@@ -192,6 +212,7 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         enable_cuda_sync: bool = False,
         defer_export: bool = True,
         enable_pm_sampling: bool = False,
+        pm_sampling_interval_us: int = 1000,
     ) -> None:
         self._lock = threading.Lock()
         # Decoded activity kept COLUMNAR (frames of named numpy columns, not per-record
@@ -240,7 +261,11 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         # other and rendered as GPU counter tracks. Off by default -- it locks GPU clocks.
         self._pm_sampler: PmSampler | None = None
         if enable_pm_sampling and self.available and pm_is_available():
-            self._pm_sampler = PmSampler(self._pm_sink, self.convert_time_array)
+            self._pm_sampler = PmSampler(
+                self._pm_sink,
+                self.convert_time_array,
+                sampling_interval_ns=pm_sampling_interval_us * 1000,
+            )
 
     def _boundary_clock_ns(self) -> int:
         # Stamp the boundary in the converted clock the events' start_ns use (convert_time
@@ -641,6 +666,31 @@ def _memcpy_columns(cols, convert, resolver):
     }
 
 
+def _memcpy2_columns(cols, convert, resolver):
+    # Peer-to-peer (MEMCPY2): same output columns as _memcpy_columns so the frames concatenate
+    # under one "gpu_memcpy" kind; reads the MEMCPY2 field ids (src/dst device fields shift
+    # correlation/graph ids). src/dst device aren't surfaced (the span on the issuing device's
+    # lane is what's wanted), but they're available on Memcpy2 if needed later.
+    gnid = cols[Memcpy2.GRAPH_NODE_ID.id].astype(np.int64)
+    corr = cols[Memcpy2.CORRELATION_ID.id].astype(np.int64)
+    return {
+        "start_ns": convert(cols[Memcpy2.START.id]),
+        "end_ns": convert(cols[Memcpy2.END.id]),
+        "device_id": cols[Memcpy2.DEVICE_ID.id].astype(np.int64),
+        "context_id": cols[Memcpy2.CONTEXT_ID.id].astype(np.int64),
+        "stream_id": cols[Memcpy2.STREAM_ID.id].astype(np.int64),
+        "correlation_id": corr,
+        "graph_node_id": gnid,
+        "graph_id": cols[Memcpy2.GRAPH_ID.id].astype(np.int64),
+        "annotation": _resolve_annotation_column(resolver, gnid),
+        "bytes": cols[Memcpy2.BYTES.id].astype(np.int64),
+        "copy_kind": cols[Memcpy2.COPY_KIND.id].astype(np.int64),
+        "src_kind": cols[Memcpy2.SRC_KIND.id].astype(np.int64),
+        "dst_kind": cols[Memcpy2.DST_KIND.id].astype(np.int64),
+        "flags": cols[Memcpy2.FLAGS.id].astype(np.int64),
+    }
+
+
 def _memset_columns(cols, convert, resolver):
     gnid = cols[Memset.GRAPH_NODE_ID.id].astype(np.int64)
     corr = cols[Memset.CORRELATION_ID.id].astype(np.int64)
@@ -744,6 +794,7 @@ def _environment_columns(cols, convert, resolver):
 _COLUMN_BUILDERS: dict[int, tuple[str, Any, bool]] = {
     int(ActivityKind.CONCURRENT_KERNEL): ("kernel", _kernel_columns, True),
     int(ActivityKind.MEMCPY): ("gpu_memcpy", _memcpy_columns, True),
+    int(ActivityKind.MEMCPY2): ("gpu_memcpy", _memcpy2_columns, True),
     int(ActivityKind.MEMSET): ("gpu_memset", _memset_columns, True),
     int(ActivityKind.RUNTIME): ("cuda_runtime", _api_columns, True),
     int(ActivityKind.DRIVER): ("cuda_driver", _api_columns, True),
