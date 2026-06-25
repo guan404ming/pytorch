@@ -2763,6 +2763,22 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         # bufC is a graph output, so it is never freed.
         self.assertEqual(peak, 350)
 
+    @requires_gpu_and_triton
+    @torch._inductor.config.patch({"reorder_for_peak_memory": False})
+    def test_combo_kernel_mask(self):
+        def fn(p_in):
+            p = p_in * 2.0 + 1.0
+            outs = [(p * k).sum() for k in (2.0, 3.0, 4.0, 5.0)]
+            return outs[0] + outs[1] + outs[2] + outs[3]
+
+        x = torch.randn(8192, 8192, device="cuda")
+
+        out_eager = fn(x)
+        torch._dynamo.reset()
+        torch._inductor.metrics.reset()
+        out_compiled = torch.compile(fn)(x)
+        self.assertEqual(out_eager, out_compiled)
+
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
