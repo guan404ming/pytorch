@@ -1411,6 +1411,18 @@ except ImportError:
 from torch import _C as _C
 
 
+_is_cow_tensor_impl = _C._is_cow_tensor  # pyrefly: ignore[missing-attribute]
+
+
+def _is_cow_tensor(input: _Any) -> builtins.bool:
+    if _C._dispatch_keys(input).has(_C.DispatchKey.Python):
+        raise RuntimeError("_is_cow_tensor is not defined for Python tensor subclasses")
+    return _is_cow_tensor_impl(input)
+
+
+_C._is_cow_tensor = _is_cow_tensor  # pyrefly: ignore[missing-attribute]
+
+
 __name, __obj = "", None
 for __name in dir(_C):
     if __name[0] != "_" and not __name.endswith("Base"):

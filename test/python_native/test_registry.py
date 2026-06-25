@@ -417,6 +417,125 @@ class TestRegistryRuntime(TestCase):
         self.assertTrue(torch.equal(out, torch.tensor([8.0, 15.0])))
         self.assertFalse(sentinel_called[0])
 
+    def test_compile_session_flag_falls_through_without_recursion(self):
+        """The eager router must not redispatch to its own aten override when
+        compile-session state is set but Dynamo is not actively tracing it.
+        """
+
+        def cond(*a, **k):
+            return False
+
+        def impl(a, b):
+            raise AssertionError("impl should not be called when cond=False")
+
+        self.registry.register_op_override(
+            "test_dsl", "aten", "mul.Tensor", "CPU", cond, impl
+        )
+        self._install("mul.Tensor", "CPU")
+
+        a = torch.tensor([2.0, 3.0])
+        b = torch.tensor([4.0, 5.0])
+        with torch.compiler._compile_session_context():
+            out = torch.ops.aten.mul.Tensor(a, b)
+
+        self.assertTrue(torch.equal(out, torch.tensor([8.0, 15.0])))
+
+    def test_dynamo_shortcut_preserves_cow_fallback(self):
+        """COW inputs must keep using the eager fallback path under Dynamo."""
+        sentinel_called = [False]
+
+        def cond(*a, **k):
+            sentinel_called[0] = True
+            return False
+
+        def impl(a, b):
+            raise AssertionError("impl should not be called when cond=False")
+
+        self.registry.register_op_override(
+            "test_dsl", "aten", "mul.Tensor", "CPU", cond, impl
+        )
+        self._install("mul.Tensor", "CPU")
+
+        @torch.compile(backend="eager")
+        def fn(a, b):
+            with torch.device("cpu"):
+                return torch.mul(a, b)
+
+        a = torch._lazy_clone(torch.tensor([2.0, 3.0]))
+        b = torch._lazy_clone(torch.tensor([4.0, 5.0]))
+        self.assertTrue(torch._C._is_cow_tensor(a))
+        self.assertTrue(torch._C._is_cow_tensor(b))
+
+        out = fn(a, b)
+
+        self.assertTrue(torch.equal(out, torch.tensor([8.0, 15.0])))
+        self.assertTrue(sentinel_called[0])
+        self.assertTrue(torch._C._is_cow_tensor(a))
+        self.assertTrue(torch._C._is_cow_tensor(b))
+
+    def test_dynamo_guards_on_cow_state(self):
+        @torch.compile(backend="eager")
+        def fn(a):
+            return torch._C._is_cow_tensor(a)
+
+        self.assertFalse(fn(torch.tensor([2.0, 3.0])))
+        self.assertTrue(fn(torch._lazy_clone(torch.tensor([2.0, 3.0]))))
+
+    def test_dynamo_graph_breaks_on_sourceless_cow_state(self):
+        @torch.compile(backend="eager")
+        def fn(a):
+            return torch._C._is_cow_tensor(a.view_as(a))
+
+        self.assertFalse(fn(torch.tensor([2.0, 3.0])))
+        self.assertTrue(fn(torch._lazy_clone(torch.tensor([2.0, 3.0]))))
+
+    def test_dynamo_graph_breaks_on_mutated_cow_state(self):
+        @torch.compile(backend="eager")
+        def fn(a):
+            a.add_(1)
+            return torch._C._is_cow_tensor(a)
+
+        self.assertFalse(fn(torch._lazy_clone(torch.tensor([2.0, 3.0]))))
+
+    def test_dynamo_allows_previously_mutated_cow_state(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(a):
+            return torch._C._is_cow_tensor(a)
+
+        x = torch.tensor([2.0, 3.0])
+        x.add_(1)
+        self.assertFalse(fn(x))
+
+    def test_strict_export_rejects_cow_state(self):
+        class Mod(torch.nn.Module):
+            def forward(self, a):
+                if torch._C._is_cow_tensor(a):
+                    return a + 1
+                return a + 2
+
+        with self.assertRaisesRegex(Exception, "COW tensor check during export"):
+            torch.export.export(
+                Mod(),
+                (torch._lazy_clone(torch.tensor([2.0, 3.0])),),
+                strict=True,
+            )
+
+    def test_non_strict_export_rejects_cow_state(self):
+        class Mod(torch.nn.Module):
+            def forward(self, a):
+                if torch._C._is_cow_tensor(a):
+                    return a + 1
+                return a + 2
+
+        with self.assertRaisesRegex(
+            Exception, "_is_cow_tensor is not defined for Python tensor subclasses"
+        ):
+            torch.export.export(
+                Mod(),
+                (torch._lazy_clone(torch.tensor([2.0, 3.0])),),
+                strict=False,
+            )
+
     def test_cond_true_routes_to_impl(self):
         """cond=True must route the call to the registered impl."""
 

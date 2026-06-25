@@ -227,6 +227,10 @@ recompiles_verbose_log = torch._logging.getArtifactLogger(
 verbose_guards_log = torch._logging.getArtifactLogger(__name__, "verbose_guards")
 
 
+def _is_cow_tensor(value: torch.Tensor) -> bool:
+    return torch._C._is_cow_tensor(value)  # pyrefly: ignore[missing-attribute]
+
+
 dunder_attrs_assumed_constants = (
     "__defaults__",
     "__kwdefaults__",
@@ -2422,6 +2426,24 @@ class GuardBuilder(GuardBuilderBase):
             self.get_guard_manager(guard).add_false_match_guard(
                 get_verbose_code_parts(code, guard), guard.user_stack
             )
+
+    @register_guard_check_spec(
+        get_metadata_fn=lambda guard, value: _is_cow_tensor(value),
+        eval_fn=lambda value, metadata: _is_cow_tensor(value) == metadata,
+    )
+    def COW_TENSOR_MATCH(self, guard: Guard) -> None:
+        expected = _is_cow_tensor(self.get(guard))
+
+        def guard_fn(x: Any) -> bool:
+            return _is_cow_tensor(x) == expected
+
+        code = f"torch._C._is_cow_tensor({self.arg_ref(guard)}) == {expected!r}"
+        self._set_guard_export_info(guard, [code])
+        self.get_guard_manager(guard).add_lambda_guard(
+            guard_fn,
+            get_verbose_code_parts(code, guard),
+            guard.user_stack,
+        )
 
     @register_guard_check_spec(
         get_metadata_fn=lambda guard, value: None,
