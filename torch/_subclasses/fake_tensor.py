@@ -1598,7 +1598,9 @@ class FakeTensorMode(TorchDispatchMode):
         if torch.xpu._is_compiled():
             if torch.cuda._is_compiled():
                 raise AssertionError("Cannot have both xpu and cuda compiled")
-            return not torch.xpu.is_available()
+            return not torch.xpu.is_initialized()
+        if torch.cuda._is_compiled():
+            return not torch.cuda.is_initialized()
 
         return not (
             torch.cuda.is_available()
