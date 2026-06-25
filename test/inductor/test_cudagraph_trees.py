@@ -1522,6 +1522,27 @@ if HAS_CUDA_AND_TRITON:
                 self.assertEqual(eager_out, compiled_out)
 
         @torch._inductor.config.patch("graph_partition", True)
+        def test_graph_partition_invoke_subgraph(self):
+            # Graph partition forms inside the invoke_subgraph body, so its
+            # cudagraph-eligible ops are captured as partitions. invoke_subgraph
+            # is a partition boundary; its lifted (deduplicated) body is
+            # partitioned and the same body partition is invoked from each call
+            # site without nesting cudagraph capture.
+            @torch.compiler.nested_compile_region
+            def gn(a, b):
+                return torch.relu(torch.matmul(a, b) + 1)
+
+            def fn(a, b):
+                return gn(gn(a, b), b)
+
+            compiled = torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+            a = torch.randn(8, 8, device="cuda")
+            b = torch.randn(8, 8, device="cuda")
+            for _ in range(3):
+                self.assertEqual(compiled(a, b), fn(a, b))
+            self.assertGreater(self.get_manager().new_graph_id().id, 0)
+
+        @torch._inductor.config.patch("graph_partition", True)
         @torch._inductor.config.patch("triton.cudagraph_trees", False)
         def test_graph_partition_gc(self):
             def _test_dummy():
