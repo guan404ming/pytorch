@@ -35,6 +35,25 @@ InputPlacements = tuple[PlacementType, ...] | None
 OutputPlacements = PlacementType | tuple[PlacementType, ...]
 
 
+def _placements_equal(
+    actual_placements: Sequence[Placement],
+    ref_placements: Sequence[Placement],
+    tensor_ndim: int,
+) -> bool:
+    if len(actual_placements) != len(ref_placements):
+        return False
+
+    def normalize_shard(x: Placement) -> Placement:
+        if isinstance(x, Shard):
+            return Shard(x.dim if x.dim >= 0 else x.dim + tensor_ndim)
+        return x
+
+    for actual, ref in zip(actual_placements, ref_placements):
+        if normalize_shard(actual) != normalize_shard(ref):
+            return False
+    return True
+
+
 def _placements_to_spmd_type(
     placements: PlacementType,
     grad_placements: PlacementType,
@@ -410,7 +429,7 @@ def _local_map_wrapped(
                 if not isinstance(spec, tuple):
                     spec = tuple(spec)
 
-                if arg.placements != spec:
+                if not _placements_equal(arg.placements, spec, arg.ndim):
                     if redistribute_inputs:
                         # redistribute to input placements
                         arg = arg.redistribute(placements=spec)
