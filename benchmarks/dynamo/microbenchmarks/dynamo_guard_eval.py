@@ -43,6 +43,10 @@ def bench(name, fn):
 # evaluation that scales with the number of inlined nn.Modules: per-layer scalar
 # attribute guards, object-aliasing guards from shared objects, and relational
 # symbolic-shape guards. See https://github.com/pytorch/pytorch/issues/185886.
+#
+# The same module pattern is mirrored in
+# benchmarks/dynamo/pr_time_benchmarks/benchmarks/nn_module_guard_eval.py; keep
+# the two in sync.
 class _Shared:
     def __init__(self):
         self.flag = True
@@ -57,6 +61,10 @@ class _RepeatedLayer(torch.nn.Module):
         self.shared = shared
 
     def forward(self, x):
+        # Load-bearing: reading the shared object is what makes Dynamo emit the
+        # object-aliasing guards (layers[i].shared is layers[j].shared) this
+        # benchmark exercises. `flag` is always True, so do not "simplify" the
+        # branch away -- doing so silently removes those guards.
         if self.shared.flag:
             x = x + self.eps
         return x * self.scale + self.bias

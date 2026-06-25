@@ -12,6 +12,9 @@ from torch._dynamo.eval_frame import _debug_get_cache_entry_list
 # attribute guards, object-aliasing guards from shared objects, and relational
 # symbolic-shape guards. This benchmark guards against regressions in that
 # runtime guard-eval cost. See https://github.com/pytorch/pytorch/issues/185886.
+#
+# The same module pattern is mirrored in
+# benchmarks/dynamo/microbenchmarks/dynamo_guard_eval.py; keep the two in sync.
 class Shared:
     def __init__(self):
         self.flag = True
@@ -26,6 +29,10 @@ class GuardEvalLayer(nn.Module):
         self.shared = shared
 
     def forward(self, x):
+        # Load-bearing: reading the shared object is what makes Dynamo emit the
+        # object-aliasing guards (layers[i].shared is layers[j].shared) this
+        # benchmark exercises. `flag` is always True, so do not "simplify" the
+        # branch away -- doing so silently removes those guards.
         if self.shared.flag:
             x = x + self.eps
         return x * self.scale + self.bias
@@ -69,15 +76,21 @@ class Benchmark(BenchmarkBase):
     def _prepare_once(self):
         torch._dynamo.reset()
         self._model = RepeatedModules(self.N_LAYERS, self.HIDDEN)
-        compiled = torch.compile(
-            self._model,
-            fullgraph=True,
-            backend=self.backend(),
-            dynamic=self.is_dynamic(),
-        )
-        # a view, so the input has a ._base (exercises relational shape guards)
-        self._x = torch.randn(2 * self.HIDDEN, self.HIDDEN)[: self.HIDDEN]
-        compiled(self._x)
+        # Pin enable_cpp_symbolic_shape_guards so the dynamic baseline is robust
+        # to a future default flip: with it True the symbolic-shape guards move
+        # into a compiled C++ guard, shifting the instruction count with no
+        # change to expected_results.csv. (The static variant has no
+        # symbolic-shape guards and is unaffected.)
+        with torch._dynamo.config.patch(enable_cpp_symbolic_shape_guards=False):
+            compiled = torch.compile(
+                self._model,
+                fullgraph=True,
+                backend=self.backend(),
+                dynamic=self.is_dynamic(),
+            )
+            # a view, so the input has a ._base (exercises relational shape guards)
+            self._x = torch.randn(2 * self.HIDDEN, self.HIDDEN)[: self.HIDDEN]
+            compiled(self._x)
 
         self._guard_manager = _debug_get_cache_entry_list(
             type(self._model).forward.__code__
