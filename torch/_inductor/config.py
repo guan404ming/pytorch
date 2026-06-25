@@ -1206,7 +1206,7 @@ class aten_distributed_optimizations:
     #   - No collective reordering (preserves NCCL stream ordering)
     #   - No memory regression (each move verified individually)
     #   - Predictable (no runtime estimation, no heuristics)
-    enable_simple_overlap: bool = False
+    enable_simple_overlap: bool = True
 
     # Enable overlap scheduling pass
     enable_overlap_scheduling: bool = False
@@ -2680,7 +2680,7 @@ class rocm:
     # Side-effect: when this is True, choices._need_to_fix_layout() returns True
     # so flexible layouts are disabled. Origami's grid/workgroup mappings depend
     # on exact strides and would mis-compile under flexible layouts.
-    origami: bool = os.environ.get("TORCHINDUCTOR_ORIGAMI") == "1"
+    origami: bool = os.environ.get("TORCHINDUCTOR_ORIGAMI") in (None, "1")
 
     # Number of top configs origami selects per GEMM. Read once from
     # TORCHINDUCTOR_ORIGAMI_TOPK; defaults to 6 (sweet spot between compile
