@@ -69,24 +69,14 @@ std::string get_type_str<int32_t>() {
 // then we can simply copy each tensor's underlying buffer contiguously into the
 // output.
 static void cat_out_mps_contiguous_impl(const ITensorListRef& inputs, const Tensor& output) {
-  MPSStream* stream = getCurrentMPSStream();
-  id<MTLBuffer> output_buffer = getMTLBufferStorage(output);
-  size_t output_offset = output.storage_offset() * output.itemsize();
-
+  int64_t offset = 0;
   for (const Tensor& input : inputs) {
     if (cat_should_skip_tensor(input)) {
       continue;
     }
-
-    id<MTLBuffer> input_buffer = getMTLBufferStorage(input);
-    size_t input_offset = input.storage_offset() * input.itemsize();
-    auto nbytes = input.nbytes();
-    auto profile_id =
-        getMPSProfiler().beginProfileCopy(input_buffer, output_buffer, input, output, nbytes, /*non_blocking=*/true);
-
-    stream->copy(input_buffer, output_buffer, nbytes, input_offset, output_offset, profile_id, SyncType::NONE);
-
-    output_offset += nbytes;
+    int64_t n = input.size(0);
+    output.narrow(0, offset, n).copy_(input);
+    offset += n;
   }
 }
 

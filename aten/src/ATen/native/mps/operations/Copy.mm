@@ -251,7 +251,6 @@ void copy_blit_mps(void* dst, const void* src, size_t size) {
 }
 
 static at::Tensor& copy_kernel_mps(at::Tensor& dst_, const at::Tensor& src_, bool non_blocking) {
-  auto src_byte_offset = src_.storage_offset() * src_.itemsize();
   auto dst_byte_offset = dst_.storage_offset() * dst_.itemsize();
 
   // If dst is contiguous and there is no byte offset, we can save directly the result of
@@ -273,17 +272,13 @@ static at::Tensor& copy_kernel_mps(at::Tensor& dst_, const at::Tensor& src_, boo
       if (returnGatherOutput) {
         return dst_;
       }
-
-      src_byte_offset = 0;
     } else {
       src = src_.expand_as(dst_).contiguous();
-      src_byte_offset = src.storage_offset() * src.itemsize();
     }
   } else {
     src = src_;
   }
   id<MTLBuffer> destBuffer = getMTLBufferStorage(dst_);
-  id<MTLBuffer> sourceBuffer = getMTLBufferStorage(src);
 
   // Scatter to `dst` if the memory is not contiguous
   // If the memory is not contiguous, it means that the tensor has strides and we would not be
@@ -294,12 +289,12 @@ static at::Tensor& copy_kernel_mps(at::Tensor& dst_, const at::Tensor& src_, boo
   src._set_conj(src_.is_conj());
   src._set_neg(src_.is_neg());
 
-  MPSStream* stream = getCurrentMPSStream();
   if (sameDataType) {
-    uint64_t profile_id = getMPSProfiler().beginProfileCopy(sourceBuffer, destBuffer, src, dst_, src.nbytes(), true);
-    // for GPU to GPU copies we only encode to stream's command buffer (no flushing)
-    stream->copy(sourceBuffer, destBuffer, src.nbytes(), src_byte_offset, dst_byte_offset, profile_id);
+    // Same dtype + (contiguous | same memory format): a flat element copy. Use
+    // the vectorized identity kernel rather than an MTLBlit (issue #188198).
+    copy_cast_kernel_mps(dst_, src);
   } else {
+    MPSStream* stream = getCurrentMPSStream();
     if (dst_byte_offset) {
       auto maybeCastedSource =
           at::empty(dst_.sizes(), dst_.scalar_type(), std::nullopt, kMPS, std::nullopt, std::nullopt);
