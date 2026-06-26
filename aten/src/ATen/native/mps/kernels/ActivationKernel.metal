@@ -349,12 +349,9 @@ kernel void glu_dense(
     uint2 tpig [[thread_position_in_grid]]) {
   const long L = inner_half;
   const long s = static_cast<long>(tpig.y) * 2 * L + tpig.x;
-  using op_T = opmath_t<T>;
-  const op_T a = input[s];
-  const op_T b = input[s + L];
-  const op_T one = 1;
+  // Share glu_functor with the strided binary path so both stay in lockstep.
   out[static_cast<long>(tpig.y) * L + tpig.x] =
-      static_cast<T>(a / (one + ::metal::precise::exp(-b)));
+      glu_functor{}(input[s], input[s + L]);
 }
 
 #define REGISTER_GLU_DENSE_OP(DTYPE)                                        \
@@ -367,6 +364,23 @@ kernel void glu_dense(
 REGISTER_GLU_DENSE_OP(float);
 REGISTER_GLU_DENSE_OP(half);
 REGISTER_GLU_DENSE_OP(bfloat);
+
+// Shared glu backward math: from a (first half), b (second half), and the
+// upstream grad gO, produce the gradients of both halves (.x for the first
+// half, .y for the second). Used by both the strided and dense backward kernels
+// so they stay in lockstep.
+struct glu_backward_functor {
+  template <typename T>
+  inline vec2type_t<T> operator()(const T a, const T b, const T gO) {
+    using op_T = opmath_t<T>;
+    const op_T one = 1;
+    const op_T sig = one / (one + ::metal::precise::exp(-op_T(b)));
+    const op_T g = gO;
+    return {
+        static_cast<T>(sig * g),
+        static_cast<T>((one - sig) * sig * g * op_T(a))};
+  }
+};
 
 // Fused glu backward, mirroring the CUDA kernel: a single pass over the
 // halved iteration shape that reads both input halves (the second via a fixed
@@ -390,15 +404,12 @@ kernel void glu_backward(
   const auto I_offs = offset_from_coord(pos, input_strides, ndim);
   const auto gO_offs = offset_from_coord(pos, grad_output_strides, ndim);
 
-  using op_T = opmath_t<T>;
-  const op_T a = val_at_offs<T>(input, I_offs);
-  const op_T b = val_at_offs<T>(input, I_offs + input_byte_offset);
-  const op_T gO = val_at_offs<T>(grad_output, gO_offs);
-  const op_T one = 1;
-  const op_T sig = one / (one + ::metal::precise::exp(-b));
-  ref_at_offs<T>(grad_input, gI_offs) = static_cast<T>(sig * gO);
-  ref_at_offs<T>(grad_input, gI_offs + grad_input_byte_offset) =
-      static_cast<T>((one - sig) * sig * gO * a);
+  const auto grads = glu_backward_functor{}(
+      val_at_offs<T>(input, I_offs),
+      val_at_offs<T>(input, I_offs + input_byte_offset),
+      val_at_offs<T>(grad_output, gO_offs));
+  ref_at_offs<T>(grad_input, gI_offs) = grads.x;
+  ref_at_offs<T>(grad_input, gI_offs + grad_input_byte_offset) = grads.y;
 }
 
 #define REGISTER_GLU_BACKWARD_OP(DTYPE)                      \
@@ -433,14 +444,10 @@ kernel void glu_backward_dense(
   const long L = inner_half;
   const long s = static_cast<long>(tpig.y) * 2 * L + tpig.x;
   const long g = static_cast<long>(tpig.y) * L + tpig.x;
-  using op_T = opmath_t<T>;
-  const op_T a = input[s];
-  const op_T b = input[s + L];
-  const op_T gO = grad_output[g];
-  const op_T one = 1;
-  const op_T sig = one / (one + ::metal::precise::exp(-b));
-  grad_input[s] = static_cast<T>(sig * gO);
-  grad_input[s + L] = static_cast<T>((one - sig) * sig * gO * a);
+  const auto grads =
+      glu_backward_functor{}(input[s], input[s + L], grad_output[g]);
+  grad_input[s] = grads.x;
+  grad_input[s + L] = grads.y;
 }
 
 #define REGISTER_GLU_BACKWARD_DENSE_OP(DTYPE)                      \
