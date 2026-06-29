@@ -872,7 +872,7 @@ class ComboKernelTests(TestCase):
             # XPU eager uses 32 threads with strided access while Triton uses
             # 256 threads with contiguous access. Due to float32 non-associativity,
             # different element-to-thread mappings produce slightly different sums.
-            torch.testing.assert_close(out_eager, out_compiled, atol=2e-5, rtol=1e-5)
+            self.assertEqual(out_eager, out_compiled, atol=2e-5, rtol=1e-5)
         else:
             self.assertEqual(out_eager, out_compiled)
         combined = " ".join(code)
