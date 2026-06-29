@@ -85,6 +85,7 @@ from ..utils import (
     sympy_dot,
     sympy_product,
     sympy_subs,
+    TMA_ALIGNMENT,
     triton_type,
     triton_version_uses_attrs_dict,
     upcast_compute_type,
@@ -3280,11 +3281,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _prescan_host_tma_materializability(self) -> None:
         """Populate _host_tma_non_materializable_buffers with buffers that
         can't be expressed as a single host-side TMA descriptor."""
-        self._host_tma_non_materializable_buffers = set()
         if not config.triton.use_tensor_descriptor:
+            # Host TMA is off; mark as scanned (no bad buffers, won't change).
+            self._host_tma_non_materializable_buffers = set()
             return
         if not hasattr(self, "features") or not hasattr(self.features, "node_schedule"):
+            # Features not available yet; leave the sentinel None so a later
+            # load()/store() retries the scan instead of caching an empty result.
             return
+        self._host_tma_non_materializable_buffers = set()
 
         from .simd_kernel_features import NodeScheduleMarker
 
@@ -3334,30 +3339,32 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self._host_tma_non_materializable_buffers.add(buf_name)
 
     def _check_buffer_alignment(self, name: str, var: str, dtype: torch.dtype) -> bool:
-        """Check if a buffer has a misaligned layout offset that prevents TMA use.
-
-        Returns True if the buffer is misaligned (TMA should be skipped).
+        """Whether a buffer's layout offset can't be proven TMA-aligned, so
+        host-side TMA must be skipped. The CUtensorMap alignment requirement is
+        CUDA-specific, so this only applies on CUDA; an offset that is not
+        statically known to be a multiple of TMA_ALIGNMENT is treated as
+        misaligned (conservative).
         """
         if not config.triton.use_tensor_descriptor:
             return False
-        try:
-            buf = V.graph.try_get_buffer(name)
-            if buf is None and hasattr(V.graph, "scheduler") and V.graph.scheduler:
-                real_name = V.graph.scheduler.mutation_real_name.get(name, name)
-                if real_name != name:
-                    buf = V.graph.try_get_buffer(real_name)
-            if buf is not None:
-                layout = buf.get_layout()
-                layout_offset = getattr(layout, "offset", 0)
-                if layout_offset != 0:
-                    offset_bytes = int(layout_offset) * dtype.itemsize
-                    if offset_bytes % 16 != 0:
-                        self._host_tma_non_materializable.add(var)
-                        self.host_tma_descriptor_args.pop(var, None)
-                        return True
-        except (TypeError, ValueError):
-            pass
-        return False
+        if V.graph.get_current_device_or_throw().type != "cuda":
+            return False
+        buf = V.graph.try_get_buffer(name)
+        if buf is None and hasattr(V.graph, "scheduler") and V.graph.scheduler:
+            real_name = V.graph.scheduler.mutation_real_name.get(name, name)
+            if real_name != name:
+                buf = V.graph.try_get_buffer(real_name)
+        if buf is None:
+            return False
+        layout_offset = getattr(buf.get_layout(), "offset", 0)
+        if layout_offset == 0:
+            return False
+        offset_bytes = layout_offset * dtype.itemsize
+        if V.graph.sizevars.statically_known_multiple_of(offset_bytes, TMA_ALIGNMENT):
+            return False
+        self._host_tma_non_materializable.add(var)
+        self.host_tma_descriptor_args.pop(var, None)
+        return True
 
     @property
     def has_store_with_contiguous_rdim(self) -> bool:
@@ -4344,7 +4351,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if config.triton.enable_host_side_tma:
             if self._host_tma_non_materializable_buffers is None:
                 self._prescan_host_tma_materializability()
-            if name in self._host_tma_non_materializable_buffers:
+            # May still be None if the scan deferred (features not ready); treat
+            # as "no known-bad buffers" this call and retry on the next.
+            if name in (self._host_tma_non_materializable_buffers or ()):
                 self._host_tma_non_materializable.add(var)
 
         skip_tma = (

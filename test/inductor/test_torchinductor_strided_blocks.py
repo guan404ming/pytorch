@@ -2281,6 +2281,34 @@ class TritonHostSideTMATestCUDA(BlockDescriptorTestBase):
         kwargs["expected_num_block_pointers"] = None
         return super()._run_and_compare(*args, **kwargs)
 
+    def test_host_tma_codegen_markers(self):
+        # Host-side TMA builds descriptors in the launcher, not the kernel: the
+        # kernel body must have no in-kernel tl.make_tensor_descriptor, and the
+        # inductor metadata must carry host_tma_descriptor_args.
+        def fn(a, b):
+            return a + b
+
+        a = torch.randn(1024, 1024, device=self.device, dtype=torch.bfloat16)
+        b = torch.randn(1024, 1024, device=self.device, dtype=torch.bfloat16)
+        result, code_list = run_and_get_code(torch.compile(fn), a, b)
+        self.assertTrue(torch.allclose(result, fn(a, b)))
+        code = "\n".join(code_list)
+        self.assertNotIn("tl.make_tensor_descriptor", code)
+        self.assertIn("host_tma_descriptor_args", code)
+
+    def test_misaligned_offset_disables_host_tma(self):
+        # A 4-byte (float32) storage offset is not 16-byte aligned, so the
+        # misaligned input can't be host-TMA'd and falls back to a plain
+        # tl.load. (Disabling is per-buffer: the aligned output may still use a
+        # descriptor, so host_tma_descriptor_args can still appear.)
+        def fn(x):
+            return x[1:] + 1
+
+        x = torch.randn(1025, device=self.device)
+        result, code_list = run_and_get_code(torch.compile(fn), x)
+        self.assertTrue(torch.allclose(result, fn(x)))
+        self.assertIn("tl.load", "\n".join(code_list))
+
 
 test_torchinductor.copy_tests(
     CommonTemplate, TritonHostSideTMATestCUDA, GPU_TYPE
@@ -2319,6 +2347,62 @@ for _name in _HOST_TMA_EXPECTED_FAILURES:
 TritonHostSideTMATestCUDA.test_dynamic_shapes_pointwise_nd_tiling_False_num_block_pointers_1_cuda = unittest.expectedFailure(
     TritonHostSideTMATestCUDA.test_dynamic_shapes_pointwise_nd_tiling_False_num_block_pointers_1_cuda
 )
+
+# Unlike the cases above (which also fail device-side), this one passes for
+# device-side TMA and non-TMA. Its im2col output store is emitted as a host-side
+# TMA tensordesc store, so the generated code has no tl.make_block_ptr and the
+# base block_descriptor_constructor_str assert does not hold. Numerics still
+# match (the _run_and_compare check passes before the code-string assert).
+TritonHostSideTMATestCUDA.test_ensure_integral_dims_and_strides_cuda = unittest.expectedFailure(
+    TritonHostSideTMATestCUDA.test_ensure_integral_dims_and_strides_cuda
+)
+
+
+class HostTMAHelperTest(InductorTestCase):
+    """Device-independent unit tests for host-side TMA helpers."""
+
+    def test_host_tma_aligned_clone_fallback(self):
+        from torch._inductor.runtime.triton_heuristics import _host_tma_aligned
+
+        # 16-byte-aligned base -> returned as-is (no clone).
+        aligned = torch.randn(1024)
+        self.assertEqual(aligned.data_ptr() % 16, 0)
+        self.assertIs(_host_tma_aligned(aligned, "aligned"), aligned)
+
+        # Misaligned base -> cloned into an aligned buffer, values preserved.
+        base = torch.randn(1024 + 8, dtype=torch.float16)
+        misaligned = base[1:]
+        self.assertNotEqual(misaligned.data_ptr() % 16, 0)
+        cloned = _host_tma_aligned(misaligned, "misaligned")
+        self.assertIsNot(cloned, misaligned)
+        self.assertEqual(cloned.data_ptr() % 16, 0)
+        self.assertTrue(torch.equal(cloned, misaligned))
+
+
+@unittest.skipIf(
+    not (HAS_CUDA_AND_TRITON and torch.cuda.get_device_capability()[0] >= 9)
+    or torch.version.hip,
+    "Requires Triton CUDA backend and CUDA compute capability >= 9.0. Not supported on ROCm",
+)
+class TritonHostSideTMAConfigTestCUDA(InductorTestCase):
+    @config.patch(
+        {
+            "triton.enable_host_side_tma": True,
+            "triton.use_tensor_descriptor": False,
+        }
+    )
+    def test_enable_host_side_tma_without_prereqs_warns(self):
+        # enable_host_side_tma only selects the descriptor flavor; without
+        # use_tensor_descriptor + assume_aligned_inputs it has no effect and
+        # should warn rather than silently no-op.
+        def fn(x):
+            return x + 1
+
+        x = torch.randn(1024, device=GPU_TYPE)
+        with self.assertWarnsRegex(UserWarning, "no effect"):
+            result, code_list = run_and_get_code(torch.compile(fn), x)
+        self.assertTrue(torch.allclose(result, fn(x)))
+        self.assertNotIn("host_tma_descriptor_args", "\n".join(code_list))
 
 
 if __name__ == "__main__":

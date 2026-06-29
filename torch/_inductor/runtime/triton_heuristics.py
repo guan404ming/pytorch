@@ -37,12 +37,14 @@ from torch._inductor.config import triton as inductor_triton_config
 from torch._prims_common import compute_required_storage_length
 from torch.utils._debug_mode import get_active_debug_mode
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._triton import has_triton_stable_tma_api
 
 from ..triton_bundler import TritonBundler
 from ..utils import (
     GPU_KERNEL_BIN_EXTS,
     prefix_is_reduction,
     tlx_only_cuda_options,
+    TMA_ALIGNMENT,
     triton_version_uses_attrs_dict,
     XPU_KERNEL_FORMAT,
 )
@@ -192,6 +194,26 @@ def _resolve_dims(dims, cfg_kwargs, constants):
             log.debug("host-side TMA: unresolved descriptor dim %r; skipping", s)
             return None
     return result
+
+
+@functools.lru_cache(None)
+def _warn_host_tma_clone(name: str) -> None:
+    log.warning(
+        "host-side TMA: input %s is not %d-byte aligned; cloning it (an extra "
+        "copy per launch). Pass aligned inputs to avoid this.",
+        name,
+        TMA_ALIGNMENT,
+    )
+
+
+def _host_tma_aligned(tensor, name):
+    """Return a TMA_ALIGNMENT-aligned view of `tensor`, cloning (with a one-time
+    warning) only if its base address is not aligned. Used by the host-side TMA
+    launcher to build TensorDescriptors from aligned storage."""
+    if tensor.data_ptr() % TMA_ALIGNMENT == 0:
+        return tensor
+    _warn_host_tma_clone(name)
+    return tensor.clone()
 
 
 def autotune_hints_to_configs(
@@ -3102,6 +3124,15 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
         host_tma_args = self.inductor_meta.get("host_tma_descriptor_args")
         pre_runner_lines: list[str] = []
         if host_tma_args:
+            # host_tma_descriptor_args is only produced when codegen confirmed the
+            # stable TMA API (TensorDescriptor); guard explicitly so a too-old
+            # Triton fails clearly instead of with an AttributeError at launch.
+            if not has_triton_stable_tma_api():
+                raise RuntimeError(
+                    "host-side TMA requires a Triton with the stable TMA API "
+                    "(triton.tools.tensor_descriptor.TensorDescriptor)"
+                )
+            scope["_host_tma_aligned"] = _host_tma_aligned
             cfg_kwargs = cfg.kwargs
             all_constants = compile_meta["constants"]
 
@@ -3122,8 +3153,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
                 desc_var = f"{inner_name}_host_tma_desc"
                 aligned_var = f"{inner_name}_aligned"
                 pre_runner_lines.append(
-                    f"{aligned_var} = {inner_name} if {inner_name}.data_ptr() % 16 == 0"
-                    f" else {inner_name}.clone()"
+                    f'{aligned_var} = _host_tma_aligned({inner_name}, "{inner_name}")'
                 )
                 pre_runner_lines.append(
                     f"{desc_var} = triton.tools.tensor_descriptor"
