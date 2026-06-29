@@ -252,4 +252,4 @@ def uniform(
     if len(shape) == 1 and isinstance(shape[0], Sequence):
         # pyrefly: ignore [bad-argument-type]
         shape = tuple(shape[0])
-    return torch.ops.aten._philox_uniform.size(shape, key, low, high, dtype=dtype
+    return torch.ops.aten._philox_uniform.size(shape, key, low, high, dtype=dtype)
