@@ -1199,6 +1199,15 @@ class _collective:
 class aten_distributed_optimizations:
     """Configuration for distributed optimization passes on ATen FX graphs."""
 
+    # Move collectives earlier and waits later in the inductor schedule
+    # to overlap communication with compute.
+    #
+    # Guarantees:
+    #   - No collective reordering (preserves NCCL stream ordering)
+    #   - No memory regression (each move verified individually)
+    #   - Predictable (no runtime estimation, no heuristics)
+    enable_simple_overlap: bool = True
+
     # Enable overlap scheduling pass
     enable_overlap_scheduling: bool = False
 
@@ -1849,6 +1858,15 @@ class triton:
 
     # Emit objgraph backref dumps for leaked cudagraph pool tensors
     cudagraph_trees_objgraph = False
+
+    # Which live cudagraph tree storages to clone before starting a new
+    # generation. None keeps the existing stale-output error behavior.
+    # "user_visible" clones live user-visible output storages out of
+    # the graph pool. Backward graph outputs are not selected for cloning.
+    # This mode can add overhead because live outputs that cross generations
+    # are explicitly copied and stop using cached TensorImpl outputs. Users
+    # can leave this unset and manually clone/copy those outputs instead.
+    cudagraph_trees_generation_cloning: Literal["user_visible"] | None = None
 
     # Enable cudagraph support for mutated inputs from prior cudagraph pool
     cudagraph_support_input_mutation = not is_fbcode()
@@ -2666,7 +2684,7 @@ class rocm:
     # Side-effect: when this is True, choices._need_to_fix_layout() returns True
     # so flexible layouts are disabled. Origami's grid/workgroup mappings depend
     # on exact strides and would mis-compile under flexible layouts.
-    origami: bool = os.environ.get("TORCHINDUCTOR_ORIGAMI") == "1"
+    origami: bool = os.environ.get("TORCHINDUCTOR_ORIGAMI") in (None, "1")
 
     # Number of top configs origami selects per GEMM. Read once from
     # TORCHINDUCTOR_ORIGAMI_TOPK; defaults to 6 (sweet spot between compile
