@@ -240,6 +240,87 @@ def _hierarchical_indexer_cute(
     return indexer
 
 
+def _expand_flex_flash_kv_blocks(
+    kv_num_blocks: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_block_split: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split FlexAttention KV block metadata into FA4 tile-sized KV blocks."""
+    if kv_block_split == 1:
+        return kv_num_blocks, kv_indices
+    kv_offsets = torch.arange(
+        kv_block_split, device=kv_indices.device, dtype=kv_indices.dtype
+    )
+    return kv_num_blocks * kv_block_split, (
+        kv_indices.unsqueeze(-1) * kv_block_split + kv_offsets
+    ).flatten(-2)
+
+
+def _create_flex_flash_block_sparse_tensors(
+    kv_num_blocks: torch.Tensor,
+    kv_indices: torch.Tensor,
+    full_kv_num_blocks: torch.Tensor | None,
+    full_kv_indices: torch.Tensor | None,
+    sparse_q_block_size: int,
+    sparse_kv_block_size: int,
+    flash_sparse_kv_block_size: int,
+) -> Any:
+    """Adapt FlexAttention BlockMask metadata to FA4 block-sparse metadata."""
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+    if sparse_kv_block_size % flash_sparse_kv_block_size != 0:
+        raise ValueError(
+            "Flex FLASH sparse KV block size must be divisible by the FA4 KV tile size. "
+            f"Got sparse_kv_block_size={sparse_kv_block_size} and "
+            f"flash_sparse_kv_block_size={flash_sparse_kv_block_size}."
+        )
+
+    kv_block_split = sparse_kv_block_size // flash_sparse_kv_block_size
+    kv_num_blocks, kv_indices = _expand_flex_flash_kv_blocks(
+        kv_num_blocks, kv_indices, kv_block_split
+    )
+    if full_kv_num_blocks is None:
+        full_kv_num_blocks = torch.zeros_like(kv_num_blocks)
+        full_kv_indices = torch.zeros_like(kv_indices)
+    elif full_kv_indices is None:
+        raise AssertionError("full_kv_indices must be provided with full_kv_num_blocks")
+    else:
+        full_kv_num_blocks, full_kv_indices = _expand_flex_flash_kv_blocks(
+            full_kv_num_blocks, full_kv_indices, kv_block_split
+        )
+
+    return BlockSparseTensorsTorch(
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        block_size=(sparse_q_block_size, flash_sparse_kv_block_size),
+    )
+
+
+def _get_flex_flash_sparse_kv_block_size(
+    device: torch.device, sparse_kv_block_size: int
+) -> int:
+    """Return the FA4 KV tile size used to represent Flex block-sparse metadata."""
+    major = torch.cuda.get_device_capability(device)[0]
+    if major in (10, 11) and sparse_kv_block_size % 128 == 0:
+        return 128
+    return sparse_kv_block_size
+
+
+def _is_flex_flash_noop_block_mask(
+    sparse_q_block_size: int,
+    sparse_kv_block_size: int,
+    has_full_blocks: bool,
+) -> bool:
+    """Identify FlexAttention's synthetic dense BlockMask."""
+    return (
+        not has_full_blocks
+        and sparse_q_block_size == 1 << 30
+        and sparse_kv_block_size == 1 << 30
+    )
+
+
 @contextmanager
 def patch_fixed_layout_indexer_for_cutedsl():
     """
@@ -473,29 +554,43 @@ def create_flex_flash_attention_kernel(
         subgraph.graph_module
     )
 
-    needs_block_mask = not mask_graph_is_trivial
+    if kv_num_blocks is None or kv_indices is None:
+        raise AssertionError("kv block metadata is required for flex FLASH")
+
     has_score_mod = not score_graph_is_trivial
+    has_mask_mod = not mask_graph_is_trivial
     has_full_blocks = full_kv_num_blocks is not None
+    if has_full_blocks and full_kv_indices is None:
+        raise AssertionError("full_kv_indices must be provided with full_kv_num_blocks")
+    is_noop_block_mask = _is_flex_flash_noop_block_mask(
+        sparse_q_block_size,
+        sparse_kv_block_size,
+        has_full_blocks,
+    )
+    if has_mask_mod and is_noop_block_mask:
+        raise NotImplementedError(
+            "Flash attention with mask_mod but without block mask metadata is not supported yet"
+        )
+    needs_block_mask = not is_noop_block_mask
+    flash_sparse_kv_block_size = _get_flex_flash_sparse_kv_block_size(
+        device, sparse_kv_block_size
+    )
 
     choices: list[Any] = []
     if flash_attention_cutedsl_template is None:
         raise AssertionError("flash_attention_cutedsl_template must not be None")
 
     input_nodes = [query, key, value, lse]
-    if has_full_blocks:
-        input_nodes.extend(
-            [kv_num_blocks, kv_indices, full_kv_num_blocks, full_kv_indices]
-        )
-
-    if needs_block_mask and not has_full_blocks:
-        raise NotImplementedError(
-            "Flash attention with block mask but without full blocks is not supported yet"
-        )
+    if needs_block_mask:
+        input_nodes.extend([kv_num_blocks, kv_indices])
+        if has_full_blocks:
+            input_nodes.extend([full_kv_num_blocks, full_kv_indices])
 
     subgraphs = []
     if has_score_mod:
         subgraphs.append(subgraph_buffer)
-    subgraphs.append(mask_graph_buffer)
+    if has_mask_mod:
+        subgraphs.append(mask_graph_buffer)
 
     aux_scalar_symbols = collect_aux_scalar_symbols(
         score_mod_other_buffers, mask_mod_other_buffers
@@ -520,7 +615,7 @@ def create_flex_flash_attention_kernel(
             subgraph.graph_module if has_score_mod and subgraph is not None else None
         ),
         score_mod_other_buffers=score_mod_other_buffers,
-        has_mask_mod=needs_block_mask,
+        has_mask_mod=has_mask_mod,
         has_mask_aux_tensors=has_mask_aux_tensors,
         mask_mod_graph_module=mask_graph.graph_module,
         mask_mod_other_buffers=mask_mod_other_buffers,
@@ -543,8 +638,11 @@ def create_flex_flash_attention_kernel(
                 MASK_MOD_OTHER_BUFFERS=mask_mod_other_buffers,
                 AUX_SCALAR_SYMBOLS=aux_scalar_symbols,
                 NEEDS_BLOCK_MASK=needs_block_mask,
+                HAS_MASK_MOD=has_mask_mod,
+                HAS_FULL_BLOCKS=has_full_blocks,
                 SPARSE_Q_BLOCK_SIZE=sparse_q_block_size,
                 SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size,
+                FLASH_SPARSE_KV_BLOCK_SIZE=flash_sparse_kv_block_size,
             )
         if error is not None and len(configs) == 1:
             raise RuntimeError(f"CuteDSL template failed: {error}")
@@ -556,13 +654,18 @@ def create_flex_flash_attention_kernel(
         raise RuntimeError(f"CuteDSL template failed: {error}")
 
     input_gen_fns: dict[int, Callable] | None = None
-    if has_full_blocks:
+    if needs_block_mask:
         input_gen_fns = {
             4: create_num_blocks_fake_generator(kv_indices),
             5: create_indices_fake,
-            6: create_num_blocks_fake_generator(full_kv_indices),
-            7: create_indices_fake,
         }
+        if has_full_blocks:
+            input_gen_fns.update(
+                {
+                    6: create_num_blocks_fake_generator(full_kv_indices),
+                    7: create_indices_fake,
+                }
+            )
 
     template_output, _ = autotune_select_algorithm(
         "flex_flash_attention",
