@@ -2541,6 +2541,188 @@ aliased to the existing `cell_var`, so later DEREF reads/writes route through th
 same VT (preserving source/guards). Cells that are non-empty (pending mutation or
 pre-existing contents) still go through `load_cell` exactly as before.
 
+### Cycle5-C: test_iter sequence/callable iterator protocol cluster
+
+Cluster (relevance ~73.7, baseline "Observed exception"), all in
+`test/cpython/v3_13/test_iter.py`:
+- `test_iter_neg_setstate` -- IMPLEMENTED
+- `test_iter_overflow` -- IMPLEMENTED
+- `test_iter_function_concealing_reentrant_exhaustion` -- IMPLEMENTED
+- `test_builtin_zip` -- DEFERRED (vendored skip)
+- `test_exception_locations` -- DEFERRED (traceback location fidelity)
+
+Two implementable iterators live as Dynamo polyfills in
+`torch/_dynamo/polyfills/builtins.py`: `_SequenceIterator` (the `__getitem__`-only
+seq iterator, CPython `seqiterobject` / `Objects/iterobject.c`) and
+`_CallableIterator` (two-arg `iter(fn, sentinel)`, CPython `calliterobject`).
+The three implemented fixes mirror CPython's C iterator algorithms in those
+polyfills.
+
+`test_iter_neg_setstate` + `test_iter_overflow` SHARE one root cause and one
+fix area. `iter(UnlimitedSequenceClass())` (only `__getitem__`) is traced as
+`_SequenceIterator`, which had no `__setstate__` and no overflow guard.
+Repro (sentinels removed):
+```
+AttributeError("'_SequenceIterator' object has no attribute '__setstate__'")
+  user code: test_iter.py:1199  it.__setstate__(-42)         # neg_setstate
+  user code: test_iter.py:1188  it.__setstate__(sys.maxsize-2)  # overflow
+```
+Fix (mirrors `iter_setstate` + `iter_iternext`):
+- `__setstate__(state)`: when not exhausted, `self.index = max(state, 0)`
+  (CPython clamps a negative index to 0 and only applies state while
+  `it_seq != NULL`).
+- `__next__`: before fetching, if `self.index == sys.maxsize` raise
+  `OverflowError("iter index too large")` (CPython's `it_index == PY_SSIZE_T_MAX`
+  guard, since the counter is a `Py_ssize_t`).
+
+`test_iter_function_concealing_reentrant_exhaustion` (gh-101892) is a separate
+fix in `_CallableIterator`. The callable reentrantly exhausts its own iterator
+(via `list(it)`) during `fn()`; CPython `calliter_iternext` re-reads
+`it_callable`/`it_sentinel` after the call and, finding them cleared by the
+reentrant exhaustion, raises `StopIteration` regardless of the value the outer
+`fn()` returned. The polyfill checked `self.exhausted` only on entry, so the
+outer call returned `HAS_MORE` instead of stopping (`AssertionError:
+StopIteration not raised`). Fix: re-check `self.exhausted` AFTER `r = self.fn()`
+and raise `StopIteration` if a reentrant call exhausted the iterator.
+
+DEFERRED:
+- `test_builtin_zip`: see the corrected Cycle 5 re-triage below
+  (`Cycle5-D`). The root cause is file I/O (`open` + iterating a
+  `TextIOWrapper`), NOT the zip/iterator model and NOT an infinite loop.
+  Sentinel + vendored decorator LEFT IN PLACE.
+- `test_exception_locations`: asserts `traceback.extract_tb(...)[0].lineno` /
+  `colno` / `end_colno` equal the iterator-expression source location. Under
+  Dynamo the traceback points into compiled/resume code
+  (`AssertionError('377 != 1217')`), not the user source. Faithful traceback
+  line/column locations through compiled bytecode is a Dynamo mechanism concern
+  (broad infra), not an object-protocol gap. Sentinel LEFT IN PLACE.
+
+Files changed:
+- `torch/_dynamo/polyfills/builtins.py` (`import sys`; `_SequenceIterator`
+  `__next__` overflow guard + new `__setstate__`; `_CallableIterator.__next__`
+  reentrancy re-check)
+- `test/dynamo/test_misc.py` (`MiscTests`, all `fullgraph=True`):
+  `test_sequence_iter_setstate_negative_clamps`,
+  `test_sequence_iter_setstate_positive`, `test_sequence_iter_overflow`,
+  `test_callable_iter_reentrant_exhaustion`
+
+Sentinels removed (working tree, uncommitted):
+- `CPython313-test_iter-TestCase.test_iter_neg_setstate`
+- `CPython313-test_iter-TestCase.test_iter_overflow`
+- `CPython313-test_iter-TestCase.test_iter_function_concealing_reentrant_exhaustion`
+
+Sentinels LEFT IN PLACE: `test_builtin_zip`, `test_exception_locations`.
+
+Exact commands run and results (current tree):
+```bash
+# Three targets, sentinels removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_iter.py \
+  TestCase.test_iter_neg_setstate TestCase.test_iter_overflow \
+  TestCase.test_iter_function_concealing_reentrant_exhaustion
+# OK (each runs PASS)
+
+# Whole affected CPython file -> PASS, no new failures, no XPASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_iter.py
+# Ran 57 tests, OK (skipped=9)
+
+# New regression tests (fullgraph=True) -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_misc.py \
+  MiscTests.test_sequence_iter_setstate_negative_clamps \
+  MiscTests.test_sequence_iter_setstate_positive \
+  MiscTests.test_sequence_iter_overflow \
+  MiscTests.test_callable_iter_reentrant_exhaustion
+# Ran 4 tests, OK
+
+# Iterator sanity in test_misc -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_misc.py -k iter
+# Ran 47 tests, OK
+```
+
+Min-Python compat: only new import is `import sys` (stdlib, all versions); no
+typing changes. Python 3.10 not available locally; static audit only.
+
+Risks: low. Changes are confined to two polyfill iterator classes and mirror the
+documented CPython C algorithms. The `__setstate__` addition is a no-op for
+already-exhausted iterators (matches `it_seq != NULL`); the overflow guard only
+fires at `sys.maxsize`; the reentrancy re-check only changes behavior when a
+reentrant call exhausted the iterator mid-`fn()`.
+
+### Cycle5-D: test_builtin_zip re-triage (corrected root cause)
+
+Status: DEFERRED (Cycle 5, re-triage). Classification: out of scope (file I/O),
+NOT zip/iterator-exhaustion modeling. Vendored `@skipIfTorchDynamo("infinite
+loop")` decorator and sentinel LEFT IN PLACE.
+
+Target: `CPython313-test_iter-TestCase.test_builtin_zip`. The human explicitly
+authorized one vendored edit (removing the `@skipIfTorchDynamo` decorator) to
+investigate. The decorator was removed, the sentinel temporarily moved aside,
+and the test run under Dynamo with a 150s timeout. It does NOT hang -- it fails
+fast (0.38s).
+
+Corrected root cause (supersedes the earlier "vendored skip dominates" note):
+the decorator is a CONDITIONAL `skipIfTorchDynamo`, not an unconditional
+`@unittest.skip`, so with it removed the test body actually runs under Dynamo
+(`CPythonTestCase` compiles the whole method with `dynamo_strict_nopython=True`
+-> `error_on_graph_break=True`). The test then hard-errors at the file-I/O
+sub-case:
+
+```
+torch._dynamo.exc.Unsupported: Failed to trace builtin operator
+  Dynamo does not know how to trace builtin operator `open` with argument
+  types ['str', 'str'] (has_kwargs True)
+  from user code: test_iter.py:726  f = open(TESTFN, "w", encoding="utf-8")
+```
+
+(If `open` were supported, the subsequent `zip(IntsFrom(0), f, IntsFrom(-100))`
+would also need `tp_iter` on `TextIOWrapper`, separately confirmed unsupported:
+`missing tp_iter ... tp_iter_impl not implemented for TextIOWrapper`, gb0811.)
+
+The "infinite loop" in the decorator string is a STALE description from an older
+Dynamo; the current failure is a fast `open` graph break, not a hang.
+
+The zip / iterator-exhaustion model is NOT the blocker -- it is fully working.
+Every other sub-case of the test passes under `fullgraph=True` (with
+`enable_trace_load_build_class=True` to mirror `CPythonTestCase`):
+`zip()`, `zip(*[])`, `zip(*[(1,2),'ab'])`, the `TypeError` cases
+(`zip(None)`, `zip(range(10), 42)`, `zip(range(10), zip)`),
+`zip(IteratingSequenceClass(3))`, `zip(SequenceClass(3))`,
+dict `zip(d, d.values())`, `zip(range(5))`, and all the length-lying classes
+(`NoGuessLen5` / `Guess3Len5` / `Guess30Len5`, including the infinite
+`__getitem__` seq + the nested `lzip(x, y)` cross product). The infinite
+`IntsFrom` iterator zipped with a finite list also terminates correctly
+(`ZipVariable.tp_iternext_impl` propagates `ObservedUserStopIteration` and
+stops at the shortest iterable, mirroring CPython `zip_next`).
+
+Supporting `open()` and iterating file objects is file-I/O modeling, explicitly
+listed as out of scope under `CPYTHON_MIRRORING.md` (predictable semantic model,
+not a CPython runtime). It is unrelated to the zip gate. No source change made.
+The vendored decorator and the sentinel were both restored; the vendored
+test file is byte-identical to the upstream copy again.
+
+Repro evidence:
+
+```bash
+# Decorator + sentinel removed -> fast hard error on open (NOT a hang), 0.38s
+timeout 150 env CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  PYTORCH_TEST_WITH_DYNAMO=1 python test/cpython/v3_13/test_iter.py \
+  TestCase.test_builtin_zip
+# ERROR: Failed to trace builtin operator `open`; Ran 1 test in 0.384s, FAILED
+
+# All non-file sub-cases under fullgraph=True (build_class config) -> PASS
+# (agent_space/zip_repro4.py): zip empties, TypeError cases, sequence classes,
+# dict items, length-lying classes, infinite-getitem seq, lzip cross product.
+
+# Decorator + sentinel restored -> back to clean skip, no hang
+timeout 120 env CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  PYTORCH_TEST_WITH_DYNAMO=1 python test/cpython/v3_13/test_iter.py \
+  TestCase.test_builtin_zip
+# Ran 1 test in 0.351s, OK (skipped=1)
+```
+
 ## Proposed Gate Changes Awaiting Human Approval
 
 Use this section only when an implementation subagent believes a gate is too

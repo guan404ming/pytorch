@@ -35,9 +35,6 @@ CPython313-test_sort-TestBase.test_small_stability,74.2
 CPython313-test_deque-TestBasic.test_getitem,73.7
 CPython313-test_iter-TestCase.test_builtin_zip,73.7
 CPython313-test_iter-TestCase.test_exception_locations,73.7
-CPython313-test_iter-TestCase.test_iter_function_concealing_reentrant_exhaustion,73.7
-CPython313-test_iter-TestCase.test_iter_neg_setstate,73.7
-CPython313-test_iter-TestCase.test_iter_overflow,73.7
 CPython313-test_deque-TestSequence.test_constructors,73.4
 CPython313-test_operator-PyOperatorTestCase.test_index,73.4
 CPython313-test_tuple-TupleTest.test_track_subtypes,73.4
