@@ -1903,7 +1903,7 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
             b = max((1, 2), (3, 4))
             return a, b
 
-        opt_fn = torch.compile(fn, fullgraph=True)
+        opt_fn = torch.compile(fn, fullgraph=True, backend="eager")
         result = opt_fn()
         self.assertEqual(result, ((1, 2), (3, 4)))
 
@@ -9854,7 +9854,7 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         )
         torch._dynamo.mark_dynamic(x, 0)
         torch._dynamo.mark_dynamic(y, 0)
-        opt = torch.compile(fn, fullgraph=True)
+        opt = torch.compile(fn, fullgraph=True, backend="eager")
         opt(*inputs)
         with self.assertRaises(RuntimeError):
             inputs = (
@@ -15213,7 +15213,7 @@ fn
     @unittest.expectedFailure
     @torch._dynamo.config.patch(enable_trace_load_build_class=True)
     def test_return_obj___build_class__(self):
-        @torch.compile(fullgraph=True)
+        @torch.compile(fullgraph=True, backend="eager")
         def fn(t):
             # class is created with an EphemeralSource and
             # UserDefinedClassVariable has no `reconstruct` method
@@ -15930,7 +15930,7 @@ with torch.library._scoped_library("mylib_ci", "FRAGMENT") as lib:
             torch._dynamo.exc.Unsupported,
             r"requires_grad_\(\)(.|\n)*\.detach\(\)",
         ):
-            torch.compile(fn, fullgraph=True)(x)
+            torch.compile(fn, fullgraph=True, backend="eager")(x)
 
         # Without fullgraph, falls back to eager and is correct
         result = torch.compile(fn, backend="eager")(x)
@@ -15950,7 +15950,7 @@ with torch.library._scoped_library("mylib_ci", "FRAGMENT") as lib:
             torch._dynamo.exc.Unsupported,
             r"requires_grad_\(\)(.|\n)*\.detach\(\)",
         ):
-            torch.compile(fn, fullgraph=True)(x)
+            torch.compile(fn, fullgraph=True, backend="eager")(x)
 
         # Without fullgraph, falls back to eager and is correct
         result = torch.compile(fn, backend="eager")(x)

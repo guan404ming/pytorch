@@ -576,7 +576,7 @@ class UnspecTests(torch._dynamo.test_case.TestCase):
         x = torch.randn(20)
         torch._dynamo.mark_dynamic(x, 0)
 
-        @torch.compile()
+        @torch.compile()  # noqa: UNSPECIFIED_BACKEND
         def fn(x):
             y = x * 2
             comptime.graph_break()
@@ -971,7 +971,7 @@ class UnspecTests(torch._dynamo.test_case.TestCase):
                 return x * 2
 
         main_model = TestModel()
-        opt_model = torch.compile(main_model, mode="max-autotune", dynamic=True)
+        opt_model = torch.compile(main_model, mode="max-autotune", dynamic=True)  # noqa: UNSPECIFIED_BACKEND
 
         x1 = torch.rand(3, 5, 4, 8)
         x2 = torch.rand(1, 5, 4, 8)
@@ -1014,7 +1014,7 @@ class UnspecTests(torch._dynamo.test_case.TestCase):
                 return x * 2
 
         main_model = TestModel()
-        opt_model = torch.compile(main_model, mode="max-autotune", dynamic=True)
+        opt_model = torch.compile(main_model, mode="max-autotune", dynamic=True)  # noqa: UNSPECIFIED_BACKEND
 
         x1 = torch.rand(3, 5, 4, 8).to(memory_format=torch.channels_last)
         x2 = torch.rand(1, 5, 4, 8).to(memory_format=torch.channels_last)
@@ -1048,7 +1048,7 @@ class UnspecTests(torch._dynamo.test_case.TestCase):
         log_stream, ctx = logs_to_string("torch._dynamo.guards", "guards")
         with ctx():
             for key in [1.0, 2.0, 3.0]:
-                model = torch.compile(Module(key))
+                model = torch.compile(Module(key))  # noqa: UNSPECIFIED_BACKEND
                 model(x)
 
         guard_log = log_stream.getvalue()

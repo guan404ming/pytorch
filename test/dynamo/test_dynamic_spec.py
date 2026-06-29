@@ -692,7 +692,7 @@ class TestShapeVarCompile(TestCase):
         with self.assertRaisesRegex(
             TypeError, "dynamic spec expects a dict, ShapesSpec, or ParamsSpec"
         ):
-            torch.compile(lambda x: x, shapes_spec="not a spec")
+            torch.compile(lambda x: x, shapes_spec="not a spec")  # noqa: UNSPECIFIED_BACKEND
 
     @_fx_experimental_config.patch(no_data_dependent_graph_break=True)
     def test_min_max_bypasses_dde_on_branching(self):
@@ -2038,7 +2038,7 @@ class TestDynamicSpecDecoratorCompile(TestCase):
             ValueError,
             r"`@dynamic_spec\(\.\.\.\)` is attached.*AND a `dynamic_shapes=`",
         ):
-            torch.compile(
+            torch.compile(  # noqa: UNSPECIFIED_BACKEND
                 fn,
                 shapes_spec=ParamsSpec({"x": TensorSpec([ShapeVar("Z"), STATIC])}),
             )(torch.randn(8, 3))

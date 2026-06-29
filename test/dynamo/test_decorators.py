@@ -1750,7 +1750,7 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             g(torch.ones(3))
 
     def test_set_stance_force_backend(self):
-        @torch.compile
+        @torch.compile  # noqa: UNSPECIFIED_BACKEND
         def a(x):
             return x + 1
 
@@ -2493,7 +2493,7 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             wrapped_fn = torch.compiler.allow_in_graph(my_custom_function)
             return wrapped_fn(x)
 
-        compiled = torch.compile(forward, fullgraph=True)
+        compiled = torch.compile(forward, fullgraph=True)  # noqa: UNSPECIFIED_BACKEND
         with self.assertRaisesRegex(
             torch._dynamo.exc.Unsupported,
             "allow_in_graph",
