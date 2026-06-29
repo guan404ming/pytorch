@@ -2324,10 +2324,10 @@ communication mechanism.
           py::arg("rank"),
           py::arg("world_size"));
 
-  // Use OpaqueBase as the metaclass to allow isinstance(fake_obj, ProcessGroup)
+  // Use CustomClassBase as the metaclass to allow isinstance(fake_obj, ProcessGroup)
   // to work.
-  py::object opaque_base_module = py::module_::import("torch._opaque_base");
-  py::object opaque_base = opaque_base_module.attr("OpaqueBaseMeta");
+  py::object opaque_base_module = py::module_::import("torch._custom_class_base");
+  py::object opaque_base = opaque_base_module.attr("CustomClassBaseMeta");
 
   auto processGroup =
       intrusive_ptr_no_gil_destructor_trampoline_class_<

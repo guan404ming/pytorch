@@ -14,8 +14,8 @@ from typing import Any, TYPE_CHECKING, TypeGuard
 import torch
 from torch import Tensor
 from torch._C import _functionalization
+from torch._custom_class_base import CustomClassBase
 from torch._logging import getArtifactLogger
-from torch._opaque_base import OpaqueBase
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._subclasses.functional_tensor import FunctionalTensor
 from torch._subclasses.meta_utils import is_sparse_any
@@ -57,11 +57,11 @@ def sync_functional_tensor(t: torch.Tensor) -> None:
             match getattr(t, attr):
                 case Tensor() as inner:
                     sync_functional_tensor(inner)
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
     else:
         torch._sync(t)
@@ -107,11 +107,11 @@ def is_fun(t: object) -> TypeGuard[FunctionalTensor | Tensor]:
                         raise AssertionError(
                             "mixed functional/non-functional inner tensors"
                         )
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
         return got_fun or False
 
@@ -131,11 +131,11 @@ def has_data_mutation(t: object) -> bool:
                 case Tensor() as v:
                     if has_data_mutation(v):
                         return True
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
         return False
     else:
@@ -155,11 +155,11 @@ def are_all_mutations_hidden_from_autograd(t: object) -> bool:
                 case Tensor() as v:
                     if not are_all_mutations_hidden_from_autograd(v):
                         return False
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
         return True
     elif isinstance(t, torch.Tensor):
@@ -178,11 +178,11 @@ def are_all_mutations_under_no_grad_or_inference_mode(t: torch.Tensor) -> bool:
                 case Tensor() as v:
                     if not are_all_mutations_under_no_grad_or_inference_mode(v):
                         return False
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
         return True
     else:
@@ -203,11 +203,11 @@ def was_inductor_storage_resized(t: object) -> bool:
                         raise RuntimeError(
                             f"storage resizing is not supported on tensor subclass: {type(t)}"
                         )
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
         return False
     elif not isinstance(t, torch.Tensor):
@@ -243,11 +243,11 @@ def has_metadata_mutation(
                         check_only_storage_mutation=check_only_storage_mutation,
                     ):
                         return True
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
         return False
     else:
@@ -619,12 +619,12 @@ def _view_meta_matches_tensor(
                         out_inner, target_inner
                     ):
                         return False
-                case OpaqueBase():
+                case CustomClassBase():
                     if out_inner != target_inner:
                         return False
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
             continue
 
@@ -660,11 +660,11 @@ def maybe_get_output_view_meta_sequence(
                 inner_meta = maybe_get_output_view_meta_sequence(inner)
                 if inner_meta is not None:
                     attr_metas[attr] = inner_meta
-            case OpaqueBase():
+            case CustomClassBase():
                 pass
             case unexpected:
                 raise AssertionError(
-                    f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                    f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                 )
 
     if not attr_metas:
@@ -719,11 +719,11 @@ def was_tensor_updated(arg: torch.Tensor, new_arg: torch.Tensor) -> bool:
                 case Tensor() as v:
                     if was_tensor_updated(v, getattr(new_arg, attr)):
                         return True
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
         return False
     else:
@@ -753,11 +753,11 @@ def was_tensor_metadata_updated(arg: Any, new_arg: Any) -> bool:
                 case Tensor() as v:
                     if was_tensor_metadata_updated(v, getattr(new_arg, attr)):
                         return True
-                case OpaqueBase():
+                case CustomClassBase():
                     pass
                 case unexpected:
                     raise AssertionError(
-                        f"expected Tensor or OpaqueBase, got {type(unexpected)}"
+                        f"expected Tensor or CustomClassBase, got {type(unexpected)}"
                     )
         return False
     else:

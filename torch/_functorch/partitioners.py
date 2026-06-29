@@ -35,7 +35,7 @@ from torch._inductor.custom_graph_pass import (
     CustomRuntimeEstimator,
 )
 from torch._library.fake_class_registry import FakeScriptObject
-from torch._library.opaque_object import is_opaque_value
+from torch._library.opaque_object import is_custom_class_obj
 from torch._library.utils import is_builtin
 from torch._logging import LazyString, trace_structured
 from torch._logging._internal import trace_log
@@ -489,7 +489,7 @@ def _iter_input_exprs_without_replacements(val: Any) -> Iterator[sympy.Basic]:
         yield from _iter_input_exprs_without_replacements(val.storage_offset())
     elif val is None:
         pass
-    elif isinstance(val, torch.Generator) or is_opaque_value(val):
+    elif isinstance(val, torch.Generator) or is_custom_class_obj(val):
         pass
     elif isinstance(val, FakeScriptObject):
         pass

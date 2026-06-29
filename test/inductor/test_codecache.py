@@ -325,15 +325,15 @@ class MyModelConv2d(torch.nn.Module):
         return x
 
 
-class _CyclicOpaque(torch._opaque_base.OpaqueBase):
+class _CyclicOpaque(torch._custom_class_base.CustomClassBase):
     """Test helper: opaque type whose instances can form reference cycles."""
 
     def __init__(self):
         self.child = None
 
 
-if not torch._library.opaque_object.is_opaque_type(_CyclicOpaque):
-    torch._library.opaque_object.register_opaque_type(_CyclicOpaque, typ="reference")
+if not torch._library.opaque_object.is_custom_class(_CyclicOpaque):
+    torch._library.opaque_object.register_custom_class(_CyclicOpaque, typ="symbolic")
 
 
 def _custom_empty(*args: object, **kwargs: object) -> None:
