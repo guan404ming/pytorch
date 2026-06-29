@@ -322,13 +322,21 @@ class DeviceOpOverrides:
     def import_get_raw_stream_as(self, name: str) -> str:
         raise NotImplementedError
 
-    def set_device(self, device_idx: int) -> str:
+    def set_device(self, device_idx: int | str) -> str:
+        # device_idx is either a literal device index (int) or a code expression (str),
+        # e.g. current_device_idx_expr() under compile-on-one-rank.
         raise NotImplementedError
 
     def synchronize(self) -> str:
         raise NotImplementedError
 
-    def device_guard(self, device_idx: int) -> str:
+    def device_guard(self, device_idx: int | str) -> str:
+        raise NotImplementedError
+
+    def current_device_idx_expr(self) -> str:
+        # Runtime expression evaluating to the current device index. Used under
+        # compile-on-one-rank so the wrapper resolves its device at run time
+        # (rank-agnostic) instead of baking the compile-time index.
         raise NotImplementedError
 
     def current_stream(self) -> str:
