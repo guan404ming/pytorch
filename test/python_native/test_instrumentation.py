@@ -1,7 +1,9 @@
 # Owner(s): ["module: dsl-native-ops"]
 
+import ast
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -12,7 +14,7 @@ from torch._logging._internal import TorchLogsFormatter, trace_log
 from torch._native.instrumentation import (
     CompileEvent,
     instrument_cutedsl_compile,
-    instrument_triton_launch,
+    instrument_triton_kernel,
 )
 from torch.testing._internal.common_utils import run_tests, TestCase
 
@@ -29,32 +31,30 @@ _CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 
 class _FakeJITFunction:
-    """Stand-in for a ``@triton.jit`` kernel's cache surface.
+    """Stand-in for a ``@triton.jit`` kernel. GPU- and Triton-free.
 
-    ``instrument_triton_launch`` watches ``device_caches[dev][0]`` (the dict
-    of compiled variants). We model a single fake device and grow the dict
-    on each distinct ``key`` to simulate a Triton compile (miss); repeated
-    keys leave it unchanged (hit). GPU- and Triton-free.
+    ``instrument_triton_kernel`` watches ``device_caches[dev][0]`` (the dict
+    of compiled variants) and launches via ``kernel[grid](*args)``. We model
+    one fake device whose cache grows on each distinct ``variant`` kwarg (a
+    fresh Triton compile / miss); a repeated variant leaves it unchanged (a
+    cache hit).
     """
 
     def __init__(self):
         # defaultdict-like: one device "cuda:0", value is a (cache_dict, ...) tuple.
         self._cache: dict = {}
         self.device_caches = {"cuda:0": (self._cache, None)}
+        self.raise_on_launch = False
 
-    def launch(self, key):
-        if key not in self._cache:
-            self._cache[key] = object()
+    def __getitem__(self, grid):
+        def launcher(*args, variant="v0", **kwargs):
+            if self.raise_on_launch:
+                raise RuntimeError("kaboom")
+            if variant not in self._cache:
+                self._cache[variant] = object()
+            return "launched"
 
-
-# Module-level kernel + launcher: instrument_triton_launch resolves watched
-# kernels from the launcher's module globals, so both must live here.
-_FAKE_KERNEL = _FakeJITFunction()
-
-
-def _fake_launch(key="v0"):
-    _FAKE_KERNEL.launch(key)
-    return "launched"
+        return launcher
 
 
 class _FakeJitCache:
@@ -205,6 +205,33 @@ class TestInstrumentation(_LoggerCaptureTest):
         self.assertEqual(calls, [(256, 64)])
         self.assertEqual(len(self.messages), 1)
 
+    def test_no_work_when_not_listening(self):
+        # With no listener (logger above INFO, no trace handlers), the wrapper
+        # must run the wrapped fn but skip all instrumentation: no log line,
+        # and crucially no key_fn call (user code we shouldn't run for nothing).
+        key_calls = []
+
+        def key_fn(N, K):
+            key_calls.append((N, K))
+            return "k"
+
+        fake = _FakeJitCache()
+        compile_fn = instrument_cutedsl_compile("aten::topk", key_fn=key_fn)(fake)
+
+        self.log.setLevel(logging.WARNING)
+        saved = list(trace_log.handlers)
+        for h in saved:
+            trace_log.removeHandler(h)
+        try:
+            compile_fn(256, 64)
+        finally:
+            for h in saved:
+                trace_log.addHandler(h)
+
+        self.assertEqual(fake.misses, 1)  # wrapped fn still ran
+        self.assertEqual(key_calls, [])  # ... but no instrumentation work
+        self.assertEqual(self.messages, [])
+
     def test_compile_event_json_roundtrip(self):
         event = CompileEvent(
             op="aten::topk",
@@ -222,19 +249,16 @@ class TestInstrumentation(_LoggerCaptureTest):
         self.assertEqual(loaded["misses"], 1)
 
 
-class TestTritonLaunchInstrumentation(_LoggerCaptureTest):
-    def setUp(self):
-        super().setUp()
-        _FAKE_KERNEL._cache.clear()
+class TestTritonKernelInstrumentation(_LoggerCaptureTest):
+    GRID = (1,)
 
-    def tearDown(self):
-        _FAKE_KERNEL._cache.clear()
-        super().tearDown()
+    def _kernel(self, op="aten::bmm", key_fn=None):
+        return instrument_triton_kernel(op, key_fn=key_fn)(_FakeJITFunction())
 
     def test_first_launch_reports_compiled(self):
-        launch = instrument_triton_launch("aten::bmm")(_fake_launch)
+        kernel = self._kernel()
 
-        self.assertEqual(launch(), "launched")
+        self.assertEqual(kernel[self.GRID](), "launched")
 
         self.assertEqual(len(self.messages), 1)
         msg = self.messages[0]
@@ -243,44 +267,77 @@ class TestTritonLaunchInstrumentation(_LoggerCaptureTest):
         self.assertIn("compiled", msg)
 
     def test_repeated_launch_reports_cache_hit(self):
-        launch = instrument_triton_launch("aten::bmm")(_fake_launch)
+        kernel = self._kernel()
 
-        launch(key="v0")
-        launch(key="v0")
+        kernel[self.GRID](variant="v0")
+        kernel[self.GRID](variant="v0")
 
         self.assertIn("compiled", self.messages[0])
         self.assertIn("cache_hit", self.messages[1])
 
     def test_new_variant_recompiles(self):
-        launch = instrument_triton_launch("aten::bmm")(_fake_launch)
+        kernel = self._kernel()
 
-        launch(key="v0")
-        launch(key="v1")
+        kernel[self.GRID](variant="v0")
+        kernel[self.GRID](variant="v1")
 
         for msg in self.messages:
             self.assertIn("compiled", msg)
-        # Running variant count surfaces as misses=2 on the second compile.
+        # This kernel's running variant count surfaces as misses=2.
         self.assertIn("misses=2", self.messages[1])
 
     def test_error_is_reported_and_reraised(self):
-        def boom():
-            raise RuntimeError("kaboom")
+        fake = _FakeJITFunction()
+        fake.raise_on_launch = True
+        kernel = instrument_triton_kernel("aten::bmm")(fake)
 
-        launch = instrument_triton_launch("aten::bmm")(boom)
         with self.assertRaises(RuntimeError):
-            launch()
+            kernel[self.GRID]()
 
         self.assertEqual(len(self.messages), 1)
         self.assertIn("error", self.messages[0])
 
     def test_key_fn_used_in_log(self):
-        launch = instrument_triton_launch(
-            "aten::bmm", key_fn=lambda key="v0": f"variant={key}"
-        )(_fake_launch)
+        kernel = self._kernel(key_fn=lambda variant="v0": f"variant={variant}")
 
-        launch(key="abc")
+        kernel[self.GRID](variant="abc")
 
         self.assertIn("variant=abc", self.messages[0])
+
+    def test_two_kernels_in_one_module_dont_collide(self):
+        # The core guarantee of per-kernel scoping: each kernel watches only
+        # its own cache, so compiling kernel B must NOT make kernel A look
+        # like it compiled. The old module-scan summed both and would here
+        # falsely report A as "compiled" on its second call.
+        kernel_a = self._kernel(op="aten::a", key_fn=lambda variant="v0": "A")
+        kernel_b = self._kernel(op="aten::b", key_fn=lambda variant="v0": "B")
+
+        kernel_a[self.GRID](variant="v0")  # A compiles
+        kernel_b[self.GRID](variant="v0")  # B compiles (must not touch A)
+        kernel_a[self.GRID](variant="v0")  # A hit -- NOT a recompile
+
+        a_msgs = [m for m in self.messages if "aten::a" in m]
+        b_msgs = [m for m in self.messages if "aten::b" in m]
+        self.assertEqual(len(a_msgs), 2)
+        self.assertEqual(len(b_msgs), 1)
+        self.assertIn("compiled", a_msgs[0])
+        self.assertIn("cache_hit", a_msgs[1])  # would be "compiled" if collided
+        self.assertIn("compiled", b_msgs[0])
+        # Each reports its own variant count, not the module-wide sum.
+        self.assertIn("misses=1", a_msgs[1])
+
+    def test_jit_kernel_exposes_raw_kernel(self):
+        # wrap_triton needs the raw JITFunction; the proxy exposes it.
+        fake = _FakeJITFunction()
+        kernel = instrument_triton_kernel("aten::bmm")(fake)
+        self.assertIs(kernel.jit_kernel, fake)
+
+    def test_attribute_passthrough(self):
+        # Non-launch attribute access is delegated to the wrapped kernel.
+        fake = _FakeJITFunction()
+        fake.cache_key = "abc123"
+        kernel = instrument_triton_kernel("aten::bmm")(fake)
+        self.assertEqual(kernel.cache_key, "abc123")
 
 
 class TestTlparseOutput(TestCase):
@@ -299,8 +356,10 @@ class TestTlparseOutput(TestCase):
         # NB: this handler must be registered BEFORE the capture handler --
         # TorchLogsFormatter(trace=True) populates record.metadata as a side
         # effect of formatting, and the capture handler reads that field.
+        # delete=False: the file is reopened by name (for tlparse and the
+        # raw-content read), so don't let close() unlink it; tearDown removes it.
         self.raw_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
-            mode="w", delete=True
+            mode="w", delete=False
         )
         self.raw_handler = logging.StreamHandler(self.raw_file)
         self.raw_handler.setFormatter(TorchLogsFormatter(trace=True))
@@ -317,6 +376,7 @@ class TestTlparseOutput(TestCase):
         trace_log.removeHandler(self.capture)
         trace_log.removeHandler(self.raw_handler)
         self.raw_file.close()
+        os.unlink(self.raw_file.name)
         trace_log.setLevel(self.old_level)
         super().tearDown()
 
@@ -402,6 +462,274 @@ class TestTlparseOutput(TestCase):
             )
         finally:
             shutil.rmtree(out, ignore_errors=True)
+
+
+def _dotted(node):
+    """Dotted name of an AST expression, e.g. ``cute.compile`` / ``triton.jit``.
+
+    Unwraps a Call to its callee, so ``@deco(...)`` and ``deco(...)`` both
+    resolve to ``"deco"``. Returns "" for anything we don't model.
+    """
+    if isinstance(node, ast.Call):
+        return _dotted(node.func)
+    if isinstance(node, ast.Attribute):
+        return f"{_dotted(node.value)}.{node.attr}"
+    if isinstance(node, ast.Name):
+        return node.id
+    return ""
+
+
+def _decorator_names(fn_node):
+    """Set of dotted decorator names on a FunctionDef node.
+
+    e.g. ``@triton.jit`` -> "triton.jit", ``@instrument_triton_kernel(...)``
+    -> "instrument_triton_kernel".
+    """
+    return {_dotted(d) for d in fn_node.decorator_list}
+
+
+# One rule per DSL. ``jit_decorator`` is the DSL's raw cache/jit decorator;
+# ``instrument_decorator`` is the explicit instrumentation wrapper; and
+# ``combined_decorator`` is the one-decorator form that applies both. A
+# compile site satisfies the guard if it carries the combined decorator, OR
+# both the jit and instrument decorators explicitly. To onboard a new DSL,
+# add a row -- every scan and existence check below picks it up. All three
+# decorator names must be real entry points in torch._native.instrumentation
+# (instrument names) / the DSL (jit name); test_required_decorators_exist
+# enforces the instrumentation ones.
+_DSL_INSTRUMENTATION_RULES = (
+    # (dsl, jit_decorator, instrument_decorator, combined_decorator)
+    ("triton", "triton.jit", "instrument_triton_kernel", "instrumented_triton_cache"),
+    (
+        "cutedsl",
+        "jit_cache",
+        "instrument_cutedsl_compile",
+        "instrumented_cutedsl_cache",
+    ),
+)
+
+
+def _is_instrumented(decos, jit_deco, instrument_deco, combined_deco):
+    """True if a function's decorator set satisfies a DSL rule.
+
+    Either the one-shot combined decorator, or the explicit jit + instrument
+    stack.
+    """
+    return combined_deco in decos or (jit_deco in decos and instrument_deco in decos)
+
+
+def _scan_for_missing_instrumentation(source, label):
+    """Return (violations, n_compile_sites) for one Python source string.
+
+    A compile site is any function carrying a DSL rule's ``jit_decorator`` or
+    its ``combined_decorator``. A violation is such a site that isn't fully
+    instrumented (see :func:`_is_instrumented`). ``n_compile_sites`` lets
+    callers assert the scan saw something rather than passing vacuously.
+    """
+    violations = []
+    n_compile_sites = 0
+    tree = ast.parse(source, filename=label)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        decos = _decorator_names(node)
+        for _, jit_deco, instrument_deco, combined_deco in _DSL_INSTRUMENTATION_RULES:
+            if jit_deco in decos or combined_deco in decos:
+                n_compile_sites += 1
+                if not _is_instrumented(
+                    decos, jit_deco, instrument_deco, combined_deco
+                ):
+                    violations.append(
+                        f"{label}:{node.lineno} {node.name} has @{jit_deco} but "
+                        f"is not instrumented (use @{combined_deco}, or add "
+                        f"@{instrument_deco})"
+                    )
+    return violations, n_compile_sites
+
+
+# cute.compile must be cached so it is also instrumented: the enclosing
+# function must carry @jit_cache or the combined @instrumented_cutedsl_cache.
+# A raw call elsewhere would compile uncached *and* invisibly to the
+# instrumentation, so it is banned.
+_CACHED_COMPILE_CALL = "cute.compile"
+_CACHE_DECORATORS = ("jit_cache", "instrumented_cutedsl_cache")
+
+
+def _scan_for_raw_cute_compile(source, label):
+    """Return (violations, n_calls) for one Python source string.
+
+    A violation is a ``cute.compile`` call whose nearest enclosing function
+    carries neither ``@jit_cache`` nor ``@instrumented_cutedsl_cache`` (or
+    that sits at module level). ``n_calls`` counts compile calls seen.
+    """
+    tree = ast.parse(source, filename=label)
+    # Map each node to its parent so we can climb to the nearest FunctionDef.
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    def enclosing_function(node):
+        cur = parent.get(node)
+        while cur is not None:
+            if isinstance(cur, ast.FunctionDef):
+                return cur
+            cur = parent.get(cur)
+        return None
+
+    violations = []
+    n_calls = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and _dotted(node) == _CACHED_COMPILE_CALL):
+            continue
+        n_calls += 1
+        fn = enclosing_function(node)
+        cached = fn is not None and any(
+            d in _decorator_names(fn) for d in _CACHE_DECORATORS
+        )
+        if not cached:
+            where = fn.name if fn is not None else "<module level>"
+            allowed = " or ".join(f"@{d}" for d in _CACHE_DECORATORS)
+            violations.append(
+                f"{label}:{node.lineno} {_CACHED_COMPILE_CALL}() in {where} is "
+                f"not wrapped by {allowed}"
+            )
+    return violations, n_calls
+
+
+class TestInstrumentationCoverage(TestCase):
+    """CI guard: every DSL compile site must carry its instrumentation.
+
+    Static AST scan of ``torch/_native/ops`` -- adding a kernel for a known
+    DSL (per :data:`_DSL_INSTRUMENTATION_RULES`) without the matching
+    instrumentation decorator turns this test (and thus CI) red.
+
+    Extending to a new DSL: add a row to ``_DSL_INSTRUMENTATION_RULES``.
+
+    For CuTeDSL this also enforces the full chain: every ``cute.compile()``
+    must be wrapped by ``@jit_cache`` (``test_no_raw_cute_compile_calls``),
+    and every ``@jit_cache`` must be instrumented -- so no compile can escape
+    caching or instrumentation.
+
+    Out of scope by construction: ops that wrap *vendored* compile fns at the
+    call site (e.g. norm's rmsnorm, which has no local ``@jit_cache`` or
+    ``cute.compile``) aren't decorator/call sites here -- they have their own
+    tests.
+    """
+
+    def _ops_files(self):
+        import torch._native
+
+        ops_dir = os.path.join(os.path.dirname(torch._native.__file__), "ops")
+        for root, _, files in os.walk(ops_dir):
+            for name in files:
+                if name.endswith(".py"):
+                    yield os.path.join(root, name)
+
+    def test_required_decorators_exist(self):
+        # Ties each rule to the real API: a typo'd or removed instrumentation
+        # entry point fails here rather than letting the scan pass vacuously.
+        import torch._native.instrumentation as instr
+
+        for dsl, _, instrument_deco, combined_deco in _DSL_INSTRUMENTATION_RULES:
+            for name in (instrument_deco, combined_deco):
+                self.assertTrue(
+                    hasattr(instr, name),
+                    f"rule for DSL {dsl!r} names {name!r}, which is not in "
+                    f"torch._native.instrumentation",
+                )
+
+    def test_every_compile_site_is_instrumented(self):
+        missing = []
+        checked = 0
+        for path in self._ops_files():
+            with open(path) as f:
+                violations, n = _scan_for_missing_instrumentation(
+                    f.read(), os.path.relpath(path)
+                )
+            missing += violations
+            checked += n
+
+        self.assertTrue(checked, "scan found no compile sites -- test is stale")
+        self.assertEqual(
+            missing,
+            [],
+            "DSL compile sites missing instrumentation:\n" + "\n".join(missing),
+        )
+
+    def test_scan_flags_uninstrumented_kernel_per_dsl(self):
+        # Meta-test: prove the guard fires. For each DSL: a bare jit decorator
+        # (no instrumentation) must be flagged, while BOTH accepted forms --
+        # the explicit jit+instrument stack and the one-shot combined
+        # decorator -- must pass.
+        templates = {
+            # dsl: (bad, explicit_ok, combined_ok)
+            "triton": (
+                "@triton.jit\ndef k(): ...\n",
+                "@instrument_triton_kernel('aten::x')\n@triton.jit\ndef k(): ...\n",
+                "@instrumented_triton_cache('aten::x')\ndef k(): ...\n",
+            ),
+            "cutedsl": (
+                "@jit_cache\ndef c(): ...\n",
+                "@instrument_cutedsl_compile('aten::x')\n@jit_cache\ndef c(): ...\n",
+                "@instrumented_cutedsl_cache('aten::x')\ndef c(): ...\n",
+            ),
+        }
+        for dsl, (bad, explicit_ok, combined_ok) in templates.items():
+            bad_v, bad_n = _scan_for_missing_instrumentation(bad, f"<{dsl}-bad>")
+            self.assertEqual(bad_n, 1, f"{dsl}: scan didn't see the compile site")
+            self.assertEqual(
+                len(bad_v), 1, f"{dsl}: uninstrumented kernel was NOT flagged"
+            )
+
+            for form, src in (("explicit", explicit_ok), ("combined", combined_ok)):
+                v, n = _scan_for_missing_instrumentation(src, f"<{dsl}-{form}>")
+                self.assertEqual(n, 1, f"{dsl}/{form}: scan missed the site")
+                self.assertEqual(v, [], f"{dsl}/{form}: wrongly flagged")
+
+    def test_no_raw_cute_compile_calls(self):
+        # Caching is compulsory for cutedsl compiles: every cute.compile() must
+        # sit inside a function decorated with @jit_cache or the combined
+        # @instrumented_cutedsl_cache. A raw call would be uncached and
+        # invisible to instrumentation.
+        bad = []
+        seen = 0
+        for path in self._ops_files():
+            with open(path) as f:
+                violations, n = _scan_for_raw_cute_compile(
+                    f.read(), os.path.relpath(path)
+                )
+            bad += violations
+            seen += n
+
+        self.assertTrue(seen, "scan found no cute.compile calls -- test is stale")
+        self.assertEqual(
+            bad,
+            [],
+            "uncached cute.compile() calls:\n" + "\n".join(bad),
+        )
+
+    def test_scan_flags_raw_cute_compile(self):
+        # Meta-test: prove the caching requirement fires, and that both the raw
+        # @jit_cache and the combined decorator satisfy it.
+        raw = "def f():\n    return cute.compile(k)\n"
+        raw_v, raw_n = _scan_for_raw_cute_compile(raw, "<raw>")
+        self.assertEqual(raw_n, 1, "scan didn't see the cute.compile call")
+        self.assertEqual(len(raw_v), 1, "raw cute.compile was NOT flagged")
+
+        module_level = "x = cute.compile(k)\n"
+        ml_v, ml_n = _scan_for_raw_cute_compile(module_level, "<module>")
+        self.assertEqual(ml_n, 1)
+        self.assertEqual(len(ml_v), 1, "module-level cute.compile was NOT flagged")
+
+        for form, deco in (
+            ("jit_cache", "@jit_cache"),
+            ("combined", "@instrumented_cutedsl_cache('aten::x')"),
+        ):
+            src = f"{deco}\ndef f():\n    return cute.compile(k)\n"
+            v, n = _scan_for_raw_cute_compile(src, f"<{form}>")
+            self.assertEqual(n, 1)
+            self.assertEqual(v, [], f"{form}-wrapped cute.compile was wrongly flagged")
 
 
 if __name__ == "__main__":

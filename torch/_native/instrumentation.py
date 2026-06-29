@@ -30,14 +30,15 @@ counter advanced. They differ only in how a snapshot is sampled:
   ``cute.compile``, so the measured wall time *is* the compile time;
   otherwise the key was served from the in-memory or on-disk ``.o`` cache.
 
-* :func:`instrument_triton_launch` -- for Triton ``@triton.jit`` kernels,
+* :func:`instrument_triton_kernel` -- for Triton ``@triton.jit`` kernels,
   which compile *and* launch in one ``kernel[grid](...)`` call and keep
-  their own per-kernel cache (``JITFunction.device_caches``). The wrapper
-  watches that cache's running variant count, which plays the role of the
-  miss counter: a new entry means a fresh Triton compile fired this call.
-  Because compile and launch are fused, ``wall_ms`` on a miss is compile +
-  host-launch latency (compile dominates); on a hit it is just host-launch
-  latency.
+  their own per-kernel cache (``JITFunction.device_caches``). Stacked above
+  ``@triton.jit``, it wraps the kernel in a transparent proxy that watches
+  *that one kernel's* variant count; a launch that grows it means a fresh
+  compile. Scoping to the single kernel gives clean per-kernel attribution --
+  two kernels in one module never collide. Because compile and launch are
+  fused, ``wall_ms`` on a miss is compile + host-launch latency (compile
+  dominates); on a hit it is just host-launch latency.
 
 Both DSLs only expose miss-side signal directly (CuTeDSL's vendored cache
 reports aggregate counters; Triton's cache only grows), so finer reasons
@@ -54,7 +55,6 @@ from __future__ import annotations
 import functools
 import logging
 import time
-import weakref
 from dataclasses import asdict, dataclass
 from typing import Any, TYPE_CHECKING, TypeVar
 
@@ -65,8 +65,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CompileEvent",
+    "InstrumentedTritonKernel",
     "instrument_cutedsl_compile",
-    "instrument_triton_launch",
+    "instrument_triton_kernel",
+    "instrumented_cutedsl_cache",
+    "instrumented_triton_cache",
 ]
 
 log = logging.getLogger(__name__)
@@ -100,6 +103,23 @@ class CompileEvent:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _listening() -> bool:
+    """True if either sink would record an event.
+
+    Lets the wrapper skip all instrumentation work (cache sampling, timing,
+    key formatting, event construction) on the hot path when nothing is
+    listening -- important because the CuTeDSL wrapper sits on the compile
+    *cache* and so runs on every op call, cache hits included.
+
+    Mirrors the gates the sinks apply internally: the logger on its effective
+    level, and structured tracing on ``trace_log.handlers`` (the documented
+    "is tracing enabled" idiom, also used by ``trace_structured`` itself).
+    """
+    from torch._logging._internal import trace_log
+
+    return log.isEnabledFor(logging.INFO) or bool(trace_log.handlers)
 
 
 def _emit(event: CompileEvent) -> None:
@@ -171,6 +191,12 @@ def _make_wrapper(
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> R:
+        # Fast path: do nothing extra unless a sink is listening. This runs on
+        # every call to the wrapped fn (for CuTeDSL, every op invocation), so
+        # the no-listener cost must stay at one predicate check.
+        if not _listening():
+            return fn(*args, **kwargs)
+
         _, misses_before = sample()
         start = time.perf_counter()
         try:
@@ -263,15 +289,15 @@ def instrument_cutedsl_compile(
 
 
 def _triton_cache_size(kernel: Any) -> int | None:
-    """Total compiled-variant count across a JITFunction's per-device caches.
+    """Compiled-variant count across one JITFunction's per-device caches.
 
     Triton stores one entry per specialized variant in
     ``JITFunction.device_caches[device]``, a ``(kernel_cache, ...)`` tuple
     whose first element is the dict of compiled kernels. The count grows by
     one each time a new (signature, constexpr, options) variant compiles, so
-    a delta across a launch tells us whether this call triggered a compile.
-    Returns None if the object doesn't expose ``device_caches`` (e.g. a
-    plain callable in tests, or a future Triton that renames this).
+    a delta across a launch tells us whether *this* kernel compiled. Returns
+    None if the object doesn't expose ``device_caches`` (a future Triton that
+    renames this, or a non-kernel in tests).
     """
     caches = getattr(kernel, "device_caches", None)
     if caches is None:
@@ -282,61 +308,139 @@ def _triton_cache_size(kernel: Any) -> int | None:
         return None
 
 
-def instrument_triton_launch(
+class InstrumentedTritonKernel:
+    """Transparent proxy over a single ``@triton.jit`` kernel.
+
+    Watches only this kernel's ``device_caches``, so a launch that grows the
+    variant count is unambiguously *this* kernel compiling -- two kernels in
+    one module never collide. All attribute access except the ``kernel[grid]``
+    launch path is delegated to the wrapped kernel, so the proxy is a drop-in
+    for the original ``JITFunction`` for attribute/method use (``.warmup``,
+    ``.cache_key``).
+
+    Composition with ``torch.library.wrap_triton``: that API does a strict
+    ``isinstance(JITFunction)`` check and would reject this proxy, but it
+    targets a different path (export/tracing, where the compile does not run
+    through our eager launch). When a native op needs ``wrap_triton``, pass the
+    raw kernel via :attr:`jit_kernel`: ``wrap_triton(my_kernel.jit_kernel)``.
+    """
+
+    def __init__(
+        self,
+        kernel: Any,
+        op: str,
+        key_fn: Callable[..., str] | None,
+    ) -> None:
+        self._kernel = kernel
+        self._op = op
+        self._key_fn = key_fn
+
+    @property
+    def jit_kernel(self) -> Any:
+        """The wrapped raw ``JITFunction`` (e.g. for ``wrap_triton``)."""
+        return self._kernel
+
+    def _sample(self) -> tuple[int | None, int | None]:
+        # Triton has no hit counter; this kernel's variant count stands in for
+        # `misses`, so a delta across the launch means a fresh compile.
+        return None, _triton_cache_size(self._kernel)
+
+    def __getitem__(self, grid: Any) -> Callable[..., Any]:
+        # kernel[grid](*args) is the launch path -- wrap the bound launcher in
+        # the shared core so the compile that may fire inside it is recorded.
+        launcher = self._kernel[grid]
+        return _make_wrapper(launcher, self._op, "triton", self._key_fn, self._sample)
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate everything else (warmup, cache_key, wrap_triton hooks, ...)
+        # to the real kernel. Only triggered for names not set on the proxy.
+        return getattr(self._kernel, name)
+
+
+def instrument_triton_kernel(
+    op: str,
+    *,
+    key_fn: Callable[..., str] | None = None,
+) -> Callable[[Any], InstrumentedTritonKernel]:
+    """Instrument a single ``@triton.jit`` kernel, stacked above the jit::
+
+        @instrument_triton_kernel("aten::bmm")
+        @triton.jit
+        def _bmm_kernel(...): ...
+
+    Unlike CuTeDSL, a Triton kernel compiles lazily *inside* its
+    ``kernel[grid](...)`` launch and caches variants on the kernel object. So
+    rather than wrap a separate compile fn, wrap the kernel itself: the proxy
+    watches that one kernel's variant count and records a compile when the
+    launch grows it. Because compile and launch are fused, ``wall_ms`` on a
+    miss is compile + host-launch latency (compile dominates); on a hit it is
+    just host-launch latency.
+
+    Args:
+        op: Operator symbol being compiled for, e.g. ``"aten::bmm"``.
+        key_fn: Optional callable with the kernel's launch-arg signature
+            returning a short string for logs (the constexprs it sees, e.g.
+            ``BLOCK``, are the actual compile key). Defaults to a repr.
+    """
+
+    def decorator(kernel: Any) -> InstrumentedTritonKernel:
+        return InstrumentedTritonKernel(kernel, op, key_fn)
+
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Combined decorators: the recommended one-decorator surface for native ops.
+# They apply the DSL's own cache/jit *and* the instrumentation, so the op
+# author writes a single decorator on a bare function and can't get the
+# stacking order wrong. The lower-level instrument_* helpers above remain for
+# custom composition.
+# ---------------------------------------------------------------------------
+
+
+def instrumented_cutedsl_cache(
     op: str,
     *,
     key_fn: Callable[..., str] | None = None,
 ) -> Callable[[Callable[..., R]], Callable[..., R]]:
-    """Instrument a function that launches a Triton kernel.
+    """Cache + instrument a CuTeDSL compile function in one decorator::
 
-    Unlike CuTeDSL, a Triton ``@triton.jit`` kernel compiles lazily *inside*
-    its ``kernel[grid](...)`` launch and caches variants on the kernel
-    object itself. So rather than wrapping a separate compile function, wrap
-    the op's launch helper and pass the ``@triton.jit`` kernel(s) whose cache
-    should be watched.
+        @instrumented_cutedsl_cache("aten::topk")
+        def _compile_topk_radix(N, K, deterministic):
+            return cute.compile(...)
 
-    Args:
-        op: Operator symbol being compiled for, e.g. ``"aten::bmm"``.
-        key_fn: Optional callable with the wrapped launcher's signature
-            returning a short string describing the launch for logs.
-
-    The kernel(s) to watch are discovered lazily from the wrapped function's
-    module globals on first call (every ``@triton.jit`` object defined
-    there). This keeps the decorator import-light: no Triton import happens
-    at registration time, only on first launch.
-
-    Errors raised by the launch are timed, reported with ``outcome="error"``,
-    and re-raised unchanged.
+    Equivalent to ``instrument_cutedsl_compile(op) `` stacked above the
+    vendored ``@jit_cache``. ``jit_cache`` is imported lazily so plain
+    ``import torch._native`` doesn't pull in the CuTeDSL runtime.
     """
+    # Lazy import: quack.cache pulls in cutlass, absent on CPU-only builds.
+    from torch._vendor.quack.cache import jit_cache
 
     def decorator(fn: Callable[..., R]) -> Callable[..., R]:
-        # Resolved once on first call and cached. weakref so we never keep a
-        # JITFunction alive past its module.
-        watched: list[weakref.ref] = []
-        resolved = False
+        return instrument_cutedsl_compile(op, key_fn=key_fn)(jit_cache(fn))
 
-        def sample() -> tuple[int | None, int | None]:
-            # Triton has no hit counter; the total variant count across watched
-            # kernels stands in for `misses`, so a delta means a fresh compile.
-            nonlocal resolved
-            if not resolved:
-                resolved = True
-                module = __import__(fn.__module__, fromlist=["*"])
-                for value in vars(module).values():
-                    if _triton_cache_size(value) is not None:
-                        watched.append(weakref.ref(value))
-            total = 0
-            saw_any = False
-            for ref in watched:
-                kernel = ref()
-                if kernel is None:
-                    continue
-                size = _triton_cache_size(kernel)
-                if size is not None:
-                    saw_any = True
-                    total += size
-            return None, (total if saw_any else None)
+    return decorator
 
-        return _make_wrapper(fn, op, "triton", key_fn, sample)
+
+def instrumented_triton_cache(
+    op: str,
+    *,
+    key_fn: Callable[..., str] | None = None,
+) -> Callable[[Callable[..., R]], InstrumentedTritonKernel]:
+    """JIT + instrument a Triton kernel in one decorator::
+
+        @instrumented_triton_cache("aten::bmm")
+        def _bmm_kernel(...):  # bare kernel body, no @triton.jit
+            ...
+
+    Equivalent to ``instrument_triton_kernel(op)`` stacked above
+    ``@triton.jit``. ``triton`` is imported lazily so plain
+    ``import torch._native`` doesn't pull in the Triton runtime.
+    """
+    # Lazy import: keep Triton out of `import torch._native`.
+    import triton
+
+    def decorator(fn: Callable[..., R]) -> InstrumentedTritonKernel:
+        return instrument_triton_kernel(op, key_fn=key_fn)(triton.jit(fn))
 
     return decorator
