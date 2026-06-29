@@ -91,7 +91,8 @@ kernel void inner_contiguous_copy(
   int opos[max_ndim];
   pos_from_thread_index(int(thread_pos.y), opos, outer_sizes, ndim_outer);
   const auto in_base = offset_from_coord(opos, input_outer_strides, ndim_outer);
-  const auto out_base = offset_from_coord(opos, output_outer_strides, ndim_outer);
+  const auto out_base =
+      offset_from_coord(opos, output_outer_strides, ndim_outer);
   device uchar* o = output + out_base + pos;
   constant uchar* in = input + in_base + pos;
   uint n = min(16u, inner_bytes - pos);
@@ -101,20 +102,26 @@ kernel void inner_contiguous_copy(
     }
     return;
   }
-  uint align = (reinterpret_cast<device ulong>(o) | reinterpret_cast<constant ulong>(in)) & 15;
+  uint align = (reinterpret_cast<device ulong>(o) |
+                reinterpret_cast<constant ulong>(in)) &
+      15;
   if (align == 0) {
-    *reinterpret_cast<device uint4*>(o) = *reinterpret_cast<constant uint4*>(in);
+    *reinterpret_cast<device uint4*>(o) =
+        *reinterpret_cast<constant uint4*>(in);
   } else if ((align & 7) == 0) {
     for (uint k = 0; k < 2; ++k) {
-      reinterpret_cast<device uint2*>(o)[k] = reinterpret_cast<constant uint2*>(in)[k];
+      reinterpret_cast<device uint2*>(o)[k] =
+          reinterpret_cast<constant uint2*>(in)[k];
     }
   } else if ((align & 3) == 0) {
     for (uint k = 0; k < 4; ++k) {
-      reinterpret_cast<device uint*>(o)[k] = reinterpret_cast<constant uint*>(in)[k];
+      reinterpret_cast<device uint*>(o)[k] =
+          reinterpret_cast<constant uint*>(in)[k];
     }
   } else if ((align & 1) == 0) {
     for (uint k = 0; k < 8; ++k) {
-      reinterpret_cast<device ushort*>(o)[k] = reinterpret_cast<constant ushort*>(in)[k];
+      reinterpret_cast<device ushort*>(o)[k] =
+          reinterpret_cast<constant ushort*>(in)[k];
     }
   } else {
     for (uint k = 0; k < 16; ++k) {

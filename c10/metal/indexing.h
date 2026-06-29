@@ -165,11 +165,12 @@ kernel void unary_inner_contiguous(
   int pos[max_ndim];
   pos_from_thread_index(int(thread_pos.y), pos, outer_sizes, ndim_outer);
   const auto in_base = offset_from_coord(pos, input_outer_strides, ndim_outer);
-  const auto out_base = offset_from_coord(pos, output_outer_strides, ndim_outer);
+  const auto out_base =
+      offset_from_coord(pos, output_outer_strides, ndim_outer);
   constant T* in = reinterpret_cast<constant T*>(
       static_cast<constant char*>(input) + in_base);
-  device res_t* out =
-      reinterpret_cast<device res_t*>(static_cast<device char*>(output) + out_base);
+  device res_t* out = reinterpret_cast<device res_t*>(
+      static_cast<device char*>(output) + out_base);
   uint base = thread_pos.x * ILP_PER_THREAD;
   if (base + ILP_PER_THREAD <= inner) {
     array<T, ILP_PER_THREAD> tmp_in;
@@ -295,14 +296,15 @@ kernel void unary_inner_contiguous_castout(
           constant uint2& ndim_outtype,                                        \
           uint2 thread_pos);                                                   \
   template [[host_name(#NAME "_inner_contiguous_castout_" #DTYPE0)]]           \
-  kernel void ::c10::metal::unary_inner_contiguous_castout<DTYPE0, NAME##_functor>( \
-      device void* output,                                                     \
-      constant void* input,                                                    \
-      constant long* outer_sizes,                                              \
-      constant long* input_outer_strides,                                      \
-      constant long* output_outer_strides,                                     \
-      constant uint4& ndimO_inner_elem_outtype,                                \
-      uint2 thread_pos)
+  kernel void ::c10::metal::                                                   \
+      unary_inner_contiguous_castout<DTYPE0, NAME##_functor>(                  \
+          device void* output,                                                 \
+          constant void* input,                                                \
+          constant long* outer_sizes,                                          \
+          constant long* input_outer_strides,                                  \
+          constant long* output_outer_strides,                                 \
+          constant uint4& ndimO_inner_elem_outtype,                            \
+          uint2 thread_pos)
 
 #define DEFINE_UNARY_FLOATING_FUNCTOR(NAME)                                     \
   struct NAME##_functor {                                                       \
@@ -517,9 +519,10 @@ kernel void unary_inner_contiguous_castout(
   int pos[max_ndim];
   pos_from_thread_index(int(thread_pos.y), pos, outer_sizes, ndim_outer);
   const auto in_base = offset_from_coord(pos, input_outer_strides, ndim_outer);
-  const auto out_base = offset_from_coord(pos, output_outer_strides, ndim_outer);
-  constant Tin* in =
-      reinterpret_cast<constant Tin*>(static_cast<constant char*>(input) + in_base);
+  const auto out_base =
+      offset_from_coord(pos, output_outer_strides, ndim_outer);
+  constant Tin* in = reinterpret_cast<constant Tin*>(
+      static_cast<constant char*>(input) + in_base);
   uint base = thread_pos.x * ILP_PER_THREAD;
   if (base + ILP_PER_THREAD <= inner) {
     array<Tin, ILP_PER_THREAD> tmp_in;
@@ -534,11 +537,13 @@ kernel void unary_inner_contiguous_castout(
     }
 #pragma unroll
     for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      store_at_offs<res_t>(output, out_base + long(base + j) * elem, out_type, tmp_out[j]);
+      store_at_offs<res_t>(
+          output, out_base + long(base + j) * elem, out_type, tmp_out[j]);
     }
   } else {
     for (uint j = base; j < inner; ++j) {
-      store_at_offs<res_t>(output, out_base + long(j) * elem, out_type, f(in[j]));
+      store_at_offs<res_t>(
+          output, out_base + long(j) * elem, out_type, f(in[j]));
     }
   }
 }
@@ -771,15 +776,16 @@ kernel void binary_inner_contiguous(
   const uint inner = ndim_outer_inner.y;
   int pos[max_ndim];
   pos_from_thread_index(int(thread_pos.y), pos, outer_sizes, ndim_outer);
-  const auto out_base = offset_from_coord(pos, output_outer_strides, ndim_outer);
+  const auto out_base =
+      offset_from_coord(pos, output_outer_strides, ndim_outer);
   const auto in_base = offset_from_coord(pos, input_outer_strides, ndim_outer);
   const auto oth_base = offset_from_coord(pos, other_outer_strides, ndim_outer);
-  device res_t* out =
-      reinterpret_cast<device res_t*>(static_cast<device char*>(output) + out_base);
-  constant T* a =
-      reinterpret_cast<constant T*>(static_cast<constant char*>(input) + in_base);
-  constant T* b =
-      reinterpret_cast<constant T*>(static_cast<constant char*>(other) + oth_base);
+  device res_t* out = reinterpret_cast<device res_t*>(
+      static_cast<device char*>(output) + out_base);
+  constant T* a = reinterpret_cast<constant T*>(
+      static_cast<constant char*>(input) + in_base);
+  constant T* b = reinterpret_cast<constant T*>(
+      static_cast<constant char*>(other) + oth_base);
   uint base = thread_pos.x * ILP_PER_THREAD;
   if (base + ILP_PER_THREAD <= inner) {
     array<T, ILP_PER_THREAD> ta;
@@ -1100,16 +1106,17 @@ kernel void binary_alpha_dense_scalar_lhs_cast(
           constant uint3& ndim,                                                \
           uint tid);                                                           \
   template [[host_name(#NAME "_inner_contiguous_" #DTYPEO "_" #DTYPEI)]]       \
-  kernel void ::c10::metal::binary_inner_contiguous<DTYPEI, NAME##_functor, OMT>( \
-      device void* out,                                                        \
-      constant void* input,                                                    \
-      constant void* other,                                                    \
-      constant long* outer_sizes,                                              \
-      constant long* output_outer_strides,                                     \
-      constant long* input_outer_strides,                                      \
-      constant long* other_outer_strides,                                      \
-      constant uint2& ndim_outer_inner,                                        \
-      uint2 thread_pos);                                                       \
+  kernel void ::c10::metal::                                                   \
+      binary_inner_contiguous<DTYPEI, NAME##_functor, OMT>(                    \
+          device void* out,                                                    \
+          constant void* input,                                                \
+          constant void* other,                                                \
+          constant long* outer_sizes,                                          \
+          constant long* output_outer_strides,                                 \
+          constant long* input_outer_strides,                                  \
+          constant long* other_outer_strides,                                  \
+          constant uint2& ndim_outer_inner,                                    \
+          uint2 thread_pos);                                                   \
   template                                                                     \
       [[host_name(#NAME "_strided_cast_" #DTYPEO "_" #DTYPEI)]] kernel void :: \
           c10::metal::binary_strided_cast<DTYPEI, NAME##_functor, OMT>(        \

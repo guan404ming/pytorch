@@ -1061,8 +1061,8 @@ void MetalShaderLibrary::exec_unary_kernel(TensorIteratorBase& iter,
   const auto alpha_type = scalar_arg_type.has_value() ? scalar_arg_type.value() : iter.common_dtype();
   // Prefer the ILP inner_contiguous kernel over the per-element strided one once
   // the contiguous inner run amortizes the per-run outer-offset calc.
-  bool inner_contiguous = !is_contiguous && !alpha.has_value() &&
-      iter.shape()[0] >= INNER_CONTIGUOUS_MIN_EXTENT && isInnerContiguous(iter);
+  bool inner_contiguous =
+      !is_contiguous && !alpha.has_value() && iter.shape()[0] >= INNER_CONTIGUOUS_MIN_EXTENT && isInnerContiguous(iter);
   if (!is_contiguous && !alpha.has_value() && force_flavor) {
     if (*force_flavor == "strided")
       inner_contiguous = false;
@@ -1072,8 +1072,8 @@ void MetalShaderLibrary::exec_unary_kernel(TensorIteratorBase& iter,
   // Same-dtype identity copy has no functor: move the inner run as raw bytes
   // (widest aligned vector) so a narrow-dtype copy isn't capped at the typed
   // sizeof(T)*ILP bytes/thread.
-  const bool byte_copy = inner_contiguous && name == "copy_identity" &&
-      outputTensor.scalar_type() == inputTensor.scalar_type();
+  const bool byte_copy =
+      inner_contiguous && name == "copy_identity" && outputTensor.scalar_type() == inputTensor.scalar_type();
   // alpha kernels are registered under "_dense_" (unary_alpha_dense); only the
   // plain unary path has the new "_dense_scalar_" / "_dense_" (ILP) split.
   std::string_view dense_suffix;
@@ -1158,9 +1158,9 @@ void MetalShaderLibrary::exec_unary_kernel(TensorIteratorBase& iter,
         } else if (inner_contiguous) {
           const auto inner = static_cast<uint32_t>(iter.shape()[0]);
           const std::array<uint32_t, 4> packed = {static_cast<uint32_t>(iter.ndim() - 1),
-                                                   inner,
-                                                   static_cast<uint32_t>(c10::elementSize(outputTensor.scalar_type())),
-                                                   out_type};
+                                                  inner,
+                                                  static_cast<uint32_t>(c10::elementSize(outputTensor.scalar_type())),
+                                                  out_type};
           mtl_setBytes(computeEncoder, packed, bindInnerContiguousOuter(computeEncoder, iter, 2, {1, 0}));
           const auto inner_tiles =
               (static_cast<NSUInteger>(inner) + c10::metal::ILP_PER_THREAD - 1) / c10::metal::ILP_PER_THREAD;
@@ -1463,9 +1463,8 @@ void MetalShaderLibrary::exec_binary_kernel(TensorIteratorBase& iter,
     // TODO: Implicitly pass both input and output types to non-cast kernels
     // The ILP suffix carries the unroll width (e.g. dense_ilp4) so future
     // variants (ilp8, ...) can coexist; see C10_METAL_ILP_PER_THREAD_STR.
-    const auto suffix = iter.is_contiguous()
-        ? (dense_ilp ? "dense_ilp" C10_METAL_ILP_PER_THREAD_STR : "dense")
-        : (inner_contiguous ? "inner_contiguous" : "strided");
+    const auto suffix = iter.is_contiguous() ? (dense_ilp ? "dense_ilp" C10_METAL_ILP_PER_THREAD_STR : "dense")
+                                             : (inner_contiguous ? "inner_contiguous" : "strided");
     kernel_name = cast_needed ? fmt::format("{}_{}_cast_{}{}", name, suffix, cast_suffix_type, alpha_suffix)
                               : fmt::format("{}_{}_{}_{}{}",
                                             name,
