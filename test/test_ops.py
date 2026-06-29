@@ -2418,7 +2418,6 @@ class _TestTagsMode(TorchDispatchMode):
 # Test to verify the correctness for tags in `tags.yaml`, also available for access through `torch.Tags`
 @unMarkDynamoStrictTest
 class TestTags(TestCase):
-    @onlyCPU
     @skipOps(
         {
             skip("sparse.sampled_addmm"),
@@ -3067,7 +3066,7 @@ instantiate_device_type_tests(TestCompositeCompliance, globals())
 instantiate_device_type_tests(TestMathBits, globals())
 instantiate_device_type_tests(TestRefsOpsInfo, globals(), only_for="cpu")
 instantiate_device_type_tests(TestFakeTensor, globals())
-instantiate_device_type_tests(TestTags, globals())
+instantiate_device_type_tests(TestTags, globals(), only_for="cpu")
 instantiate_device_type_tests(TestForwardADWithScalars, globals())
 
 if __name__ == "__main__":
