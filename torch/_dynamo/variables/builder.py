@@ -2842,6 +2842,7 @@ class VariableBuilder:
         if (
             not _has_spec
             and not is_static_input
+            and not hasattr(value, "_dynamo_dynamic_indices")
             and (
                 isinstance(value, torch.nn.Parameter)
                 # mark tensor attributes of nn modules static
@@ -4680,9 +4681,13 @@ def _automatic_dynamic(
                         from torch.fx.experimental.symbolic_shapes import (
                             StrictMinMaxConstraint,
                         )
+                        from torch.utils._sympy.numbers import int_oo
 
                         constraint_size = StrictMinMaxConstraint(
-                            vr=ValueRanges(lower=dim_range.min, upper=dim_range.max),
+                            vr=ValueRanges(
+                                lower=-int_oo if dim_range.min is None else dim_range.min,
+                                upper=int_oo if dim_range.max is None else dim_range.max,
+                            ),
                             warn_only=False,
                         )
                 else:
