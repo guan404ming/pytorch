@@ -12,10 +12,12 @@ from torch._inductor.fx_passes.bucketing import (
     BucketMode,
     has_mergeable_all_gather_convert_dtype,
     is_all_gather_into_tensor as is_all_gather,
+    is_all_reduce_tensor,
     is_fsdp_all_gather,
     is_fsdp_reduce_scatter,
     is_reduce_scatter_tensor as is_reduce_scatter,
     merge_all_gather_bucket,
+    merge_all_reduce_bucket,
     merge_reduce_scatter_bucket,
 )
 from torch._inductor.fx_passes.overlap_preserving_bucketer import (
@@ -102,6 +104,11 @@ def _reduce_scatter_bucket_trace_inputs(coll_node: fx.Node) -> list[fx.Node]:
     return _bucket_trace_inputs(coll_node, coll_node.args[0], group_name_arg=3)
 
 
+def _all_reduce_bucket_trace_inputs(coll_node: fx.Node) -> list[fx.Node]:
+    # all_reduce(tensor, reduce_op, group_name): tensor at 0, group_name at 2.
+    return _bucket_trace_inputs(coll_node, coll_node.args[0], group_name_arg=2)
+
+
 def _move_wait_users_after_latest_inputs(
     graph: fx.Graph,
     replacements: dict[fx.Node, fx.Node],
@@ -162,7 +169,9 @@ def _move_overlap_nodes(
     for target, sources in overlap_deps.items():
         for source in sources:
             source_type = bucketed_node_types.get(source, "")
-            if source_type.startswith("bucketed_reduce_scatter"):
+            if source_type.startswith(
+                ("bucketed_reduce_scatter", "bucketed_all_reduce")
+            ):
                 rs_defer[target].append(source)
             elif source_type.startswith("bucketed_all_gather"):
                 ag_prefetch[target].append(source)
@@ -226,9 +235,13 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
             bucket_trace_inputs = _reduce_scatter_bucket_trace_inputs
             merge_bucket = merge_reduce_scatter_bucket
             node_type = "bucketed_reduce_scatter"
+        elif is_all_reduce_tensor(first):
+            bucket_trace_inputs = _all_reduce_bucket_trace_inputs
+            merge_bucket = merge_all_reduce_bucket
+            node_type = "bucketed_all_reduce"
         else:
             raise ValueError(
-                "bucket non all_gather/reduce_scatter node is not supported"
+                "bucket non all_gather/reduce_scatter/all_reduce node is not supported"
             )
 
         # coll_nodes order is used for tensor packing and may differ from
@@ -295,6 +308,7 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
             if not (
                 is_fsdp_all_gather(node, self.node_ancestors)
                 or is_fsdp_reduce_scatter(node)
+                or is_all_reduce_tensor(node)
             ):
                 continue
             key = get_full_bucket_key(node, "custom_ops")
@@ -435,13 +449,17 @@ class ManualOverlapScheduler(OverlapScheduler):
             if node in self.scheduled:
                 continue
 
-            if node_type == "bucketed_reduce_scatter":
-                # Collect reduce scatter start nodes (pre_bucket_rs and rs)
+            if node_type in ("bucketed_reduce_scatter", "bucketed_all_reduce"):
+                # Collect grad-reduction start nodes (pre_bucket_rs and rs, or
+                # the HSDP/DDP replicate all_reduce).
                 current_rs_start_nodes.append(node)
 
-            elif node_type == "bucketed_reduce_scatter_wait":
-                # When we see a wait node from a new RS, flush delayed waits
-                # with dependencies on previously collected RS start nodes
+            elif node_type in (
+                "bucketed_reduce_scatter_wait",
+                "bucketed_all_reduce_wait",
+            ):
+                # When we see a wait node from a new RS/AR, flush delayed waits
+                # with dependencies on previously collected start nodes
                 if current_rs_start_nodes:
                     for delayed in delayed_rs_wait_nodes:
                         for rs_start in current_rs_start_nodes:
