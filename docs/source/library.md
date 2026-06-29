@@ -16,6 +16,9 @@ For a detailed guide on effectively using these APIs, please see
 [PyTorch Custom Operators Landing Page](https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html)
 for more details on how to effectively use these APIs.
 
+To pass arbitrary user-defined "black box" objects (e.g. process groups or
+custom callables) into custom operators, see {ref}`opaque_objects`.
+
 ## Testing custom ops
 
 Use {func}`torch.library.opcheck` to test custom ops for incorrect usage of the
