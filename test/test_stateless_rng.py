@@ -553,6 +553,61 @@ class TestStatelessRNGCompile(TestCase):
 
         self.assertEqual(f(key), random.uniform(random.fold_in(key, 3), (100,)))
 
+    def test_factory_matches_inplace(self, device):
+        # The out-of-place uniform()/normal() route through the size-taking
+        # factory ops; they must match filling a buffer in-place.
+        key = random.key(42, device=device)
+        buf = torch.empty(1000, device=device)
+        random.uniform_(key, buf, low=2.0, high=5.0)
+        self.assertEqual(random.uniform(key, (1000,), low=2.0, high=5.0), buf)
+        random.normal_(key, buf, mean=1.0, std=3.0)
+        self.assertEqual(random.normal(key, (1000,), mean=1.0, std=3.0), buf)
+
+    def test_generation_avoids_wasted_copy(self, device):
+        # Generation fully overwrites its output, so neither path should copy it.
+        from functorch.compile import aot_function
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        aten = torch.ops.aten
+        key = random.key(42, device=device)
+
+        # Out-of-place lowers to the factory op: no dead empty, no clone.
+        fw_graphs = []
+
+        def fw(gm, inputs):
+            fw_graphs.append(gm)
+            return gm
+
+        def f(key):
+            return random.uniform(random.fold_in(key, 3), (128, 128))
+
+        aot_function(f, fw_compiler=fw)(key)
+        self.assertEqual(len(fw_graphs), 1)
+        nodes = fw_graphs[0].graph.nodes
+        targets = {n.target for n in nodes if n.op == "call_function"}
+        self.assertNotIn(aten.empty.memory_format, targets)
+        self.assertNotIn(aten.clone.default, targets)
+        self.assertIn(aten._philox_uniform.size, targets)
+
+        # In-place functional counterpart clones inside the kernel (not a graph
+        # node), so count clones directly.
+        class CloneCounter(TorchDispatchMode):
+            def __init__(self):
+                self.clones = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func is aten.clone.default:
+                    self.clones += 1
+                return func(*args, **(kwargs or {}))
+
+        buf = torch.empty(1024, device=device)
+        counter = CloneCounter()
+        with counter:
+            aten._philox_uniform(buf, key)
+            aten._philox_normal(buf, key)
+        self.assertEqual(counter.clones, 0)
+        self.assertIn(torch.ops.aten._philox_uniform.size, targets)
+
 
 instantiate_device_type_tests(TestStatelessRNGKey, globals(), only_for=("cuda",))
 instantiate_device_type_tests(TestStatelessRNGKeySplit, globals(), only_for=("cuda",))
