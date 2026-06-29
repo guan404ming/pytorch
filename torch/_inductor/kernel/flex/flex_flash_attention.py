@@ -240,45 +240,6 @@ def _hierarchical_indexer_cute(
     return indexer
 
 
-def _create_flex_flash_block_sparse_tensors(
-    kv_num_blocks: torch.Tensor,
-    kv_indices: torch.Tensor,
-    full_kv_num_blocks: torch.Tensor | None,
-    full_kv_indices: torch.Tensor | None,
-    sparse_q_block_size: int,
-    sparse_kv_block_size: int,
-) -> Any:
-    """Package FlexAttention BlockMask metadata for FA4."""
-    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
-
-    if full_kv_num_blocks is None:
-        full_kv_num_blocks = torch.zeros_like(kv_num_blocks)
-        full_kv_indices = torch.zeros_like(kv_indices)
-    elif full_kv_indices is None:
-        raise AssertionError("full_kv_indices must be provided with full_kv_num_blocks")
-
-    return BlockSparseTensorsTorch(
-        kv_num_blocks,
-        kv_indices,
-        full_kv_num_blocks,
-        full_kv_indices,
-        block_size=(sparse_q_block_size, sparse_kv_block_size),
-    )
-
-
-def _is_flex_flash_noop_block_mask(
-    sparse_q_block_size: int,
-    sparse_kv_block_size: int,
-    has_full_blocks: bool,
-) -> bool:
-    """Identify FlexAttention's synthetic dense BlockMask."""
-    return (
-        not has_full_blocks
-        and sparse_q_block_size == 1 << 30
-        and sparse_kv_block_size == 1 << 30
-    )
-
-
 @contextmanager
 def patch_fixed_layout_indexer_for_cutedsl():
     """
@@ -504,9 +465,6 @@ def create_flex_flash_attention_kernel(
         stride=[sympy.sympify(s) for s in output.get_stride()],
     )
 
-    sparse_q_block_size = V.graph.sizevars.guard_int(sparse_q_block_size)
-    sparse_kv_block_size = V.graph.sizevars.guard_int(sparse_kv_block_size)
-
     mask_graph_is_trivial = is_trivial_mask_graph(mask_graph.graph_module)
     score_graph_is_trivial = subgraph is None or is_trivial_score_graph(
         subgraph.graph_module
@@ -520,16 +478,15 @@ def create_flex_flash_attention_kernel(
     has_full_blocks = full_kv_num_blocks is not None
     if has_full_blocks and full_kv_indices is None:
         raise AssertionError("full_kv_indices must be provided with full_kv_num_blocks")
-    is_noop_block_mask = _is_flex_flash_noop_block_mask(
-        sparse_q_block_size,
-        sparse_kv_block_size,
-        has_full_blocks,
-    )
-    if has_mask_mod and is_noop_block_mask:
-        raise NotImplementedError(
-            "Flash attention with mask_mod but without block mask metadata is not supported yet"
+    is_noop_block_mask = not has_full_blocks and V.graph.sizevars.statically_known_true(
+        sympy.And(
+            sympy.Eq(sparse_q_block_size, 1 << 30),
+            sympy.Eq(sparse_kv_block_size, 1 << 30),
         )
-    needs_block_mask = not is_noop_block_mask
+    )
+    needs_block_mask = not (mask_graph_is_trivial and is_noop_block_mask)
+    sparse_q_block_size = V.graph.sizevars.guard_int(sparse_q_block_size)
+    sparse_kv_block_size = V.graph.sizevars.guard_int(sparse_kv_block_size)
 
     choices: list[Any] = []
     if flash_attention_cutedsl_template is None:
