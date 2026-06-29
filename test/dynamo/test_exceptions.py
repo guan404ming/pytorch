@@ -1492,6 +1492,49 @@ class ExceptionTests(torch._dynamo.test_case.TestCase):
         result = fn(t)
         self.assertEqual(result, ref_result)
 
+    @make_dynamo_test
+    def test_exception_custom_attribute(self):
+        e = RuntimeError("boom")
+        e.foo = 42
+        assert e.foo == 42  # noqa: S101
+
+    @make_dynamo_test
+    def test_exception_set_args_from_iterable(self):
+        e = RuntimeError("boom")
+        e.args = [1, 2, 3]
+        assert e.args == (1, 2, 3)  # noqa: S101
+
+    @make_dynamo_test
+    def test_exception_set_args_not_iterable(self):
+        e = RuntimeError("boom")
+        try:
+            e.args = 2
+        except TypeError as exc:
+            assert "object is not iterable" in str(exc)  # noqa: S101
+        else:
+            raise AssertionError
+
+    @make_dynamo_test
+    def test_exception_setstate_dict(self):
+        e = RuntimeError("boom")
+        e.__setstate__({"foo": 7})
+        assert e.foo == 7  # noqa: S101
+
+    @make_dynamo_test
+    def test_exception_setstate_none_noop(self):
+        e = RuntimeError("boom")
+        assert e.__setstate__(None) is None  # noqa: S101
+
+    @make_dynamo_test
+    def test_exception_setstate_not_dict(self):
+        e = RuntimeError("boom")
+        try:
+            e.__setstate__(2)
+        except TypeError as exc:
+            assert "state is not a dictionary" in str(exc)  # noqa: S101
+        else:
+            raise AssertionError
+
 
 instantiate_parametrized_tests(ExceptionTests)
 
