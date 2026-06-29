@@ -1472,6 +1472,12 @@ _cupti_monitor.enable_hes_early()
             )
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @unittest.skipUnless(
+        SM100OrLater,
+        "cuda_driver (cuLaunchKernelEx) activity is only emitted by the cuBLAS "
+        "kernel-launch path on sm_100+; pre-sm_100 archs route launches through "
+        "the runtime API and never surface a DRIVER record",
+    )
     def test_cupti_monitor_observed_kinds_present(self):
         # Every activity kind the ProfilerObserver subscribes to must surface in the
         # exported chrome trace. One workload exercises kernels, H2D/D2H memcpy, memset,
