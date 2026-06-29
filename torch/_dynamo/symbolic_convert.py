@@ -207,10 +207,12 @@ from .variables.user_defined import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Sequence
 
     from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.export.dynamic_shapes import _ConstraintTarget
 
+    from .backends.registry import CompilerFn
     from .package import CompilePackage
 
 log = logging.getLogger(__name__)
@@ -393,7 +395,7 @@ class LocalState:
 # Mutable box that is shared across restarts
 @dataclasses.dataclass
 class DistributedState:
-    compile_pg: Any
+    compile_pg: torch.distributed.ProcessGroup
     local_state: LocalState
     all_states: list[LocalState] | None = None
 
@@ -5337,7 +5339,7 @@ class InstructionTranslatorBase(
         if sys.version_info < (3, 11):
             push_types |= CO_GENERATOR
         if f_code.co_flags & (push_types):
-            self.push(BuiltinVariable(None))
+            self.push(BuiltinVariable(None))  # type: ignore[arg-type]
 
         self.inline_depth = inline_depth
         self.inconsistent_side_effects = False
@@ -5379,13 +5381,13 @@ class InstructionTranslator(InstructionTranslatorBase):
         f_globals: dict[str, Any],
         f_builtins: dict[str, Any],
         closure: tuple[Any, ...] | None,
-        torch_function_mode_stack: Any,
+        torch_function_mode_stack: list[torch.overrides.TorchFunctionMode],
         code_options: CodeOptions,
-        compiler_fn: Any,
+        compiler_fn: CompilerFn | None,
         one_graph: bool,
         export: bool,
-        export_constraints: Any,
-        frame_state: Any,
+        export_constraints: Sequence[_ConstraintTarget] | None,
+        frame_state: dict[str, int | FrameStateSizeEntry] | None,
         speculation_log: SpeculationLog,
         exn_vt_stack: ExceptionStack,
         distributed_state: DistributedState | None,

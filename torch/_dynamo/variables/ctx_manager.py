@@ -793,9 +793,9 @@ class InferenceModeVariable(ContextWrappingVariable):
 class GenericDeviceVariable(ContextWrappingVariable):
     """Abstract base for device context managers that swap the active device index."""
 
-    _exchange_fn: Any
-    _maybe_exchange_fn: Any
-    _get_device_index_fn: Any
+    _exchange_fn: Callable[..., Any]
+    _maybe_exchange_fn: Callable[..., Any]
+    _get_device_index_fn: Callable[..., Any]
 
     @classmethod
     def create(

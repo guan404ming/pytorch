@@ -344,7 +344,7 @@ class BaseBuiltinVariable(VariableTracker):
     and overrides as_python_constant / reconstruct / var_getattr accordingly.
     """
 
-    _fn: Any = None
+    _fn: Callable[..., Any] | None = None
 
     @classmethod
     def create_with_source(cls, value: Any, source: Source) -> "BaseBuiltinVariable":
@@ -884,7 +884,7 @@ class BuiltinVariable(BaseBuiltinVariable):
         {dict, getattr, hasattr, iter, list, setattr}
     )
 
-    def __init__(self, fn: Any, **kwargs: Any) -> None:
+    def __init__(self, fn: Callable[..., Any], **kwargs: Any) -> None:
         if fn in self.MUST_USE_SPECIALIZED:
             raise AssertionError(
                 f"Use the specialized VT class for {fn!r}, not BuiltinVariable. "
@@ -1670,7 +1670,7 @@ class BuiltinVariable(BaseBuiltinVariable):
                     tx=tx,
                 )
 
-        if name in _BUILTIN_CONSTANT_FOLDABLE_METHODS.get(self.fn, ()):
+        if name in _BUILTIN_CONSTANT_FOLDABLE_METHODS.get(self.fn, ()):  # type: ignore[arg-type]
             if all(a.is_python_constant() for a in args) and all(
                 v.is_python_constant() for v in kwargs.values()
             ):

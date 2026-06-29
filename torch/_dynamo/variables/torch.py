@@ -33,7 +33,7 @@ import math
 import re
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
-from typing import Any, NoReturn, TYPE_CHECKING, TypeVar, Union
+from typing import Any, cast, NoReturn, TYPE_CHECKING, TypeVar, Union
 from typing_extensions import TypeIs
 
 import torch._C
@@ -2103,12 +2103,11 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
             self, tx: "InstructionTranslatorBase", *terms: VariableTracker
         ) -> VariableTracker | None:
             if all(isinstance(x, SymNodeVariable) for x in terms):
+                proxy = torch.fx.experimental.symbolic_shapes.sym_and(
+                    *(x.as_proxy() for x in terms)
+                )
                 return SymNodeVariable.create(
-                    tx,
-                    torch.fx.experimental.symbolic_shapes.sym_and(
-                        *(x.as_proxy() for x in terms)
-                    ),
-                    sym_num=None,
+                    tx, cast("torch.fx.Proxy", proxy), sym_num=None
                 )
             return None
 
@@ -2117,12 +2116,11 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
             self, tx: "InstructionTranslatorBase", *terms: VariableTracker
         ) -> VariableTracker | None:
             if all(isinstance(x, SymNodeVariable) for x in terms):
+                proxy = torch.fx.experimental.symbolic_shapes.sym_or(
+                    *(x.as_proxy() for x in terms)
+                )
                 return SymNodeVariable.create(
-                    tx,
-                    torch.fx.experimental.symbolic_shapes.sym_or(
-                        *(x.as_proxy() for x in terms)
-                    ),
-                    sym_num=None,
+                    tx, cast("torch.fx.Proxy", proxy), sym_num=None
                 )
             return None
 
