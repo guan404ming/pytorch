@@ -990,6 +990,7 @@ class BundledShaderLibrary : public MetalShaderLibrary {
 };
 
 // Inner extent below which the per-element strided kernel beats the ILP tile.
+// Measured safe for both unary and binary, so a single shared value suffices.
 static constexpr int64_t INNER_CONTIGUOUS_MIN_EXTENT = 16;
 
 // True for a strided view whose innermost coalesced dim is unit-stride for every

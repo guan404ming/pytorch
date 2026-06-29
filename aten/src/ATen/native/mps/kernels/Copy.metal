@@ -102,9 +102,7 @@ kernel void inner_contiguous_copy(
     }
     return;
   }
-  uint align = (reinterpret_cast<device ulong>(o) |
-                reinterpret_cast<constant ulong>(in)) &
-      15;
+  uint align = (reinterpret_cast<ulong>(o) | reinterpret_cast<ulong>(in)) & 15;
   if (align == 0) {
     *reinterpret_cast<device uint4*>(o) =
         *reinterpret_cast<constant uint4*>(in);
