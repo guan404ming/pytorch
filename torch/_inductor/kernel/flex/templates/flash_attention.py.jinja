@@ -119,7 +119,6 @@
         {% if HAS_FULL_BLOCKS %}FULL_KV_IDX{% else %}None{% endif %},
         {{SPARSE_Q_BLOCK_SIZE}},
         {{SPARSE_KV_BLOCK_SIZE}},
-        {{FLASH_SPARSE_KV_BLOCK_SIZE}},
     )
     {% else %}
     block_sparse_tensors = None

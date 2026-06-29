@@ -240,22 +240,6 @@ def _hierarchical_indexer_cute(
     return indexer
 
 
-def _expand_flex_flash_kv_blocks(
-    kv_num_blocks: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_block_split: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split FlexAttention KV block metadata into FA4 tile-sized KV blocks."""
-    if kv_block_split == 1:
-        return kv_num_blocks, kv_indices
-    kv_offsets = torch.arange(
-        kv_block_split, device=kv_indices.device, dtype=kv_indices.dtype
-    )
-    return kv_num_blocks * kv_block_split, (
-        kv_indices.unsqueeze(-1) * kv_block_split + kv_offsets
-    ).flatten(-2)
-
-
 def _create_flex_flash_block_sparse_tensors(
     kv_num_blocks: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -263,49 +247,23 @@ def _create_flex_flash_block_sparse_tensors(
     full_kv_indices: torch.Tensor | None,
     sparse_q_block_size: int,
     sparse_kv_block_size: int,
-    flash_sparse_kv_block_size: int,
 ) -> Any:
-    """Adapt FlexAttention BlockMask metadata to FA4 block-sparse metadata."""
+    """Package FlexAttention BlockMask metadata for FA4."""
     from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 
-    if sparse_kv_block_size % flash_sparse_kv_block_size != 0:
-        raise ValueError(
-            "Flex FLASH sparse KV block size must be divisible by the FA4 KV tile size. "
-            f"Got sparse_kv_block_size={sparse_kv_block_size} and "
-            f"flash_sparse_kv_block_size={flash_sparse_kv_block_size}."
-        )
-
-    kv_block_split = sparse_kv_block_size // flash_sparse_kv_block_size
-    kv_num_blocks, kv_indices = _expand_flex_flash_kv_blocks(
-        kv_num_blocks, kv_indices, kv_block_split
-    )
     if full_kv_num_blocks is None:
         full_kv_num_blocks = torch.zeros_like(kv_num_blocks)
         full_kv_indices = torch.zeros_like(kv_indices)
     elif full_kv_indices is None:
         raise AssertionError("full_kv_indices must be provided with full_kv_num_blocks")
-    else:
-        full_kv_num_blocks, full_kv_indices = _expand_flex_flash_kv_blocks(
-            full_kv_num_blocks, full_kv_indices, kv_block_split
-        )
 
     return BlockSparseTensorsTorch(
         kv_num_blocks,
         kv_indices,
         full_kv_num_blocks,
         full_kv_indices,
-        block_size=(sparse_q_block_size, flash_sparse_kv_block_size),
+        block_size=(sparse_q_block_size, sparse_kv_block_size),
     )
-
-
-def _get_flex_flash_sparse_kv_block_size(
-    device: torch.device, sparse_kv_block_size: int
-) -> int:
-    """Return the FA4 KV tile size used to represent Flex block-sparse metadata."""
-    major = torch.cuda.get_device_capability(device)[0]
-    if major in (10, 11) and sparse_kv_block_size % 128 == 0:
-        return 128
-    return sparse_kv_block_size
 
 
 def _is_flex_flash_noop_block_mask(
@@ -572,9 +530,6 @@ def create_flex_flash_attention_kernel(
             "Flash attention with mask_mod but without block mask metadata is not supported yet"
         )
     needs_block_mask = not is_noop_block_mask
-    flash_sparse_kv_block_size = _get_flex_flash_sparse_kv_block_size(
-        device, sparse_kv_block_size
-    )
 
     choices: list[Any] = []
     if flash_attention_cutedsl_template is None:
@@ -642,7 +597,6 @@ def create_flex_flash_attention_kernel(
                 HAS_FULL_BLOCKS=has_full_blocks,
                 SPARSE_Q_BLOCK_SIZE=sparse_q_block_size,
                 SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size,
-                FLASH_SPARSE_KV_BLOCK_SIZE=flash_sparse_kv_block_size,
             )
         if error is not None and len(configs) == 1:
             raise RuntimeError(f"CuteDSL template failed: {error}")

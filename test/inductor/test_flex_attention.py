@@ -4635,22 +4635,23 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         if not ensure_flash_available():
             self.skipTest("flash-attn-4 is not available")
         if torch.cuda.get_device_capability(device)[0] not in (10, 11):
-            self.skipTest("FA4 sparse block normalization in this test targets SM100+")
+            self.skipTest("FA4 sparse block path in this test targets SM100+")
 
         torch.manual_seed(0)
-        batch, heads, q_blocks, kv_blocks, block_size, head_dim, top_k = (
+        batch, heads, q_blocks, kv_blocks, q_block_size, kv_block_size, head_dim, top_k = (
             1,
             1,
             2,
             2,
             256,
             128,
+            128,
             1,
         )
         q = torch.randn(
             batch,
             heads,
-            q_blocks * block_size,
+            q_blocks * q_block_size,
             head_dim,
             device=device,
             dtype=torch.bfloat16,
@@ -4658,7 +4659,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         k = torch.randn(
             batch,
             heads,
-            kv_blocks * block_size,
+            kv_blocks * kv_block_size,
             head_dim,
             device=device,
             dtype=torch.bfloat16,
@@ -4666,7 +4667,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         v = torch.randn(
             batch,
             heads,
-            kv_blocks * block_size,
+            kv_blocks * kv_block_size,
             head_dim,
             device=device,
             dtype=torch.bfloat16,
@@ -4691,8 +4692,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             batch, heads, q_blocks, kv_blocks, device=device, dtype=torch.bool
         )
         block_map.scatter_(-1, selected.long(), True)
-        dense_mask = block_map.repeat_interleave(block_size, -2).repeat_interleave(
-            block_size, -1
+        dense_mask = block_map.repeat_interleave(q_block_size, -2).repeat_interleave(
+            kv_block_size, -1
         )
         ref = (
             torch.softmax(
@@ -4710,14 +4711,14 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 kv_indices=zero_indices,
                 full_kv_num_blocks=num_blocks,
                 full_kv_indices=sparse_indices,
-                BLOCK_SIZE=block_size,
-                seq_lengths=(q_blocks * block_size, kv_blocks * block_size),
+                BLOCK_SIZE=(q_block_size, kv_block_size),
+                seq_lengths=(q_blocks * q_block_size, kv_blocks * kv_block_size),
             ),
             "partial": BlockMask.from_kv_blocks(
                 kv_num_blocks=num_blocks,
                 kv_indices=sparse_indices,
-                BLOCK_SIZE=block_size,
-                seq_lengths=(q_blocks * block_size, kv_blocks * block_size),
+                BLOCK_SIZE=(q_block_size, kv_block_size),
+                seq_lengths=(q_blocks * q_block_size, kv_blocks * kv_block_size),
             ),
         }
         flash = torch.compile(
