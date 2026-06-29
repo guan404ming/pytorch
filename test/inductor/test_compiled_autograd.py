@@ -4074,8 +4074,8 @@ class CompiledAutograd0(torch.nn.Module):
         getitem_18 = packed_data[0]
         getitem_19 = hooks[1]
         getitem_20 = packed_data[1]
-        call_hook = torch__dynamo_external_utils_call_hook(getitem_17, getitem_18, hook_type = 'unpack_hook');  getitem_17 = getitem_18 = None
-        call_hook_1 = torch__dynamo_external_utils_call_hook(getitem_19, getitem_20, hook_type = 'unpack_hook');  getitem_19 = getitem_20 = None
+        call_hook = torch__dynamo_external_utils_call_hook(getitem_17, 'unpack_hook', getitem_18);  getitem_17 = getitem_18 = None
+        call_hook_1 = torch__dynamo_external_utils_call_hook(getitem_19, 'unpack_hook', getitem_20);  getitem_19 = getitem_20 = None
         mul_backward0 = torch__dynamo_compiled_autograd_ops_MulBackward0([getitem_16], [True, True], call_hook, 6, call_hook_1, 6);  getitem_16 = call_hook = call_hook_1 = None
         getitem_21 = mul_backward0[0]
         getitem_22 = mul_backward0[1];  mul_backward0 = None
@@ -4085,7 +4085,7 @@ class CompiledAutograd0(torch.nn.Module):
 
         getitem_25 = hooks[2]
         getitem_26 = packed_data[2]
-        call_hook_2 = torch__dynamo_external_utils_call_hook(getitem_25, getitem_26, hook_type = 'unpack_hook');  getitem_25 = getitem_26 = None
+        call_hook_2 = torch__dynamo_external_utils_call_hook(getitem_25, 'unpack_hook', getitem_26);  getitem_25 = getitem_26 = None
         cos_backward0 = torch__dynamo_compiled_autograd_ops_CosBackward0([getitem_24], [True], call_hook_2);  getitem_24 = call_hook_2 = None
         getitem_27 = cos_backward0[0];  cos_backward0 = None
         validate_outputs_3 = torch__dynamo_compiled_autograd_ops_validate_outputs([getitem_27], [((None, None, device(type='cpu'), 6, 0, None), [unwrap_maybe_dynamic_int_8, unwrap_maybe_dynamic_int_9], False, 6)]);  getitem_27 = unwrap_maybe_dynamic_int_8 = unwrap_maybe_dynamic_int_9 = None
@@ -4094,7 +4094,7 @@ class CompiledAutograd0(torch.nn.Module):
 
         getitem_29 = hooks[3];  hooks = None
         getitem_30 = packed_data[3];  packed_data = None
-        call_hook_3 = torch__dynamo_external_utils_call_hook(getitem_29, getitem_30, hook_type = 'unpack_hook');  getitem_29 = getitem_30 = None
+        call_hook_3 = torch__dynamo_external_utils_call_hook(getitem_29, 'unpack_hook', getitem_30);  getitem_29 = getitem_30 = None
         sin_backward0 = torch__dynamo_compiled_autograd_ops_SinBackward0([add], [True], call_hook_3);  add = call_hook_3 = None
         getitem_31 = sin_backward0[0];  sin_backward0 = None
         validate_outputs_4 = torch__dynamo_compiled_autograd_ops_validate_outputs([getitem_31], [((None, None, device(type='cpu'), 6, 0, None), [unwrap_maybe_dynamic_int_10, unwrap_maybe_dynamic_int_11], False, 6)]);  getitem_31 = unwrap_maybe_dynamic_int_10 = unwrap_maybe_dynamic_int_11 = None
@@ -4169,7 +4169,7 @@ class CompiledAutograd1(torch.nn.Module):
         getitem_8 = hooks[0]
         getitem_9 = packed_data[0];  packed_data = None
         getitem_10 = hooks[1];  hooks = None
-        call_hook = torch__dynamo_external_utils_call_hook(getitem_8, getitem_9, hook_type = 'unpack_hook');  getitem_8 = getitem_9 = None
+        call_hook = torch__dynamo_external_utils_call_hook(getitem_8, 'unpack_hook', getitem_9);  getitem_8 = getitem_9 = None
         call_backward = torch__dynamo_external_utils_call_backward(getitem_10, (call_hook,), getitem_7);  getitem_10 = call_hook = getitem_7 = None
         getitem_12 = call_backward[0];  call_backward = None
         validate_outputs_2 = torch__dynamo_compiled_autograd_ops_validate_outputs([getitem_12], [((None, None, device(type='cuda', index=0), 6, 0, None), [getitem_3], False)]);  getitem_12 = getitem_3 = None
@@ -4254,7 +4254,7 @@ class CompiledAutograd1(torch.nn.Module):
         getitem_7 = hooks[0]
         getitem_8 = packed_data[0];  packed_data = None
         getitem_9 = hooks[1];  hooks = None
-        call_hook = torch__dynamo_external_utils_call_hook(getitem_7, getitem_8, hook_type = 'unpack_hook');  getitem_7 = getitem_8 = None
+        call_hook = torch__dynamo_external_utils_call_hook(getitem_7, 'unpack_hook', getitem_8);  getitem_7 = getitem_8 = None
         call_backward = torch__dynamo_external_utils_call_backward(getitem_9, (call_hook,), getitem_6);  getitem_9 = call_hook = getitem_6 = None
         getitem_11 = call_backward[0];  call_backward = None
         validate_outputs_2 = torch__dynamo_compiled_autograd_ops_validate_outputs([getitem_11], [((None, None, device(type='cpu'), 6, 0, None), [getitem_3], False)]);  getitem_11 = getitem_3 = None

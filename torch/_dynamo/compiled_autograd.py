@@ -21,7 +21,7 @@ import operator
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Generator, Sequence
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 import torch
 import torch.utils._pytree as pytree
@@ -78,6 +78,14 @@ TURN_OFF_MSG = """You can turn off compiled autograd by either:
 
 compiled_autograd_log = getArtifactLogger(__name__, "compiled_autograd")
 verbose_log = getArtifactLogger(__name__, "compiled_autograd_verbose")
+
+HookType = Literal[
+    "unpack_hook",
+    "tensor_pre_hook",
+    "pre_hook",
+    "post_hook",
+    "post_acc_grad_hook",
+]
 
 
 def snapshot_verbose_logging_enabled() -> bool:
@@ -884,16 +892,17 @@ class AutogradCompilerInstance:
         return result
 
     def proxy_call_hook(
-        self, hook: Callable[..., Any], *args: Any, **kwargs: Any
+        self, hook: Callable[..., Any], hook_type: HookType, *args: Any
     ) -> torch.fx.Proxy:
         return self.fx_tracer.create_proxy(
             "call_function",
             call_hook,
             (
                 hook,
+                hook_type,
                 *[self.to_proxy(x) for x in args],
             ),
-            kwargs,
+            {},
         )
 
     def unpack_hook(self, hook_id: int, data_id: int) -> torch.Tensor:
@@ -903,8 +912,8 @@ class AutogradCompilerInstance:
         data = self.packed_data_proxy[data_id]  # type: ignore[index]
         proxy = self.proxy_call_hook(
             hook,
+            "unpack_hook",
             data,
-            hook_type="unpack_hook",
         )
         out = self.allocate_dummy()
         self.bind_objects_to_proxies([out], [proxy])
@@ -918,8 +927,8 @@ class AutogradCompilerInstance:
         hook = self.hooks_proxy[hook_id]  # type: ignore[index]
         proxy = self.proxy_call_hook(
             hook,
+            "tensor_pre_hook",
             inputs[i],
-            hook_type="tensor_pre_hook",
         )
         with disable_proxy_modes_tracing():
             inputs[i] = maybe_clone(inputs[i])  # type: ignore[assignment]
@@ -946,8 +955,8 @@ class AutogradCompilerInstance:
         hook = self.hooks_proxy[hook_id]  # type: ignore[index]
         proxies = self.proxy_call_hook(
             hook,
+            "pre_hook",
             inputs,
-            hook_type="pre_hook",
         )
         with disable_proxy_modes_tracing():
             inputs = [maybe_clone(x) for x in inputs]
@@ -962,9 +971,9 @@ class AutogradCompilerInstance:
         hook = self.hooks_proxy[hook_id]  # type: ignore[index]
         proxies = self.proxy_call_hook(
             hook,
+            "post_hook",
             outputs,
             inputs,
-            hook_type="post_hook",
         )
         with disable_proxy_modes_tracing():
             outputs = [maybe_clone(x) for x in outputs]  # type: ignore[misc]
@@ -981,8 +990,8 @@ class AutogradCompilerInstance:
         hook = self.hooks_proxy[hook_id]  # type: ignore[index]
         proxy = self.proxy_call_hook(
             hook,
+            "post_acc_grad_hook",
             input,
-            hook_type="post_acc_grad_hook",
         )
         with disable_proxy_modes_tracing():
             res = [maybe_clone(input)]
@@ -1311,7 +1320,7 @@ class AutogradCompilerInstance:
         for node in self.fx_tracer.graph.find_nodes(
             op="call_function", target=call_hook
         ):
-            if node.kwargs.get("hook_type", None) != "unpack_hook":
+            if node.args[1] != "unpack_hook":
                 continue
 
             first_user = min(node.users)
@@ -1327,11 +1336,11 @@ class AutogradCompilerInstance:
         for node in self.fx_tracer.graph.find_nodes(
             op="call_function", target=call_hook
         ):
-            if node.kwargs.get("hook_type", None) != "tensor_pre_hook":
+            if node.args[1] != "tensor_pre_hook":
                 continue
 
             getitem_node = node.args[0]
-            input_node = node.args[1]  # tensor_pre_hook handle only one grad tensor
+            input_node = node.args[2]  # tensor_pre_hook handle only one grad tensor
 
             if input_node is not node.prev and not self.is_placeholder(input_node):
                 input_node.append(getitem_node)
@@ -1348,12 +1357,12 @@ class AutogradCompilerInstance:
         for node in self.fx_tracer.graph.find_nodes(
             op="call_function", target=call_hook
         ):
-            if node.kwargs.get("hook_type", None) != "pre_hook":
+            if node.args[1] != "pre_hook":
                 continue
 
             getitem_node = node.args[0]
             # pre_hook handle a tuple of grad tensors
-            input_nodes = self.get_all_nodes(node.args[1])
+            input_nodes = self.get_all_nodes(node.args[2])
 
             to_remove = []
             to_append = []
@@ -1384,7 +1393,7 @@ class AutogradCompilerInstance:
         for node in self.fx_tracer.graph.find_nodes(
             op="call_function", target=call_hook
         ):
-            if node.kwargs.get("hook_type", None) != "pre_hook":
+            if node.args[1] != "pre_hook":
                 continue
             pre_hooks.append(node)
 
@@ -1422,7 +1431,7 @@ class AutogradCompilerInstance:
         for node in self.fx_tracer.graph.find_nodes(
             op="call_function", target=call_hook
         ):
-            if node.kwargs.get("hook_type", None) != "post_acc_grad_hook":
+            if node.args[1] != "post_acc_grad_hook":
                 continue
             post_acc_grad_hooks.append(node)
 
@@ -1430,7 +1439,7 @@ class AutogradCompilerInstance:
         # to same node, we should keep their relative order
         for node in reversed(post_acc_grad_hooks):
             getitem_node = node.args[0]
-            param_node = node.args[1]  # post_acc_grad_hook handle one param
+            param_node = node.args[2]  # post_acc_grad_hook handle one param
 
             # find the corresponding acc_grad node
             acc_grad_node = None
@@ -1459,14 +1468,14 @@ class AutogradCompilerInstance:
         for node in self.fx_tracer.graph.find_nodes(
             op="call_function", target=call_hook
         ):
-            if node.kwargs.get("hook_type", None) != "post_hook":
+            if node.args[1] != "post_hook":
                 continue
             post_hooks.append(node)
 
         for node in reversed(post_hooks):
             getitem_node = node.args[0]
-            output_nodes = node.args[1]
-            input_nodes = node.args[2]
+            output_nodes = node.args[2]
+            input_nodes = node.args[3]
 
             if len(output_nodes) > 0:
                 continue
@@ -1481,7 +1490,7 @@ class AutogradCompilerInstance:
                     if not (
                         user.op == "call_function"
                         and user.target is call_hook
-                        and node.kwargs.get("hook_type", None) == "post_hook"
+                        and node.args[1] == "post_hook"
                     )
                 )
 
@@ -1493,7 +1502,7 @@ class AutogradCompilerInstance:
                     if (
                         n.op == "call_function"
                         and n.target is call_hook
-                        and n.kwargs.get("hook_type", None) == "post_acc_grad_hook"
+                        and n.args[1] == "post_acc_grad_hook"
                     ):
                         post_acc_grad_hook_node = n
 

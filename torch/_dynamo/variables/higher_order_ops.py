@@ -82,6 +82,9 @@ from typing import ParamSpec, TypeVar
 P = ParamSpec("P")
 R = TypeVar("R")
 HOP_VT_Alias = TypeVar("HOP_VT_Alias", bound="TorchHigherOrderOperatorVariable")
+SetSubgraphInputs = Literal[
+    "automatic", "automatic_with_forced_inputs", "flatten_manual", "manual"
+]
 
 log = logging.getLogger(__name__)
 hc_log = torch._logging.getArtifactLogger(__name__, "hierarchical_compile")
@@ -1131,7 +1134,7 @@ def validate_args_and_maybe_create_graph_inputs(
     sub_args: list[VariableTracker],
     tracer: "SubgraphTracer",
     tx: "InstructionTranslatorBase",
-    set_subgraph_inputs: str,
+    set_subgraph_inputs: SetSubgraphInputs,
     description: str,
     sub_args_names: Sequence[str] | None = None,
 ) -> list[Any]:
@@ -1598,7 +1601,7 @@ def get_hop_args(
     subtracer: "SubgraphTracer",
     sub_args: list[VariableTracker],
     sub_kwargs: dict[str, VariableTracker],
-    set_subgraph_inputs: str,
+    set_subgraph_inputs: SetSubgraphInputs,
     description: str,
 ) -> list[VariableTracker]:
     sub_args_names = maybe_positional_arg_names(f)
@@ -1650,9 +1653,7 @@ def speculate_subgraph_with_auto_output_flattening(
     # order they are see while tracing). This is useful for autograd.Function
     # backward where we do need to account for all the inputs of the backwards
     # to be lifted as inputs for making the fwd-bwd graph consistent.
-    set_subgraph_inputs: Literal[
-        "automatic", "automatic_with_forced_inputs", "flatten_manual", "manual"
-    ] = "automatic",
+    set_subgraph_inputs: SetSubgraphInputs = "automatic",
     # If True, exposes intermediates to subgraph outputs to allow later tensor ops to
     # access intermediates from the subgraph, this is useful for mutation
     allow_side_effects: bool = False,
@@ -2022,9 +2023,7 @@ def speculate_subgraph(
     # 3. if your HOP must preserve inputs that are not tensor or symnode as placeholders e.g. AutogradFunctionContextVariable
     # use set_subgraph_inputs="manual" (not recommended). We do not recommend it in general because it has the
     # restriction that user need to manually control how to create placeholders and VariableTrackers for the args.
-    set_subgraph_inputs: Literal[
-        "automatic", "semi_automatic", "flatten_manual", "manual"
-    ] = "automatic",
+    set_subgraph_inputs: SetSubgraphInputs = "automatic",
     restore_side_effects: bool = True,
     should_flatten_outputs: bool = False,
     # if should_flatten_outputs is True, `remove_consts_from_outputs` remove the
@@ -3836,9 +3835,7 @@ class WrapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         description: str,
         *,
         subgraph_name: str = "wrap_body",
-        set_subgraph_inputs: Literal[
-            "automatic", "automatic_with_forced_inputs"
-        ] = "automatic",
+        set_subgraph_inputs: SetSubgraphInputs = "automatic",
     ) -> tuple[
         tuple[Proxy, ...],
         dict[str, VariableTracker],

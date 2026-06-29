@@ -5191,7 +5191,10 @@ def get_instruction_source_311(code: types.CodeType, inst: Instruction) -> str:
     )
 
 
-def get_static_address_type(t: Any) -> Any:
+StaticAddressType: TypeAlias = Literal["guarded", "unguarded"]
+
+
+def get_static_address_type(t: Any) -> StaticAddressType | None:
     if isinstance(t, torch.Tensor):
         return getattr(t, "_dynamo_static_input_type", None)
 
@@ -5641,7 +5644,14 @@ def set_feature_use(feature: str, usage: bool) -> None:
         get_metrics_context().set_key_value("feature_usage", feature, usage)
 
 
-_ddp_optimization_mode: tuple[str, ...] = (
+OptimizeDdpMode: TypeAlias = Literal[
+    "ddp_optimizer",
+    "python_reducer",
+    "python_reducer_without_compiled_forward",
+    "no_optimization",
+]
+
+_ddp_optimization_mode: tuple[OptimizeDdpMode, ...] = (
     "ddp_optimizer",
     "python_reducer",  # experimental mode
     "python_reducer_without_compiled_forward",
@@ -5649,7 +5659,7 @@ _ddp_optimization_mode: tuple[str, ...] = (
 )
 
 
-def get_optimize_ddp_mode() -> str:
+def get_optimize_ddp_mode() -> OptimizeDdpMode:
     optimize_ddp = config.optimize_ddp
     if isinstance(optimize_ddp, bool):
         mode = "ddp_optimizer" if optimize_ddp else "no_optimization"
@@ -5662,7 +5672,7 @@ def get_optimize_ddp_mode() -> str:
 
     if mode not in _ddp_optimization_mode:
         raise AssertionError(f"Invalid dynamo config optimize_ddp value {mode=}")
-    return mode
+    return cast(OptimizeDdpMode, mode)
 
 
 @contextmanager
