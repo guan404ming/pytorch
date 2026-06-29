@@ -2333,6 +2333,214 @@ right resume value; the new code computes it explicitly).
 
 Next gate: Cycle4-I (or per manager).
 
+## Gates (Cycle 5)
+
+### Cycle5-A: Sort Decorated (str.split returns mutable list)
+
+Status: IMPLEMENTED (Cycle 5). Classification (a): genuine in-scope
+object-protocol gap. CPython `str.split`/`rsplit`/`splitlines` return a fresh,
+caller-owned MUTABLE list; Dynamo modeled the result as an immutable
+`ListVariable` (no `mutation_type`), so any in-place mutation on the result
+graph-broke / asserted.
+
+Root cause (confirmed via repro, sentinel temporarily removed):
+`test_decorated` does `data = '...'.split()` then `random.shuffle(data)`. The
+shuffle path (`misc.py:2524`) calls `side_effects.mutation(seq)` on the
+split-result list, which hits
+`check_allowed_side_effect` ->
+`AssertionError: mutation_type is None for ListVariable(length=9)`. In
+`ConstantVariable.call_method`, the str-method branch
+(`name in str.__dict__`) returned `ConstantVariable.create(method(...))`; for
+`split`/`rsplit`/`splitlines` that result is a python `list`, and `create`
+builds a `ListVariable` with NO `mutation_type` (immutable). CPython's
+`str.split` returns a fresh mutable list owned by the caller, so subsequent
+`.sort()`/shuffle/append must be tracked.
+
+This is the str.split-mutable-list blocker, explicitly CONFIRMED as NOT the
+arg-binding/#173231 path: the failure is the `mutation_type is None` assertion
+in side-effects, reached from `random.shuffle(data)` on a split result, not an
+inline arg-binding `TypeError`.
+
+Fix: in the str-method branch of `ConstantVariable.call_method`, when the
+method is `split`/`rsplit`/`splitlines` (the str methods that return a fresh
+list), create the result `ListVariable` with `mutation_type=ValueMutationNew()`
+so in-place mutations are tracked. Exception behavior on the method call is
+unchanged (still routed through `raise_observed_exception`).
+
+Files changed:
+- `torch/_dynamo/variables/constant.py` (`ConstantVariable.call_method`
+  str-method branch)
+- `test/dynamo/test_functions.py`
+  (`FunctionTests.test_str_split_returns_mutable_list`, `fullgraph=True`:
+  sort/append on `split`, reverse on `rsplit`, pop on `splitlines`)
+
+Sentinel removed (working tree, uncommitted):
+- `CPython313-test_sort-TestDecorateSortUndecorate.test_decorated` (target)
+
+No collateral sentinels removed. `test_baddecorator` was verified to STILL FAIL
+with its sentinel removed (it needs the rejected inline arg-binding `TypeError`
+reroute, #173231-related) and its sentinel was restored / LEFT IN PLACE. The
+other `test_sort` sentinels (`test_stability`, `test_reverse_stability`,
+`test_small_stability`, `testStressfully`, `test_unsafe_object_compare`) remain
+in place; the full-file run shows no XPASS errors, so none are collateral here.
+
+Exact commands run and results (current tree):
+
+```bash
+# Target test, sentinel removed -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_sort.py TestDecorateSortUndecorate.test_decorated
+# OK (1 test)
+
+# Whole affected CPython file -> PASS, no new failures, no XPASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_sort.py
+# Ran 21 tests, OK (skipped=10)
+
+# test_baddecorator with its sentinel removed -> still FAILED (left in place)
+# Ran 1 test, FAILED (errors=1)
+
+# New regression test (fullgraph=True) -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_functions.py FunctionTests.test_str_split_returns_mutable_list
+# OK (1 test)
+
+# Nearby Dynamo suite sanity -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_functions.py
+# Ran 527 tests, OK (skipped=8, expected failures=2)
+
+# lintrunner on changed files -> clean
+# ok No lint issues.
+```
+
+Risks: low. Scoped to three str methods that are documented to return a fresh
+caller-owned list; constant exception behavior is unchanged. Marking the result
+mutable matches CPython ownership semantics and cannot affect immutable
+str/int/float method results.
+
+### Cycle5-B: __build_class__ uninitialized closure cell (test_dict gates 1/2/9)
+
+Status: IMPLEMENTED (Cycle 5). Classification (a): genuine in-scope Dynamo fix.
+
+Gates addressed (all in `test/cpython/v3_13/test_dict.py`):
+- Gate 2: `DictTest.test_getitem` -- `class BadEq` defines `__eq__` that
+  `raise Exc()` where `class Exc(Exception)` is defined *after* `BadEq`.
+- Gate 9: `DictTest.test_reentrant_insertion` -- `check_reentrant_insertion`
+  defines `class Mutating` whose `__del__` closes over `d`, assigned *after*
+  the class.
+- Gate 1: `DictTest.test_fromkeys` -- stale sentinel only; the vendored test is
+  decorated `@unittest.skip("test hangs")`, so it already passes-as-skip under
+  Dynamo. No code involved.
+
+Root cause: `NestedUserFunctionVariable._get_function_impl` (the
+`allow_sourced_cells=True` / `__build_class__` path in
+`torch/_dynamo/variables/functions.py`) eagerly called
+`side_effects.load_cell(cell_var)` on *every* closure cell of the class-body
+function. When a class body defines methods that close over a free var (or the
+class's own name) bound only after the `class` statement, that cell is
+legitimately empty at build time, so `load_cell` raised `unimplemented("Read
+uninitialized cell", gb0091)`. That `Unsupported` propagated out of
+`__build_class__` (`builtin.py` only catches `NotImplementedError`) and surfaced
+as gb8977 "Invalid call to __build_class__", killing tracing at class
+construction. CPython builds the class fine -- the empty cell is read only once
+the method runs. `bind_args` already models unassigned cells gracefully; the
+`__build_class__` path was the lone holdout.
+
+Fix: in the closure loop, before calling `load_cell`, detect the uninitialized
+case (`allow_sourced_cells` and `isinstance(cell_var, CellVariable)` and not
+`has_pending_mutation_of_attr(cell_var, "cell_contents")` and not
+`cell_var.pre_existing_contents`). For that case, create a genuine empty
+`types.CellType()`, alias it to the existing `cell_var` in side_effects, append
+it to the cells list, and `continue` (skip `load_cell`). Later LOAD/STORE_DEREF
+on the freevar then resolve back to the same `cell_var` via load_cell/store_cell.
+
+Helper added: `SideEffects.track_empty_cell(cell, cellvar)` in
+`torch/_dynamo/side_effects.py` -- aliases a real empty cell object to an
+already-existing `CellVariable` (`id_to_variable[id(cell)] = cellvar` plus
+keepalive). Distinct from `track_cell_existing`, which constructs a *new*
+CellVariable; here we must reuse the closure's existing VT so its source/guards
+are preserved. Matches the explicit-state-management style (no raw dict poking
+at the call site).
+
+Scope guard: the change is confined to the `allow_sourced_cells` branch. The
+constant-cell path and `as_python_constant`/`is_python_constant` are untouched
+(commit #185998 deliberately kept those strict; relaxing them regressed
+contextlib/with).
+
+Gate 10 (`DictTest.test_str_nonstr`) is DEFERRED, sentinel LEFT IN PLACE. With
+this fix it now advances past the build_class stage to the genuine limitation it
+targets: a `nonlocal eq_count` write inside a closure method hits gb0169 "Write
+to immutable cell". That needs broad writable-closure-cell infra, deferred
+separately. The expected-failure wrapper tolerates it as a graph-break-skip, so
+no XPASS is reported.
+
+Files changed:
+- `torch/_dynamo/variables/functions.py` (`_get_function_impl`, empty-cell
+  branch at the top of the closure loop)
+- `torch/_dynamo/side_effects.py` (`SideEffects.track_empty_cell` helper)
+- `test/dynamo/test_misc.py`
+  (`MiscTests.test_build_class_closure_over_later_assigned_name`,
+  `MiscTests.test_build_class_closure_over_self_name`, `fullgraph=True`)
+
+Sentinels removed (working tree, uncommitted):
+- `CPython313-test_dict-DictTest.test_getitem` (gate 2)
+- `CPython313-test_dict-DictTest.test_reentrant_insertion` (gate 9)
+- `CPython313-test_dict-DictTest.test_fromkeys` (gate 1, stale)
+
+`CPython313-test_dict-DictTest.test_str_nonstr` (gate 10) sentinel LEFT IN PLACE.
+
+Exact commands run and results (current tree):
+
+```bash
+# Target tests, sentinels removed -> PASS / pass-as-skip
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py \
+  DictTest.test_getitem DictTest.test_reentrant_insertion DictTest.test_fromkeys
+# Ran 3 tests, OK (skipped=1)  [getitem+reentrant ran OK; fromkeys skipped]
+
+# Gate 10 still deferred (sentinel in place) -> graph-break-skip, no XPASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py DictTest.test_str_nonstr
+# Ran 1 test, OK (skipped=1)  [skipped via gb0169 Write to immutable cell]
+
+# Whole affected CPython file -> PASS, no new failures, no XPASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu PYTORCH_TEST_WITH_DYNAMO=1 \
+  python test/cpython/v3_13/test_dict.py
+# Ran 112 tests, OK (skipped=35)
+
+# New regression tests (fullgraph=True) -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_misc.py \
+  MiscTests.test_build_class_closure_over_later_assigned_name \
+  MiscTests.test_build_class_closure_over_self_name
+# Ran 2 tests, OK
+
+# build_class + closure sanity in test_misc -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_misc.py -k build_class
+# Ran 8 tests, OK (expected failures=1)
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_misc.py -k closure
+# Ran 24 tests, OK
+
+# Full test_misc.py sanity (build_class change) -> PASS
+CUDA_VISIBLE_DEVICES= PYTORCH_TESTING_DEVICE_ONLY_FOR=cpu \
+  python test/dynamo/test_misc.py
+# Ran 773 tests, OK (skipped=12, expected failures=4)
+
+# lintrunner on changed files -> clean
+# ok No lint issues.
+```
+
+Risks: low. The change is confined to the `allow_sourced_cells=True`
+(`__build_class__`) branch; the constant-cell path and
+`as_python_constant`/`is_python_constant` are untouched, so the #185998
+contextlib/with behavior is preserved. The empty cell is a real `types.CellType`
+aliased to the existing `cell_var`, so later DEREF reads/writes route through the
+same VT (preserving source/guards). Cells that are non-empty (pending mutation or
+pre-existing contents) still go through `load_cell` exactly as before.
+
 ## Proposed Gate Changes Awaiting Human Approval
 
 Use this section only when an implementation subagent believes a gate is too
