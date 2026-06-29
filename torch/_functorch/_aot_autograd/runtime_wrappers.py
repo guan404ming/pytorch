@@ -1032,7 +1032,7 @@ def _create_runtime_wrapper(
         alias_lines.append("    return ret_outs")
         alias_source = "\n".join(alias_lines)
 
-        from .subclass_codegen import _compile_and_exec_source
+        from .codegen import _compile_and_exec_source
 
         _codegen_alias_fn = _compile_and_exec_source(
             alias_source, alias_globals, "_alias_fn", "output_alias_wrapper"
@@ -1117,13 +1117,13 @@ def _create_runtime_wrapper(
             mut_lines.append("    pass")
         mut_source = "\n".join(mut_lines)
 
-        from .subclass_codegen import _compile_and_exec_source
+        from .codegen import _compile_and_exec_source
 
         codegen_apply_mutations = _compile_and_exec_source(
             mut_source, mut_globals, "_apply_mutations", "mutation_epilogue"
         )
 
-    from .subclass_codegen import _compile_and_exec_source
+    from .codegen import _compile_and_exec_source
 
     epilogue_args_idx = runtime_epilogue.epilogue_args_idx
     num_mutated_runtime_inps = runtime_metadata.num_mutated_inp_runtime_indices
@@ -1249,7 +1249,7 @@ class FunctionalizedRngRuntimeWrapper(InductorWrapper):
                 f"expected num_outputs_rng_offset == 1, got {runtime_metadata.num_outputs_rng_offset}"
             )
 
-        from .subclass_codegen import _compile_and_exec_source
+        from .codegen import _compile_and_exec_source
 
         offset_index = runtime_metadata.num_forward_returns
         lines = ["def _functionalized_rng_wrapper(runtime_args):"]
@@ -1474,7 +1474,7 @@ class EffectTokensWrapper(CompilerWrapper):
         if num_tokens == 0:
             return compiled_fn
 
-        from .subclass_codegen import _compile_and_exec_source
+        from .codegen import _compile_and_exec_source
 
         lines = ["def _effect_tokens_wrapper(args):"]
         lines.append(f"    new_args = [{', '.join(['None'] * num_tokens)}, *args]")
@@ -1778,7 +1778,7 @@ class AOTDedupeWrapper(CompilerWrapper):
             f"    args.clear()\n"
             f"    return compiled_fn(deduped_args)\n"
         )
-        from .subclass_codegen import _compile_and_exec_source
+        from .codegen import _compile_and_exec_source
 
         wrapped_compiled_fn: Callable[..., Any] = _compile_and_exec_source(  # type: ignore[assignment]
             source,
@@ -2025,7 +2025,7 @@ class AOTSyntheticBaseWrapper(CompilerWrapper):
         if not self.needs_post_compile:
             return compiled_fn
 
-        from .subclass_codegen import _compile_and_exec_source
+        from .codegen import _compile_and_exec_source
 
         base_groups = self.base_groups
         other_indices = self.other_arg_indices
@@ -2977,7 +2977,7 @@ def _codegen_backward_prologue(
     maybe_subclass_meta: SubclassMeta | None,
     codegen_unwrap_fn: Callable[..., Any] | None,
 ) -> Callable[..., Any]:
-    from .subclass_codegen import _compile_and_exec_source
+    from .codegen import _compile_and_exec_source
 
     num_mutated_runtime_inps = fw_metadata.num_mutated_inp_runtime_indices
     num_outputs = fw_metadata.num_outputs
@@ -3143,7 +3143,7 @@ def _codegen_backward_epilogue(
     maybe_subclass_meta: SubclassMeta | None,
     codegen_wrap_fn: Callable[..., Any] | None,
 ) -> Callable[..., Any]:
-    from .subclass_codegen import _compile_and_exec_source
+    from .codegen import _compile_and_exec_source
 
     num_bw_tokens = fw_metadata.num_backward_tokens
     is_rng = fw_metadata.is_rng_op_functionalized
@@ -3202,7 +3202,7 @@ def _codegen_compiled_forward(
     disable_amp: bool,
     num_rng: int,
 ) -> Callable[..., Any]:
-    from .subclass_codegen import _compile_and_exec_source
+    from .codegen import _compile_and_exec_source
 
     lines: list[str] = [
         "def _compiled_forward(ctx, args, _rng_add_, _save_, _finalize_, _compiled_fw_):"
@@ -3246,7 +3246,7 @@ def _codegen_compiled_backward(
     num_tensors_no_vc_check: int | None,
     inputs_require_grad: bool,
 ) -> Callable[..., Any]:
-    from .subclass_codegen import _compile_and_exec_source
+    from .codegen import _compile_and_exec_source
 
     lines: list[str] = [
         "def _compiled_backward("
@@ -3438,7 +3438,7 @@ class _AOTDispatchAutogradFunctionFactory:
 
         _xform_source = "\n".join(_xform_lines)
 
-        from .subclass_codegen import _compile_and_exec_source
+        from .codegen import _compile_and_exec_source
 
         _codegen_transform_raw_returns: Callable[..., list[Any]] = (
             _compile_and_exec_source(  # type: ignore[assignment]
@@ -3837,7 +3837,7 @@ class DebugAssertWrapper(CompilerWrapper):
         source = "\n".join(lines)
         globals_dict["Tensor"] = Tensor
 
-        from .subclass_codegen import _compile_and_exec_source
+        from .codegen import _compile_and_exec_source
 
         return _compile_and_exec_source(
             source,
