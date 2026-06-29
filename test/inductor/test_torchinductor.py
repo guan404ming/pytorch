@@ -82,7 +82,6 @@ from torch.testing._internal.common_cuda import (
     TEST_CUDNN,
     tf32_on_and_off,
     with_tf32_off,
-    xfailIfSM100OrLater,
 )
 from torch.testing._internal.common_device_type import (
     expectedFailureXPU,
@@ -3295,6 +3294,42 @@ class CommonTemplate:
         )
         expected = fn(x)
         actual = torch.compile(fn)(x)
+        self.assertEqual(actual, expected)
+
+    def test_add_scalar_type_promotion_bf16(self):
+        # https://github.com/pytorch/pytorch/issues/185517
+        def fwd(x):
+            return x + 1.7, x - 1.7
+
+        x = torch.tensor(
+            [-1.703125, 1.703125, 0.5], dtype=torch.bfloat16, device=self.device
+        )
+        self.assertEqual(torch.compile(fwd)(x), fwd(x))
+
+        # Eager CPU/MPS round margin to bf16, making the pre-clamp value of
+        # margin_ranking_loss exactly 0.0, so the clamp_min backward passes
+        # gradient at the boundary. The compiled backward must agree.
+        def loss_fn(a, b, t):
+            return torch.nn.functional.margin_ranking_loss(
+                a, b, t, margin=1.7, reduction="mean"
+            )
+
+        def grads(f):
+            a = torch.tensor(
+                [1.703125] * 2,
+                dtype=torch.bfloat16,
+                device=self.device,
+                requires_grad=True,
+            )
+            b = torch.zeros(
+                2, dtype=torch.bfloat16, device=self.device, requires_grad=True
+            )
+            t = torch.ones(2, dtype=torch.bfloat16, device=self.device)
+            f(a, b, t).backward()
+            return a.grad, b.grad
+
+        expected = grads(loss_fn)
+        actual = grads(torch.compile(loss_fn))
         self.assertEqual(actual, expected)
 
     @skip_if_gpu_halide
@@ -11024,6 +11059,30 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 self.assertEqual(x.grad, x_ref.grad)
                 self.assertEqual(y.grad, y_ref.grad)
 
+    def test_diagonal_scatter_overlap_input(self):
+        # The decomposition for diagonal_scatter (and the other *_scatter ops)
+        # uses clone_preserve_strides, which must materialize a contiguous
+        # buffer when the input has internal memory overlap (e.g. an expand
+        # of a scalar with stride 0). Otherwise the diagonal write aliases
+        # the entire output and corrupts non-diagonal positions. This pattern
+        # arises naturally in the backward of diagonal_scatter(x, src).sum().
+        def fn(x, src):
+            return torch.diagonal_scatter(x, src, 0).sum()
+
+        x = torch.randn(8, 8, device=self.device, requires_grad=True)
+        src = torch.randn(8, device=self.device, requires_grad=True)
+
+        x_eager = x.clone().detach().requires_grad_(True)
+        src_eager = src.clone().detach().requires_grad_(True)
+        fn(x_eager, src_eager).backward()
+
+        x_compiled = x.clone().detach().requires_grad_(True)
+        src_compiled = src.clone().detach().requires_grad_(True)
+        torch.compile(fn)(x_compiled, src_compiled).backward()
+
+        self.assertEqual(x_eager.grad, x_compiled.grad)
+        self.assertEqual(src_eager.grad, src_compiled.grad)
+
     @skip_if_gpu_halide  # accuracy issue
     def test_slice_scatter(self):
         def fn(x, a):
@@ -16815,12 +16874,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             with self.assertRaisesRegex(RuntimeError, "Output size is too small"):
                 _ = torch.compile(model)(inputs)
 
-    @skipIfRocm
     @requires_cuda
     def test_conv_transpose_zero_size_output(self):
-        # Only CUDA (cuDNN) supports zero-sized spatial outputs for conv_transpose.
-        # ROCm/miopen fails with miopenStatusBadParm, MPS fails with empty placeholder assert.
-        # This test ensures compiled mode matches eager behavior on CUDA.
+        # CUDA/HIP support zero-sized spatial outputs for conv_transpose by
+        # short-circuiting before backend libraries see empty tensor descriptors.
+        # This test ensures compiled mode matches eager behavior.
         class Model(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -18549,6 +18607,25 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 check_lowp=False,
             )
 
+    @requires_gpu()
+    @skip_if_cpp_wrapper("cross-device shallow_copy_data_ not in AOTI shim")
+    def test_tensor_set_data_cross_device(self):
+        def func(x):
+            x.data = x.data.to(self.device)
+            return x + 1
+
+        x_eager = torch.randn(4, device="cpu")
+        x_compiled = x_eager.clone()
+
+        out_eager = func(x_eager)
+        torch._dynamo.reset()
+        out_compiled = torch.compile(func, backend="inductor", fullgraph=True)(
+            x_compiled
+        )
+
+        self.assertEqual(out_eager, out_compiled)
+        self.assertEqual(x_eager.device, x_compiled.device)
+
     # end of class CommonTemplate - add new tests here
 
 
@@ -18740,10 +18817,6 @@ if RUN_GPU:
 
             return kernels
 
-        # On Blackwell+, #179729 raised the split-reduction no-split threshold to 524288,
-        # so the 256*256=65536-element reduction below no longer splits and produces 1 kernel
-        # instead of the expected 2.
-        @xfailIfSM100OrLater
         def test_divisible_by_16_covers_numel_args(self):
             torch._dynamo.reset()
 
