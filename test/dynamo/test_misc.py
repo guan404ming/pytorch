@@ -12458,6 +12458,48 @@ def ___make_guard_fn():
         self.assertEqual(list(eager), list(compiled))
         self.assertEqual(len(counters["graph_break"]), 0)
 
+    def test_itertools_repeat_length_hint(self):
+        def fn():
+            return (
+                operator.length_hint(itertools.repeat(None, 50)),
+                operator.length_hint(itertools.repeat(None, 0)),
+                operator.length_hint(itertools.repeat(None, -3)),
+                operator.length_hint(itertools.repeat(None), 12),
+            )
+
+        compiled_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(fn(), compiled_fn())
+        self.assertEqual(compiled_fn(), (50, 0, 0, 12))
+
+    def test_itertools_repeat_repr(self):
+        def fn():
+            r = itertools.repeat("a", -1)
+            bounded = repr(r)
+            unbounded = repr(itertools.repeat(1 + 0j))
+            return bounded, unbounded
+
+        compiled_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(fn(), compiled_fn())
+        self.assertEqual(compiled_fn(), ("repeat('a', 0)", "repeat((1+0j))"))
+
+    def test_itertools_repeat_bounded_exhausts(self):
+        def fn():
+            return list(itertools.repeat("a", 3)) + list(itertools.repeat("b", -2))
+
+        compiled_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(fn(), compiled_fn())
+        self.assertEqual(compiled_fn(), ["a", "a", "a"])
+
+    def test_itertools_repeat_partial_iteration(self):
+        def fn():
+            r = itertools.repeat("a", 3)
+            next(r)
+            return operator.length_hint(r), repr(r)
+
+        compiled_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(fn(), compiled_fn())
+        self.assertEqual(compiled_fn(), (2, "repeat('a', 2)"))
+
     def test_itertools_infinite_count(self):
         for args in ([], [10], [5, -1]):
             counters.clear()
@@ -15359,6 +15401,54 @@ fn
         outer.scale = 7
         self.assertEqual(fn(t), outer.get_scale() + t.sum())
         self.assertEqual(cnt.frame_count, 2)
+
+    @torch._dynamo.config.patch(enable_trace_load_build_class=True)
+    def test_build_class_closure_over_later_assigned_name(self):
+        # A class-body method closes over a free variable that is only assigned
+        # *after* the class statement. The cell is legitimately empty when the
+        # class is built; CPython reads it only when the method runs. Dynamo must
+        # build the class with a genuine empty cell rather than graph-breaking on
+        # an uninitialized cell read.
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt, fullgraph=True)
+        def fn(t):
+            class Maker:
+                def make(self):
+                    return Helper()  # Helper is defined below the class.
+
+            class Helper:
+                def value(self):
+                    return 5
+
+            return Maker().make().value() + t.sum()
+
+        t = torch.randn(3)
+        self.assertEqual(fn(t), 5 + t.sum())
+        self.assertEqual(cnt.frame_count, 1)
+
+    @torch._dynamo.config.patch(enable_trace_load_build_class=True)
+    def test_build_class_closure_over_self_name(self):
+        # A class-body method references the class's own name (the cell for that
+        # name is empty until __build_class__ binds it), as in isinstance checks
+        # against the class itself.
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(t):
+            class C:
+                def __init__(self, v):
+                    self.v = v
+
+                def same_type(self, other):
+                    return isinstance(other, C)
+
+            a = C(1)
+            b = C(2)
+            return a.same_type(b), t.cos()
+
+        t = torch.randn(3)
+        same, cos = fn(t)
+        self.assertTrue(same)
+        self.assertEqual(cos, t.cos())
 
     def test_dunder_weakref(self):
         class Foo:
