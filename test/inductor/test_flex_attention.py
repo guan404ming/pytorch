@@ -4638,16 +4638,14 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             self.skipTest("FA4 sparse block path in this test targets SM100+")
 
         torch.manual_seed(0)
-        batch, heads, q_blocks, kv_blocks, q_block_size, kv_block_size, head_dim, top_k = (
-            1,
-            1,
-            2,
-            2,
-            256,
-            128,
-            128,
-            1,
-        )
+        batch = 1
+        heads = 1
+        q_blocks = 2
+        kv_blocks = 2
+        q_block_size = 256
+        kv_block_size = 128
+        head_dim = 128
+        top_k = 1
         q = torch.randn(
             batch,
             heads,
