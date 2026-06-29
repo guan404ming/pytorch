@@ -44,7 +44,7 @@ from collections.abc import Generator, Sized
 from dataclasses import dataclass
 from enum import Enum
 from os.path import dirname, join
-from typing import Any, Literal, NamedTuple, TYPE_CHECKING
+from typing import Any, NamedTuple, TYPE_CHECKING
 from unittest.mock import patch
 
 import sympy
@@ -69,6 +69,7 @@ from torch._C._dynamo.eval_frame import (  # noqa: F401
     set_skip_guard_eval_unsafe,
     unsupported,
 )
+from torch._compiler_types import StanceStr
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.types import ConvertFrameReturn, FrameAction, FrameExecStrategy
 from torch._export.utils import _compiling_state_context
@@ -177,16 +178,6 @@ else:
             return callback
         else:
             return set_eval_frame(callback)
-
-
-StanceStr = Literal[
-    "default",
-    "eager_then_compile",
-    "aot_eager_then_compile",
-    "force_eager",
-    "eager_on_recompile",
-    "fail_on_recompile",
-]
 
 
 @dataclass

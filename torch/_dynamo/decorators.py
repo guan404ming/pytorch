@@ -13,6 +13,7 @@ from typing_extensions import ParamSpec
 
 import torch
 import torch.utils._pytree as pytree
+from torch._compiler_types import StanceStr
 from torch._opaque_base import OpaqueBase
 from torch._vendor.packaging.version import InvalidVersion, Version
 from torch.compiler import is_compiling
@@ -30,7 +31,6 @@ from .eval_frame import (
     innermost_fn,
     RunOnlyContext,
     skip_code,
-    StanceStr,
 )
 from .external_utils import (
     get_nonrecursive_disable_wrapper,

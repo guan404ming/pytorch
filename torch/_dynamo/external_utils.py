@@ -28,6 +28,7 @@ from typing_extensions import deprecated, ParamSpec
 
 import torch
 import torch.utils._pytree as pytree
+from torch._compiler_types import HookType
 
 
 try:
@@ -72,7 +73,7 @@ def wrap_inline(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 def call_hook(
-    hook: Callable[..., torch.Tensor | None], hook_type: str, *args: Any
+    hook: Callable[..., torch.Tensor | None], hook_type: HookType, *args: Any
 ) -> torch.Tensor:
     """
     Used by compiled autograd to handle hook returning None.

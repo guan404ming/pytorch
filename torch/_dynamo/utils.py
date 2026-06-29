@@ -68,6 +68,7 @@ import torch._functorch.config
 import torch.fx.experimental.symbolic_shapes
 import torch.utils._pytree as pytree
 from torch import fx
+from torch._compiler_types import OptimizeDdpMode, StaticAddressType
 from torch._C import (
     _instruction_counter,
     _len_torch_function_stack,
@@ -5191,9 +5192,6 @@ def get_instruction_source_311(code: types.CodeType, inst: Instruction) -> str:
     )
 
 
-StaticAddressType: TypeAlias = Literal["guarded", "unguarded"]
-
-
 def get_static_address_type(t: Any) -> StaticAddressType | None:
     if isinstance(t, torch.Tensor):
         return getattr(t, "_dynamo_static_input_type", None)
@@ -5643,13 +5641,6 @@ def set_feature_use(feature: str, usage: bool) -> None:
     if get_metrics_context().in_progress():
         get_metrics_context().set_key_value("feature_usage", feature, usage)
 
-
-OptimizeDdpMode: TypeAlias = Literal[
-    "ddp_optimizer",
-    "python_reducer",
-    "python_reducer_without_compiled_forward",
-    "no_optimization",
-]
 
 _ddp_optimization_mode: tuple[OptimizeDdpMode, ...] = (
     "ddp_optimizer",

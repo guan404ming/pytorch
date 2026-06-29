@@ -29,8 +29,9 @@ import warnings
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast, Literal, Optional, TYPE_CHECKING, Union
+from typing import Any, cast, Optional, TYPE_CHECKING, Union
 
+from torch._compiler_types import SetSubgraphInputs
 import torch._C
 import torch.fx
 import torch.nn
@@ -82,9 +83,6 @@ from typing import ParamSpec, TypeVar
 P = ParamSpec("P")
 R = TypeVar("R")
 HOP_VT_Alias = TypeVar("HOP_VT_Alias", bound="TorchHigherOrderOperatorVariable")
-SetSubgraphInputs = Literal[
-    "automatic", "automatic_with_forced_inputs", "flatten_manual", "manual"
-]
 
 log = logging.getLogger(__name__)
 hc_log = torch._logging.getArtifactLogger(__name__, "hierarchical_compile")

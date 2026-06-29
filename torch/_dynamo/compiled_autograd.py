@@ -21,10 +21,11 @@ import operator
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Generator, Sequence
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.utils._pytree as pytree
+from torch._compiler_types import HookType
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.external_utils import (
     call_accumulate_grad,
@@ -78,15 +79,6 @@ TURN_OFF_MSG = """You can turn off compiled autograd by either:
 
 compiled_autograd_log = getArtifactLogger(__name__, "compiled_autograd")
 verbose_log = getArtifactLogger(__name__, "compiled_autograd_verbose")
-
-HookType = Literal[
-    "unpack_hook",
-    "tensor_pre_hook",
-    "pre_hook",
-    "post_hook",
-    "post_acc_grad_hook",
-]
-
 
 def snapshot_verbose_logging_enabled() -> bool:
     return torch._logging._internal.log_state.is_artifact_enabled(
