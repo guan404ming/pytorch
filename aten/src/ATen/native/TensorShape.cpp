@@ -762,6 +762,146 @@ TORCH_IMPL_FUNC(cat_out_cpu)
   }
 }
 
+// copy Python cat meta function so that it is symint aware
+// this is not registered as a structure kernel bc changing the entire
+// structured behaviour is too risky
+namespace {
+
+MemoryFormat cat_compute_output_memory_format(
+    const MaterializedITensorListRef& inputs) {
+  std::optional<MemoryFormat> format = std::nullopt;
+  for (const Tensor& t : inputs) {
+    auto f = t.suggest_memory_format();
+    if (f == MemoryFormat::Contiguous) {
+      return f;
+    }
+    if (format.has_value() && format.value() != f) {
+      return MemoryFormat::Contiguous;
+    }
+    format = f;
+  }
+  TORCH_INTERNAL_ASSERT(format.has_value());
+  return *format;
+}
+
+struct CatMetaShape {
+  c10::SymDimVector sizes;
+  MemoryFormat memory_format;
+};
+
+CatMetaShape compute_cat_meta_shape(
+    const MaterializedITensorListRef& materialized,
+    int64_t dim) {
+  TORCH_CHECK(
+      !materialized.empty(),
+      "cat expects at least one tensor, but received zero!");
+
+  const Tensor* example = nullptr;
+  for (const auto i : c10::irange(materialized.size())) {
+    const Tensor& t = materialized[i];
+    if (example == nullptr) {
+      if (t.dim() != 1) {
+        example = &t;
+      }
+    } else if (t.dim() != 1) {
+      TORCH_CHECK(
+          t.dim() == example->dim(),
+          "Number of dimensions of tensors must match.  Expected ",
+          example->dim(),
+          "-D tensors, but got ",
+          t.dim(),
+          "-D for tensor number ",
+          i,
+          " in the list");
+    }
+  }
+  if (example == nullptr) {
+    example = &materialized[0].get();
+  }
+  const int64_t ndim = example->dim();
+
+  c10::SmallVector<const Tensor*, 8> filtered;
+  for (const auto i : c10::irange(materialized.size())) {
+    const Tensor& t = materialized[i];
+    if (t.dim() != ndim) {
+      TORCH_CHECK(
+          TORCH_GUARD_OR_FALSE(t.sym_size(0).sym_eq(0)),
+          "Number of dimensions of tensors must match.  Expected ",
+          ndim,
+          "-D tensors, but got 1-D for tensor number ",
+          i,
+          " in the list");
+    } else if (!(t.dim() == 1 &&
+                 TORCH_GUARD_OR_FALSE(t.sym_size(0).sym_eq(0)))) {
+      filtered.push_back(&t);
+    }
+  }
+
+  CatMetaShape result;
+  result.memory_format = cat_compute_output_memory_format(materialized);
+
+  if (filtered.empty()) {
+    result.sizes = c10::SymDimVector{c10::SymInt(0)};
+    return result;
+  }
+
+  const int64_t wrapped_dim = maybe_wrap_dim(dim, ndim);
+  const Tensor& first = *filtered[0];
+  result.sizes =
+      c10::SymDimVector(first.sym_sizes().begin(), first.sym_sizes().end());
+
+  c10::SymInt size_at_dim = 0;
+  for (const auto i : c10::irange(filtered.size())) {
+    const Tensor& t = *filtered[i];
+    for (const auto d : c10::irange(ndim)) {
+      if (d == wrapped_dim) {
+        continue;
+      }
+      TORCH_SYM_CHECK(
+          t.sym_size(d).sym_eq(first.sym_size(d)),
+          "Sizes of tensors must match except in dimension ",
+          wrapped_dim,
+          ". Expected ",
+          first.sym_size(d),
+          " but got ",
+          t.sym_size(d),
+          " for tensor number ",
+          i,
+          " in the list.");
+    }
+    size_at_dim += t.sym_size(wrapped_dim);
+  }
+  result.sizes[wrapped_dim] = std::move(size_at_dim);
+  return result;
+}
+
+} // namespace
+
+Tensor cat_meta(const ITensorListRef& tensors, int64_t dim) {
+  auto materialized = tensors.materialize();
+  auto shape = compute_cat_meta_shape(materialized, dim);
+  auto options = materialized[0]
+                     .get()
+                     .options()
+                     .dtype(result_type(tensors))
+                     .memory_format(shape.memory_format);
+  return at::empty_symint(shape.sizes, options, std::nullopt);
+}
+
+Tensor& cat_out_meta(const ITensorListRef& tensors, int64_t dim, Tensor& out) {
+  auto out_dtype = result_type(tensors);
+  TORCH_CHECK_TYPE(
+      canCast(out_dtype, out.scalar_type()),
+      "torch.cat(): input types can't be cast to the desired output type ",
+      out.scalar_type());
+  auto materialized = tensors.materialize();
+  auto shape = compute_cat_meta_shape(materialized, dim);
+  if (resize_output_symint(out, shape.sizes)) {
+    out.unsafeGetTensorImpl()->empty_tensor_restride(shape.memory_format);
+  }
+  return out;
+}
+
 // torch.concat, alias for torch.cat
 
 Tensor& concat_out(TensorList tensors, int64_t dim, Tensor& result) {
