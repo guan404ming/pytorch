@@ -344,9 +344,6 @@ laswp_rowparallel_kernel(
 // After this call, swap_buf[0:nb, 0:ncols] contains the permuted rows,
 // and dA rows below nb are patched correctly.
 // The caller must copy swap_buf back into dA (or feed it into TRSM).
-//
-// Full parallel pivot application for use in the recursive panel.
-// Does: setup_pivinfo -> laswp_rowparallel (gather + patch), then copy back.
 template <typename scalar_t>
 void batched_apply_pivots_parallel(
   scalar_t* dA,
@@ -381,9 +378,7 @@ void batched_apply_pivots_parallel(
 
   // Gather nb rows into swap_buf + patch dA, tiled across columns via grid.x
   // Max columns per tile limited by shared memory: nb * swp_width * sizeof(scalar_t) <= 48KB
-  int swp_width = (48 * 1024) / (nb * sizeof(scalar_t));
-  if (swp_width < 1) swp_width = 1;
-  if (swp_width > ncols) swp_width = ncols;
+  int swp_width = std::min(static_cast<int>((48 * 1024) / (nb * sizeof(scalar_t))), ncols);
 
   int col_tiles = (ncols + swp_width - 1) / swp_width;
   size_t shmem = nb * swp_width * sizeof(scalar_t);
