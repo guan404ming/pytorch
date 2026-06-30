@@ -19,6 +19,7 @@ These rules are critical for TorchDynamo's ability to automatically determine
 compilation boundaries and optimize PyTorch programs effectively.
 """
 
+import _weakrefset
 import abc
 import builtins
 import contextlib
@@ -3393,6 +3394,7 @@ def is_numpy_type_info(obj: Any) -> bool:
 
 
 BUILTIN_SKIPLIST = (
+    _weakrefset,
     abc,
     copy,
     importlib,
