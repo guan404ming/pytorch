@@ -52,6 +52,27 @@ jobs:
           ref: v0.0.2
           path: llm-target-determinator
 
+      - name: Set up sibling workspace for the indexer
+        shell: bash
+        run: |
+          set -eux
+          # llm-target-determinator@v0.0.2 (config.py) resolves its own realpath
+          # and then reads the corpus from `<parent>/pytorch` and the model from
+          # `<parent>/codellama` — i.e. it expects pytorch / codellama / itself to
+          # be sibling dirs. setup-linux checks pytorch out at GITHUB_WORKSPACE and
+          # the two helper repos as subdirs, so the realpath-based lookup misses
+          # the corpus. Move the helper repos into a clean workspace and point
+          # `pytorch` at the checkout via a symlink. Because `.resolve()` follows
+          # symlinks, the helper repos must be *real* dirs here (not symlinks).
+          # Moving them out of the pytorch tree also keeps them out of the
+          # indexer's os.walk corpus.
+          WS="${RUNNER_TEMP}/td-workspace"
+          mkdir -p "${WS}"
+          mv "${GITHUB_WORKSPACE}/codellama" "${WS}/codellama"
+          mv "${GITHUB_WORKSPACE}/llm-target-determinator" "${WS}/llm-target-determinator"
+          ln -sfn "${GITHUB_WORKSPACE}" "${WS}/pytorch"
+          echo "TD_WORKSPACE=${WS}" >> "${GITHUB_ENV}"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
         with:
@@ -64,29 +85,26 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           # Do this outside of docker so I don't have to put env vars in
-          pip3 install awscli==1.29.40
-          cd codellama
+          pip3 install -q awscli==1.29.40
+          cd "${TD_WORKSPACE}/codellama"
           mkdir "CodeLlama-7b-Python"
+          # --quiet: the checkpoint is many files; without it the per-object
+          # "download:" lines flood the log.
           aws s3 cp \
             "s3://target-determinator-assets/CodeLlama-7b-Python" \
             "CodeLlama-7b-Python" \
-            --recursive
+            --recursive \
+            --quiet
 
       - name: Run indexer
         shell: bash -l {0}
         env:
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          # Runs inside the CI image (container:). td_llm_indexer.sh / indexer.py
-          # expect pytorch, codellama and llm-target-determinator as sibling dirs,
-          # but setup-linux checks pytorch out directly at GITHUB_WORKSPACE (with
-          # the other two as subdirs). Recreate the sibling layout with symlinks.
-          WS="${RUNNER_TEMP}/td-workspace"
-          mkdir -p "${WS}"
-          ln -sfn "${GITHUB_WORKSPACE}" "${WS}/pytorch"
-          ln -sfn "${GITHUB_WORKSPACE}/codellama" "${WS}/codellama"
-          ln -sfn "${GITHUB_WORKSPACE}/llm-target-determinator" "${WS}/llm-target-determinator"
-          cd "${WS}"
+          # Sibling layout (pytorch / codellama / llm-target-determinator) was
+          # set up in "Set up sibling workspace for the indexer". `pytorch` is a
+          # symlink to the checkout; the script cd's between the siblings.
+          cd "${TD_WORKSPACE}"
           bash pytorch/.github/scripts/td_llm_indexer.sh
 
       - name: Upload to s3
@@ -94,7 +112,7 @@ jobs:
         env:
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          cd llm-target-determinator/assets
+          cd "${TD_WORKSPACE}/llm-target-determinator/assets"
 
           TIMESTAMP=$(date -Iseconds)
           ZIP_NAME="indexer-files-${TIMESTAMP}.zip"
