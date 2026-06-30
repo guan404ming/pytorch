@@ -20,7 +20,8 @@ class ConstTensorWrapper:
         self._tensor = tensor
 
     def data_ptr(self) -> int:
-        return self._tensor.const_data_ptr()
+        # const_data_ptr() exists at runtime but is absent from the type stubs.
+        return self._tensor.const_data_ptr()  # type: ignore[attr-defined]
 
     @property
     def dtype(self) -> torch.dtype:
@@ -41,11 +42,11 @@ class ConstTensorWrapper:
     def dim(self) -> int:
         return self._tensor.dim()
 
-    def size(self, *args: object) -> object:
-        return self._tensor.size(*args)
+    def size(self, dim: int | None = None) -> torch.Size | int:
+        return self._tensor.size() if dim is None else self._tensor.size(dim)
 
-    def stride(self, *args: object) -> object:
-        return self._tensor.stride(*args)
+    def stride(self, dim: int | None = None) -> tuple[int, ...] | int:
+        return self._tensor.stride() if dim is None else self._tensor.stride(dim)
 
     def element_size(self) -> int:
         return self._tensor.element_size()
