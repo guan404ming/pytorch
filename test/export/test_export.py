@@ -3967,17 +3967,17 @@ def forward(self, add):
             str(ep.graph_module.code).strip(),
             """\
 def forward(self, x, y):
-    foo = torch.ops.export.foo.default(x, y);  x = None
-    sym_size_int = torch.ops.aten.sym_size.int(foo, 0)
-    sym_size_int_1 = torch.ops.aten.sym_size.int(foo, 1)
+    bar = torch.ops.export.bar.default(y)
+    sym_size_int = torch.ops.aten.sym_size.int(bar, 0)
     ge = sym_size_int >= 0;  sym_size_int = None
-    _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
+    _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u2 >= 0 on node 'ge'");  ge = _assert_scalar_default = None
+    foo = torch.ops.export.foo.default(x, y);  x = y = None
+    sym_size_int_1 = torch.ops.aten.sym_size.int(foo, 0)
+    sym_size_int_2 = torch.ops.aten.sym_size.int(foo, 1)
     ge_1 = sym_size_int_1 >= 0;  sym_size_int_1 = None
-    _assert_scalar_default_1 = torch.ops.aten._assert_scalar.default(ge_1, "Runtime assertion failed for expression u1 >= 0 on node 'ge_1'");  ge_1 = _assert_scalar_default_1 = None
-    bar = torch.ops.export.bar.default(y);  y = None
-    sym_size_int_2 = torch.ops.aten.sym_size.int(bar, 0)
+    _assert_scalar_default_1 = torch.ops.aten._assert_scalar.default(ge_1, "Runtime assertion failed for expression u0 >= 0 on node 'ge_1'");  ge_1 = _assert_scalar_default_1 = None
     ge_2 = sym_size_int_2 >= 0;  sym_size_int_2 = None
-    _assert_scalar_default_2 = torch.ops.aten._assert_scalar.default(ge_2, "Runtime assertion failed for expression u2 >= 0 on node 'ge_2'");  ge_2 = _assert_scalar_default_2 = None
+    _assert_scalar_default_2 = torch.ops.aten._assert_scalar.default(ge_2, "Runtime assertion failed for expression u1 >= 0 on node 'ge_2'");  ge_2 = _assert_scalar_default_2 = None
     return (foo, bar)""",
         )
 
@@ -16569,6 +16569,7 @@ graph():
             )
 
     @testing.expectedFailureStrictV2
+    @torch._dynamo.config.patch(canonicalize_output_graph_node_order=False)
     def test_enum_str(self):
         class TensorDim(str, enum.Enum):
             DDP = "ddp"
