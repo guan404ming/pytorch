@@ -53,7 +53,7 @@ from torch.hub import tqdm
 from .. import config
 from ..backends.registry import CompilerFn, lookup_backend, register_debug_backend
 from ..debug_utils import clone_inputs_retaining_gradness
-from ..types import CompilerConfig, CompilerConfigProvider
+from ..types import CompilerConfigProvider
 
 
 log = logging.getLogger(__name__)
@@ -61,11 +61,6 @@ log = logging.getLogger(__name__)
 
 inductor_config = import_module("torch._inductor.config")
 use_buck = inductor_config.is_fbcode()
-
-
-def _no_compiler_config() -> CompilerConfig | None:
-    return None
-
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
 #                           MAIN ENTRY POINT
@@ -87,8 +82,6 @@ def _accuracy_fails(
 
 
 class WrapBackendDebug:
-    get_compiler_config: Callable[[], CompilerConfig | None]
-
     def __init__(
         self, unconfigured_compiler_fn: CompilerFn, compiler_name: str | None
     ) -> None:
@@ -100,9 +93,7 @@ class WrapBackendDebug:
         if hasattr(unconfigured_compiler_fn, "compiler_name"):
             self.__name__ = unconfigured_compiler_fn.compiler_name  # type: ignore[attr-defined]
         if isinstance(unconfigured_compiler_fn, CompilerConfigProvider):
-            self.get_compiler_config = unconfigured_compiler_fn.get_compiler_config
-        else:
-            self.get_compiler_config = _no_compiler_config
+            self.get_compiler_config = unconfigured_compiler_fn.get_compiler_config  # type: ignore[attr-defined]
 
     def __call__(
         self, gm: torch.fx.GraphModule, example_inputs: list[Any], **kwargs: Any
