@@ -4,7 +4,7 @@ Note [Opaque Objects]
 Opaque objects are the way we allow custom operators to accept a user-defined
 "black box" object as an input.
 
-There are two kinds of opaque types: VALUE type and SYMBOLIC type.
+There are two kinds of opaque types: CONSTANT type and SYMBOLIC type.
 The distinction determines how torch.compile handles the object.
 
 SYMBOLIC TYPES (default):
@@ -17,12 +17,12 @@ input to the graph.
 You can register a custom class as being a symbolic-typed opaque object class
 through `register_custom_class(MyClass, typ="symbolic")`.
 
-VALUE TYPES:
+CONSTANT TYPES:
 
-Value-typed opaque objects represent constant values.
+Constant-typed opaque objects represent constant values.
 In torch.compile, the graph specializes on the object like how other constants
 are. Therefore there are a couple of methods on the class that must be
-implemented before registering it as a value-typed opaque object class:
+implemented before registering it as a constant-typed opaque object class:
   - __eq__: torch.compile will create guards based on the equality of this
   object, meaning that a recompilation will happen if __eq__ returns False.
   - __hash__: This must be implemented for Fake Tensor caching
@@ -31,8 +31,8 @@ implemented before registering it as a value-typed opaque object class:
     where repr_string can reconstruct the object and the dict maps names used in
     repr_string to their corresponding types.
 
-You can register a custom class as being a reference-based opaque object class
-through `register_custom_class(MyClass, typ="value")`.
+You can register a custom class as being a constant-typed opaque object class
+through `register_custom_class(MyClass, typ="constant")`.
 """
 
 import logging
@@ -108,9 +108,9 @@ class _OpaqueTypeInfo:
     reconstruct_fn: ReconstructFn | None
 
 
-# Mapping of type -> (string name, reference/value type)
+# Mapping of type -> (string name, symbolic/constant type)
 _OPAQUE_TYPES: WeakKeyDictionary[Any, _OpaqueTypeInfo] = WeakKeyDictionary()
-# Mapping of class_name -> (type, reference/value type)
+# Mapping of class_name -> (type, symbolic/constant type)
 _OPAQUE_TYPES_BY_NAME: dict[str, _OpaqueTypeInfo] = {}
 
 
@@ -167,19 +167,19 @@ def register_custom_class(
 
     Args:
         cls (type): The class to register as an opaque type.
-        typ (str): Either "reference" or "value". See Note [Opaque Objects] for
+        typ (str): Either "symbolic" or "constant". See Note [Opaque Objects] for
             more details.
-        hoist (bool): Only applies to value types. A hoist=True value type
+        hoist (bool): Only applies to constant types. A hoist=True constant type
             object is lifted as an input to the torch.compile'd graph, instead
             of being a constant baked into the graph. This is useful to
             improve compilation times in hierarchical compilation
             (e.g., change your custom ops to use hoisted strings to avoid
             baking the string into the Dynamo/AOTAutograd/FX graphs).
-            This flag does nothing for reference types.
+            This flag does nothing for symbolic types.
         guard_fn (callable | None): A function that takes an instance of the opaque
             object and returns a list of values to guard on. These values will be compared
             for equality on each function call, triggering recompilation if they change.
-            Only applicable for reference types.
+            Only applicable for symbolic types.
             Example: lambda obj: [obj.x, obj.y]
         members (dict[str, MemberType] | None): Dictionary mapping member names
             (attributes, properties, or methods) to their MemberType, which controls
@@ -296,7 +296,7 @@ def register_opaque_type(
     )
 
 
-# Enums are always opaque value types.
+# Enums are always opaque constant types.
 register_custom_class(Enum, typ="constant")
 
 

@@ -124,24 +124,24 @@ A constant type is baked into the graph. It must implement `__eq__` and
 evaluable representation used when the value is emitted into the FX graph.
 
 ```{code-cell}
-class ValueConfig(CustomClassBase):
+class ConstantConfig(CustomClassBase):
     def __init__(self, mode: str):
         self.mode = mode
 
     def __eq__(self, other):
-        return isinstance(other, ValueConfig) and self.mode == other.mode
+        return isinstance(other, ConstantConfig) and self.mode == other.mode
 
     def __hash__(self):
         return hash(self.mode)
 
     def __fx_repr__(self):
         # (repr_string, {name: type}) -- repr_string must reconstruct the object
-        return f"ValueConfig(mode={self.mode!r})", {"ValueConfig": ValueConfig}
+        return f"ConstantConfig(mode={self.mode!r})", {"ConstantConfig": ConstantConfig}
 
-register_custom_class(ValueConfig, typ="constant")
+register_custom_class(ConstantConfig, typ="constant")
 
 @torch.library.custom_op("mylib::process_with_config", mutates_args=())
-def process_with_config(x: torch.Tensor, cfg: ValueConfig) -> torch.Tensor:
+def process_with_config(x: torch.Tensor, cfg: ConstantConfig) -> torch.Tensor:
     if cfg.mode == "double":
         return x * 2
     return x
@@ -154,8 +154,8 @@ def _(x, cfg):
 def f(x, cfg):
     return torch.ops.mylib.process_with_config(x, cfg)
 
-# The ValueConfig is baked into the graph as a constant.
-print(f(torch.ones(3), ValueConfig("double")))
+# The ConstantConfig is baked into the graph as a constant.
+print(f(torch.ones(3), ConstantConfig("double")))
 ```
 
 #### Symbolic type
