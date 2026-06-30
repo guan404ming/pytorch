@@ -138,7 +138,6 @@ meta_consistency_out_dtype_mismatch_xfails = {
     xfail("all"),
     xfail("amax"),
     xfail("amin"),
-    xfail("aminmax"),
     xfail("any"),
     xfail("bucketize"),
     xfail("conj_physical"),
@@ -168,6 +167,7 @@ meta_consistency_out_dtype_mismatch_xfails = {
     xfail("linalg.lu_factor"),
     xfail("linalg.lu_factor_ex"),
     xfail("linalg.lu_solve"),
+    xfail("linalg.polar"),
     xfail("linalg.qr"),
     xfail("linalg.slogdet"),
     xfail("linalg.solve"),
@@ -451,7 +451,7 @@ class TestCommon(TestCase):
                 self.assertEqual(
                     result.numel(),
                     expected_numel,
-                    f"{op.name} with dim={dim_val} should reduce numel by factor of {reduction_factor} "
+                    lambda msg: f"{msg}\n{op.name} with dim={dim_val} should reduce numel by factor of {reduction_factor} "
                     f"(input: {sample.input.numel()}, expected: {expected_numel}, got: {result.numel()})",
                 )
 
@@ -597,10 +597,11 @@ class TestCommon(TestCase):
             if skip_bfloat and (
                 (
                     isinstance(sample.input, torch.Tensor)
-                    and sample.input.dtype == torch.bfloat16
+                    and sample.input.dtype in {torch.bfloat16, torch.bcomplex32}
                 )
                 or any(
-                    isinstance(arg, torch.Tensor) and arg.dtype == torch.bfloat16
+                    isinstance(arg, torch.Tensor)
+                    and arg.dtype in {torch.bfloat16, torch.bcomplex32}
                     for arg in sample.args
                 )
             ):
@@ -913,7 +914,7 @@ class TestCommon(TestCase):
 
             msg = "Got different gradients for contiguous / non-contiguous inputs wrt input {}."
             for i, (t, n) in enumerate(zip(t_grads, n_grads)):
-                self.assertEqual(t, n, msg=msg.format(i))
+                self.assertEqual(t, n, msg=lambda _m: f"{_m}\n" + (msg.format(i)))
 
     # Separates one case from the following test_out because many ops don't properly implement the
     #   incorrectly sized out parameter warning properly yet
@@ -1535,12 +1536,20 @@ class TestCommon(TestCase):
             unittest.skip("Does not support complex32")
 
         for sample in op.sample_inputs(device, dtype):
+            # MPS doesn't support float64
+            if torch.float64 in (
+                *sample.args,
+                *sample.kwargs.values(),
+            ) and not op.supports_dtype(torch.float64, device):
+                continue
+
             actual = op(sample.input, *sample.args, **sample.kwargs)
             # sample.transform applies the lambda to torch.Tensor and torch.dtype.
             # However, we only want to apply it to Tensors with dtype `torch.complex32`..
             transformed_sample = sample.transform(
                 lambda x: x.to(torch.complex64)
-                if isinstance(x, torch.Tensor) and x.dtype is torch.complex32
+                if isinstance(x, torch.Tensor)
+                and x.dtype in (torch.complex32, torch.bcomplex32)
                 else x
             )
             expected = op(
@@ -3036,14 +3045,18 @@ class TestForwardADWithScalars(TestCase):
                 result = op(dual0d, 2.0)
                 p, t = torch.autograd.forward_ad.unpack_dual(result)
                 self.assertEqual(
-                    p.dtype, t.dtype, f"{op.name} and scalar on RHS - dtype mismatch"
+                    p.dtype,
+                    t.dtype,
+                    lambda msg: f"{msg}\n{op.name} and scalar on RHS - dtype mismatch",
                 )
             # Test with scalar on LHS
             if op.supports_one_python_scalar:
                 result = op(2.0, dual0d)
                 p, t = torch.autograd.forward_ad.unpack_dual(result)
                 self.assertEqual(
-                    p.dtype, t.dtype, f"{op.name} and scalar on LHS - dtype mismatch"
+                    p.dtype,
+                    t.dtype,
+                    lambda msg: f"{msg}\n{op.name} and scalar on LHS - dtype mismatch",
                 )
 
 
