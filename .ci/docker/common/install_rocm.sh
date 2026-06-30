@@ -146,16 +146,6 @@ ROCM_ENV
 
       echo "source /etc/rocm_env.sh" >> /etc/bash.bashrc
 
-      # Register tarball sysdeps libs (e.g. librocm_sysdeps_liblzma.so.5) with
-      # the dynamic linker so `import torch` resolves them without
-      # LD_LIBRARY_PATH (the distributed preflight runs python directly, not via
-      # test.sh which sources /etc/rocm_env.sh).
-      if [ -d /opt/rocm/lib/rocm_sysdeps/lib ]; then
-        echo "/opt/rocm/lib/rocm_sysdeps/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf
-        echo "/opt/rocm/lib" >> /etc/ld.so.conf.d/rocm-sysdeps.conf
-        ldconfig
-      fi
-
       # --- End of theRock nightly tarball installation ---
     else
       # =========================================================================

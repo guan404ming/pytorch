@@ -272,14 +272,15 @@ if [[ "$BUILD_ENVIRONMENT" != *libtorch* ]]; then
     python -m build --wheel --no-isolation
   fi
 
-  # For theRock nightly ROCm builds, the produced wheel links against sysdeps
-  # libs (e.g. librocm_sysdeps_liblzma.so.5) under /opt/rocm/lib/rocm_sysdeps/lib
-  # that are not on the default loader search path. Encode an RPATH on the torch
-  # shared objects so `import torch` resolves them straight from the wheel,
-  # without relying on LD_LIBRARY_PATH or a global ldconfig entry (mirroring the
-  # RPATH encoding used for the bundled ROCm nightly wheels). Guarded on the
-  # sysdeps dir so the apt-based ROCm path is unaffected.
-  if [[ "$BUILD_ENVIRONMENT" == *rocm* ]] && [[ -d /opt/rocm/lib/rocm_sysdeps/lib ]]; then
+  # For TheRock ROCm builds, the produced wheel links against sysdeps libs (e.g.
+  # librocm_sysdeps_liblzma.so.5) that are not on the default loader search path.
+  # Encode an RPATH on the torch shared objects so `import torch` resolves them
+  # straight from the wheel, without relying on LD_LIBRARY_PATH (mirroring the
+  # RPATH encoding used for the bundled ROCm wheels). The helper self-guards: it
+  # supports both the tarball (/opt/rocm) and TheRock-wheels (_rocm_sdk_core in
+  # site-packages, per pytorch/pytorch#188429) layouts and no-ops for the
+  # apt-based ROCm path where neither is present.
+  if [[ "$BUILD_ENVIRONMENT" == *rocm* ]]; then
     patch_rocm_sysdeps_rpath dist
   fi
 

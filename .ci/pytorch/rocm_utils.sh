@@ -57,27 +57,63 @@ build_rocm_ck_wheel() {
   echo "Finished building rocm-composable-kernel (ck4inductor) wheel at $(date)"
 }
 
-# Encode the theRock nightly sysdeps + ROCm lib dirs into the torch shared
+# Encode the TheRock ROCm runtime + sysdeps lib dirs into the torch shared
 # objects of a freshly-built wheel so the fix travels with the wheel.
 #
-# theRock nightly ROCm is installed under /opt/rocm with its OS-side sysdeps
-# (libdrm, liblzma, ...) under /opt/rocm/lib/rocm_sysdeps/lib. The torch
-# binaries built against it carry NEEDED entries such as
-# librocm_sysdeps_liblzma.so.5, but neither that dir nor /opt/rocm/lib is on the
-# default loader search path. As a result `import torch` only works when
-# LD_LIBRARY_PATH (via /etc/rocm_env.sh) or a global ldconfig entry points at
-# them -- which is not the case for e.g. the distributed pre-flight that runs
-# python directly.
+# TheRock ships OS-side sysdeps (libdrm, liblzma, ...) under
+# .../lib/rocm_sysdeps/lib and the torch binaries built against it carry NEEDED
+# entries such as librocm_sysdeps_liblzma.so.5. Those dirs are not on the
+# default loader search path, so `import torch` only works when LD_LIBRARY_PATH
+# (via /etc/rocm_env.sh) points at them -- which is NOT the case for e.g. the
+# distributed pre-flight that runs python directly. Encode them as RPATH on the
+# torch .so files instead (preserving torch's own $ORIGIN entries), mirroring
+# how .ci/manywheel/repair_wheel.py / cuda_rpaths() encode RPATHs on the bundled
+# wheels, so the wheel is self-resolving regardless of the environment.
 #
-# Mirroring how .ci/manywheel/repair_wheel.py encodes RPATHs on the bundled ROCm
-# nightly wheels, we append these dirs to the RPATH of the torch .so files in
-# the produced wheel (preserving torch's own $ORIGIN entries) so it is
-# self-resolving regardless of the environment. Guarded by the caller on the
-# existence of the sysdeps dir so the apt-based ROCm path is unaffected.
+# Two ROCm layouts are supported so this works before AND after the tarball ->
+# wheels migration (pytorch/pytorch#188429) without depending on /opt/rocm:
+#   * TheRock wheels (pytorch/pytorch#188429): the `rocm` pip package unpacks
+#     under <site-packages>/_rocm_sdk_core (verified by torch/utils/cpp_extension.py),
+#     a sibling of torch/ in site-packages -> reachable via an $ORIGIN-relative
+#     RPATH so the produced wheel stays self-contained.
+#   * Tarball install (current rocm-nightly): libs live at /opt/rocm/lib and
+#     /opt/rocm/lib/rocm_sysdeps/lib -> added as an absolute RPATH only if that
+#     dir exists.
+# Both entries may be added together and are harmless when one layout is absent,
+# so neither breaks the other across the migration. No-ops (and patches nothing)
+# when neither layout is present, e.g. the apt-based ROCm path.
 # Usage: patch_rocm_sysdeps_rpath <wheel_dir>
 patch_rocm_sysdeps_rpath() {
   local wheel_dir="${1:?patch_rocm_sysdeps_rpath: wheel directory required}"
-  local extra_rpath="/opt/rocm/lib/rocm_sysdeps/lib:/opt/rocm/lib"
+
+  local extra_rpath=""
+
+  # TheRock wheel layout: derive an $ORIGIN-relative path from torch/lib to the
+  # _rocm_sdk_core lib dir. relpath is computed at build time so the wheel does
+  # not hardcode the absolute site-packages location.
+  local rocm_rel
+  rocm_rel="$(python3 -c '
+import importlib.util, os, sysconfig
+spec = importlib.util.find_spec("_rocm_sdk_core")
+if spec and spec.origin:
+    root_lib = os.path.join(os.path.dirname(spec.origin), "lib")
+    torch_lib = os.path.join(sysconfig.get_path("purelib"), "torch", "lib")
+    print(os.path.relpath(root_lib, torch_lib))
+' 2>/dev/null || true)"
+  if [ -n "$rocm_rel" ]; then
+    extra_rpath="\$ORIGIN/${rocm_rel}:\$ORIGIN/${rocm_rel}/rocm_sysdeps/lib"
+  fi
+
+  # Tarball layout: absolute /opt/rocm dirs (only present in the tarball world).
+  if [ -d /opt/rocm/lib/rocm_sysdeps/lib ]; then
+    extra_rpath="${extra_rpath:+${extra_rpath}:}/opt/rocm/lib/rocm_sysdeps/lib:/opt/rocm/lib"
+  fi
+
+  if [ -z "$extra_rpath" ]; then
+    echo "patch_rocm_sysdeps_rpath: no TheRock ROCm sysdeps layout detected; skipping"
+    return 0
+  fi
+  echo "patch_rocm_sysdeps_rpath: appending RPATH entries: ${extra_rpath}"
 
   # `wheel` (unpack/pack) and `patchelf` may not be present in the build image.
   python -m pip install wheel patchelf
