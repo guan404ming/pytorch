@@ -56,3 +56,59 @@ build_rocm_ck_wheel() {
   rm -rf "$ck_dir"
   echo "Finished building rocm-composable-kernel (ck4inductor) wheel at $(date)"
 }
+
+# Encode the theRock nightly sysdeps + ROCm lib dirs into the torch shared
+# objects of a freshly-built wheel so the fix travels with the wheel.
+#
+# theRock nightly ROCm is installed under /opt/rocm with its OS-side sysdeps
+# (libdrm, liblzma, ...) under /opt/rocm/lib/rocm_sysdeps/lib. The torch
+# binaries built against it carry NEEDED entries such as
+# librocm_sysdeps_liblzma.so.5, but neither that dir nor /opt/rocm/lib is on the
+# default loader search path. As a result `import torch` only works when
+# LD_LIBRARY_PATH (via /etc/rocm_env.sh) or a global ldconfig entry points at
+# them -- which is not the case for e.g. the distributed pre-flight that runs
+# python directly.
+#
+# Mirroring how .ci/manywheel/repair_wheel.py encodes RPATHs on the bundled ROCm
+# nightly wheels, we append these dirs to the RPATH of the torch .so files in
+# the produced wheel (preserving torch's own $ORIGIN entries) so it is
+# self-resolving regardless of the environment. Guarded by the caller on the
+# existence of the sysdeps dir so the apt-based ROCm path is unaffected.
+# Usage: patch_rocm_sysdeps_rpath <wheel_dir>
+patch_rocm_sysdeps_rpath() {
+  local wheel_dir="${1:?patch_rocm_sysdeps_rpath: wheel directory required}"
+  local extra_rpath="/opt/rocm/lib/rocm_sysdeps/lib:/opt/rocm/lib"
+
+  # `wheel` (unpack/pack) and `patchelf` may not be present in the build image.
+  python -m pip install wheel patchelf
+
+  local tmp
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  local whl
+  for whl in "${wheel_dir}"/torch-*.whl; do
+    [ -f "$whl" ] || continue
+    echo "Encoding ROCm sysdeps RPATH into $(basename "$whl")"
+    local unpack_dir="${tmp}/unpack"
+    rm -rf "$unpack_dir"
+    wheel unpack "$whl" -d "$unpack_dir"
+
+    local torch_dir
+    torch_dir="$(echo "${unpack_dir}"/torch-*/torch)"
+    local sofile cur
+    for sofile in "${torch_dir}"/*.so* "${torch_dir}"/lib/*.so*; do
+      [ -f "$sofile" ] || continue
+      cur="$(patchelf --print-rpath "$sofile" 2>/dev/null || true)"
+      if [ -n "$cur" ]; then
+        patchelf --force-rpath --set-rpath "${cur}:${extra_rpath}" "$sofile"
+      else
+        patchelf --force-rpath --set-rpath "${extra_rpath}" "$sofile"
+      fi
+    done
+
+    rm -f "$whl"
+    wheel pack "${unpack_dir}"/torch-*/ -d "$wheel_dir"
+  done
+}
