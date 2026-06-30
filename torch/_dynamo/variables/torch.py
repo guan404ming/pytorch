@@ -2548,10 +2548,9 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
             match message_vt:
                 case None:
                     pass
-                case _ if type(message_vt) in (
-                    NestedUserFunctionVariable,
-                    UserFunctionVariable,
-                ):
+                case NestedUserFunctionVariable() | UserFunctionVariable() if type(
+                    message_vt
+                ) in (NestedUserFunctionVariable, UserFunctionVariable):
                     # These report is_python_constant() True (as_python_constant
                     # returns the underlying fn), so this arm must precede the
                     # constant arm below. Restrict to exact types: other
