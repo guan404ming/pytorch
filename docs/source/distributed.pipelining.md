@@ -110,6 +110,22 @@ else:
     output = schedule.step()
 ```
 
+If your input pipeline already produces microbatches, pass them directly and
+set `pre_split_args_kwargs=True`:
+
+```python
+arg_mbs = [(x0,), (x1,)]
+kwarg_mbs = [{"mask": mask0}, {"mask": mask1}]
+target_mbs = [target0, target1]
+
+schedule.step(
+    arg_mbs,
+    kwargs=kwarg_mbs,
+    target=target_mbs,
+    pre_split_args_kwargs=True,
+)
+```
+
 Note that the above code needs to be launched for each worker, thus we use a
 launcher service to launch multiple processes:
 
