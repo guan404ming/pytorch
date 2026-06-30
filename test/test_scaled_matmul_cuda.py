@@ -52,6 +52,7 @@ from torch.testing._internal.common_utils import (
     random_matrix_with_scaled_reduction_dim,
     run_tests,
     runOnRocmArch,
+    skipIfNoCuteDSL,
     skipIfRocm,
     skipIfTorchDynamo,
     TEST_CUDA,
@@ -81,7 +82,6 @@ mxfp8_grouped_mm_skip_msg = "MXFP8 grouped GEMM is only supported when PyTorch i
 
 # avoid division by zero when calculating scale
 EPS = 1e-12
-
 
 
 def amax_to_scale(
@@ -292,6 +292,96 @@ def scaled_grouped_mm_wrap(
             bias=bias,
             output_dtype=out_dtype,
             use_fast_accum=use_fast_accum)
+
+
+_CPP_SCALED_GROUPED_MM_V2_KERNEL = None
+
+
+def _get_cpp_scaled_grouped_mm_v2_kernel():
+    global _CPP_SCALED_GROUPED_MM_V2_KERNEL
+    if _CPP_SCALED_GROUPED_MM_V2_KERNEL is None:
+        from torch._native import registry
+
+        registry.deregister_op_overrides(disable_dsl_names="cutedsl")
+        try:
+            _CPP_SCALED_GROUPED_MM_V2_KERNEL = torch._C._dispatch_get_computed_kernel_for_dispatch_key(  # pyrefly: ignore [missing-module-attribute]
+                "aten::_scaled_grouped_mm_v2", "CUDA"
+            )
+        finally:
+            registry.reenable_op_overrides(enable_dsl_names="cutedsl")
+    return _CPP_SCALED_GROUPED_MM_V2_KERNEL
+
+
+def _cuda_dispatch_keyset(device_type: str):
+    dispatch_key = torch._C._dispatch_key_for_device(
+        device_type
+    )  # pyrefly: ignore [missing-module-attribute]
+    dispatch_key = getattr(
+        torch._C.DispatchKey, dispatch_key
+    )  # pyrefly: ignore [missing-module-attribute]
+    return torch._C.DispatchKeySet(
+        dispatch_key
+    )  # pyrefly: ignore [missing-module-attribute]
+
+
+def _as_arg_list(value):
+    return value if isinstance(value, list) else [value]
+
+
+def _enum_values(value):
+    return [v.value if hasattr(v, "value") else v for v in _as_arg_list(value)]
+
+
+def scaled_grouped_mm_cpp_wrap(
+    a,
+    b,
+    scale_a,
+    scale_b,
+    scale_recipe_a,
+    scale_recipe_b,
+    swizzle_a=SwizzleType.NO_SWIZZLE,
+    swizzle_b=SwizzleType.NO_SWIZZLE,
+    scale_result=None,
+    out_dtype=torch.bfloat16,
+    use_fast_accum=False,
+    offs=None,
+    bias=None,
+    wrap_v2=True,
+):
+    if not wrap_v2:
+        return scaled_grouped_mm_wrap(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            scale_recipe_a,
+            scale_recipe_b,
+            swizzle_a=swizzle_a,
+            swizzle_b=swizzle_b,
+            scale_result=scale_result,
+            out_dtype=out_dtype,
+            use_fast_accum=use_fast_accum,
+            offs=offs,
+            bias=bias,
+            wrap_v2=wrap_v2,
+        )
+
+    return _get_cpp_scaled_grouped_mm_v2_kernel().call_boxed(
+        _cuda_dispatch_keyset(a.device.type),
+        a,
+        b,
+        _as_arg_list(scale_a),
+        _enum_values(scale_recipe_a),
+        _enum_values(swizzle_a),
+        _as_arg_list(scale_b),
+        _enum_values(scale_recipe_b),
+        _enum_values(swizzle_b),
+        offs,
+        bias,
+        out_dtype,
+        [],
+        use_fast_accum,
+    )
 
 
 
@@ -732,6 +822,7 @@ class TestFP8Matmul(TestCase):
         self.assertEqual(out_fp8, out_fp8_s)
 
 
+    @onlyCUDA
     @unittest.skipIf(not PLATFORM_SUPPORTS_MXFP8_GROUPED_GEMM, mxfp8_grouped_mm_skip_msg)
     @parametrize("G", [1, 4, 16])
     @parametrize("M", [2048, 2049])
@@ -802,13 +893,20 @@ class TestFP8Matmul(TestCase):
         # Assert outputs are close
         torch.testing.assert_close(y_lp, y_bf16, atol=8.0e-2, rtol=8.0e-2)
 
+    @onlyCUDA
     @unittest.skipIf(not PLATFORM_SUPPORTS_MXFP8_GROUPED_GEMM, mxfp8_grouped_mm_skip_msg)
     @parametrize("G", [1, 4, 16])
     @parametrize("M", [16640])
     @parametrize("N", [8192])
     @parametrize("K", [4096])
     @parametrize("format", ["mxfp8"] + (["nvfp4", "mxfp4"] if torch.version.cuda else []))
+    @skipIfNoCuteDSL
     def test_mxfp8_scaled_grouped_mm_2d_3d(self, G, M, N, K, format, device):
+        from torch._native import registry
+
+        if "_scaled_grouped_mm_v2" not in registry.get_dsl_operations("cutedsl"):
+            raise unittest.SkipTest("CuTeDSL scaled_grouped_mm override not registered")
+
         torch.manual_seed(42)
 
         if format == "mxfp4" and SM120OrLater:
@@ -934,6 +1032,11 @@ class TestFP8Matmul(TestCase):
             wq.transpose(-2, -1),
             **kwargs
         )
+        y_cpp = scaled_grouped_mm_cpp_wrap(
+            xq,
+            wq.transpose(-2, -1),
+            **kwargs
+        )
 
         # Compute reference bf16 grouped gemm.
         # Note: Reference result should be on reconstructed, not original values.
@@ -946,6 +1049,7 @@ class TestFP8Matmul(TestCase):
         )
 
         # Assert outputs are close.
+        torch.testing.assert_close(y_lp, y_cpp, atol=8.0e-2, rtol=8.0e-2)
         torch.testing.assert_close(y_lp, y_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
