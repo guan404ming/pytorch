@@ -77,6 +77,7 @@ from ..utils import (
     base_exception_methods,
     check_constant_args,
     cmp_name_to_op_mapping,
+    deque_methods,
     dict_methods,
     exception_methods,
     frozenset_methods,
@@ -111,7 +112,11 @@ from .base import (
 )
 from .dicts import ConstDictVariable, pydict_check
 from .hashable import HashableTracker
-from .object_protocol import is_nb_not_implemented, type_implements_nb_slot
+from .object_protocol import (
+    generic_repr,
+    is_nb_not_implemented,
+    type_implements_nb_slot,
+)
 from .sets import SetVariable
 
 
@@ -390,6 +395,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
             int.__new__,
             float.__new__,
             str.__new__,
+            collections.deque.__new__,
         }
         return c_new_fns.union(exceptions)
 
@@ -483,13 +489,23 @@ class UserDefinedClassVariable(UserDefinedVariable):
     def repr_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
         # https://github.com/python/cpython/blob/3.13/Objects/typeobject.c#L2379-L2408
         metaclass = type(self.value)
-        if metaclass is type or type(self.value).__repr__ is type.__repr__:
+        if metaclass is type or metaclass.__repr__ is type.__repr__:
             return VariableTracker.build(tx, repr(self.value))
 
         type_attr = self.lookup_metaclass_attr("__repr__")
         if type_attr is None:
             raise_type_error(tx, "'NoneType' object is not callable")
         return self.call_method(tx, "__repr__", [], {})
+
+    def str_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        metaclass = type(self.value)
+        if metaclass is type or metaclass.__str__ is type.__str__:
+            return generic_repr(tx, self)
+
+        type_attr = self.lookup_metaclass_attr("__str__")
+        if type_attr is None:
+            raise_type_error(tx, "'NoneType' object is not callable")
+        return self.call_method(tx, "__str__", [], {})
 
     def nb_or_impl(
         self,
@@ -1050,7 +1066,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
             # unreconstructable args (e.g. generators).  Other tp_new functions
             # (tuple.__new__, BaseException.__new__) use the extra args.
             new_fn = self.value.__new__
-            if new_fn in (dict.__new__, set.__new__):
+            if new_fn in (dict.__new__, set.__new__, collections.deque.__new__):
                 init_args: list[VariableTracker] = []
             else:
                 init_args = list(args[1:])
@@ -1895,8 +1911,6 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
-        from .object_protocol import generic_repr
-
         type_attr = self.lookup_class_mro_attr("__str__")
         if type_attr is NO_SUCH_SUBOBJ:
             return super().str_impl(tx)
@@ -2836,6 +2850,15 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                     return variables.UserMethodVariable(
                         traceable_fn, self
                     ).call_function(tx, args, kwargs)
+
+        if name == "__call__":
+            unimplemented(
+                gb_type="call to a callable object with no traceable __call__",
+                context=f"object={self.value}",
+                explanation="Dynamo could not trace a Python `__call__` method on "
+                "this object.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
 
         return super().call_method(tx, name, args, kwargs)
 
@@ -4319,6 +4342,12 @@ class UserDefinedExceptionObjectVariable(UserDefinedObjectVariable):
             return super().repr_impl(tx)
         return self.exc_vt.repr_impl(tx)
 
+    def str_impl(self, tx: "InstructionTranslatorBase") -> "VariableTracker":
+        # ref: BaseException_str in https://github.com/python/cpython/blob/3.13/Objects/exceptions.c#L118-L129
+        if type(self.value).__str__ is not BaseException.__str__:
+            return super().str_impl(tx)
+        return self.exc_vt.str_impl(tx)
+
     @python_stack.setter
     def python_stack(self, value: traceback.StackSummary) -> None:
         self._base_vt.python_stack = value  # type: ignore[missing-attribute]
@@ -5162,6 +5191,47 @@ class UserDefinedListVariable(UserDefinedObjectVariable):
         self._base_methods = list_methods
         if self._base_vt is None:
             raise AssertionError("_base_vt must not be None after initialization")
+
+
+class UserDefinedDequeVariable(UserDefinedObjectVariable):
+    """
+    Represents user defined objects that are subclasses of collections.deque.
+
+    Internally, it uses a DequeVariable to represent the deque part of the
+    variable tracker. For everything else, it falls back to
+    UserDefinedObjectVariable.
+    """
+
+    def __init__(
+        self,
+        value: object,
+        deque_vt: Union["variables.lists.DequeVariable", None] = None,
+        **kwargs: Any,
+    ) -> None:
+        from .lists import DequeVariable
+
+        super().__init__(value, **kwargs)
+        if deque_vt is None:
+            if self.source is not None:
+                raise AssertionError(
+                    "deque_vt must be constructed by builder.py when source is present"
+                )
+            self._base_vt = DequeVariable([], mutation_type=ValueMutationNew())
+        else:
+            self._base_vt = deque_vt
+        self._base_methods = deque_methods
+        if self._base_vt is None:
+            raise AssertionError("_base_vt must not be None after initialization")
+
+    def var_getattr(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> VariableTracker:
+        # maxlen is a read-only getset on deque, not a method, so it is not
+        # covered by the _base_methods call_method delegation; route it to the
+        # DequeVariable which tracks maxlen on the base deque.
+        if name == "maxlen" and self._base_vt is not None:
+            return self._base_vt.var_getattr(tx, name)
+        return super().var_getattr(tx, name)
 
 
 class UserDefinedTupleVariable(UserDefinedObjectVariable):
