@@ -8,10 +8,10 @@
 #include <cuda_runtime.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 
-#include "nccl.h"
-#include "torch/csrc/distributed/c10d/nccltc/CudaApi.hpp"
-#include "torch/csrc/distributed/c10d/nccltc/NcclApi.hpp"
-#include "torch/csrc/distributed/c10d/nccltc/TorchCommOptions.hpp"
+#include <nccl.h>
+#include <torch/csrc/distributed/c10d/nccltc/CudaApi.hpp>
+#include <torch/csrc/distributed/c10d/nccltc/NcclApi.hpp>
+#include <torch/csrc/distributed/c10d/nccltc/TorchCommOptions.hpp>
 
 namespace c10d::nccltc {
 
