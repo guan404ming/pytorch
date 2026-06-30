@@ -413,17 +413,41 @@ def _unwrap_efc_compiled_obj(compiled_obj):
     return compiled_obj
 
 
-def _rewrap_efc_compiled_obj(compiled_fn, kernel):
+def _init_efc_jit(kernel, epilogue_args):
+    """Lightweight EFC JIT init from epilogue args, without a full kernel.compile().
+
+    EFC.compile() calls analyze_epilogue_with_arguments() then creates the JIT
+    object. We replicate just those two steps so that disk-cached artifacts can
+    be rewrapped without recompiling the CuTe DSL kernel.
+    """
+    from cutlass_api.providers.cutedsl.evt.common_efc import EFC
+    from cutlass_api.utils import TensorWrapper
+
+    efc = kernel.impl.efc
+    params = [
+        e.compile_time_tensor if isinstance(e, TensorWrapper) else e
+        for e in epilogue_args.parameters
+    ]
+    efc.analyze_epilogue_with_arguments(params)
+    efc.jit = EFC.JIT(efc, efc.epilogue_parameter_names)
+
+
+def _rewrap_efc_compiled_obj(compiled_fn, kernel, epilogue_args=None):
     """Reconstruct the EFC wrapped_launch closure from a loaded JIT function.
 
-    Returns None if the kernel's EFC JIT state is not yet initialized
-    (e.g. when loading from disk cache before kernel.compile has run),
-    signaling the caller to fall through and recompile.
+    When epilogue_args is provided and efc.jit is missing, performs a
+    lightweight initialization (analyze + JIT creation) so that
+    disk-cached EFC artifacts can be reused without a full recompile.
+    Falls back to returning None (triggering recompile) only when
+    epilogue_args is not available.
     """
     if not hasattr(kernel, "impl") or not hasattr(kernel.impl, "efc"):
         return compiled_fn
     if not hasattr(kernel.impl.efc, "jit"):
-        return None
+        if epilogue_args is not None:
+            _init_efc_jit(kernel, epilogue_args)
+        else:
+            return None
 
     from cutlass_api.providers.cutedsl.gemm.sm100_static_persistent_efc import (
         KernelOperand,
@@ -501,7 +525,11 @@ def _nvgemm_run(
                 dev_idx,
             )
             if compiled_fn is not None:
-                compiled_fn = _rewrap_efc_compiled_obj(compiled_fn, kernel)
+                compiled_fn = _rewrap_efc_compiled_obj(
+                    compiled_fn,
+                    kernel,
+                    epilogue_args=epilogue_args,
+                )
             if compiled_fn is not None:
                 return CompiledArtifact(compiled_fn, kernel)
             return None
