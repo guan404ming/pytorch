@@ -277,9 +277,8 @@ if [[ "$BUILD_ENVIRONMENT" != *libtorch* ]]; then
   # Encode an RPATH on the torch shared objects so `import torch` resolves them
   # straight from the wheel, without relying on LD_LIBRARY_PATH (mirroring the
   # RPATH encoding used for the bundled ROCm wheels). The helper self-guards: it
-  # supports both the tarball (/opt/rocm) and TheRock-wheels (_rocm_sdk_core in
-  # site-packages, per pytorch/pytorch#188429) layouts and no-ops for the
-  # apt-based ROCm path where neither is present.
+  # targets the TheRock-wheels layout (_rocm_sdk_core in site-packages) and
+  # no-ops for the apt-based ROCm path where it is absent.
   if [[ "$BUILD_ENVIRONMENT" == *rocm* ]]; then
     patch_rocm_sysdeps_rpath dist
   fi
