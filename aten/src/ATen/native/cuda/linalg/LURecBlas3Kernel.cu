@@ -278,7 +278,6 @@ setup_pivinfo_kernel(
       }
     }
   }
-  __syncthreads();
 }
 
 // Row-parallel swap: exact copy of MAGMA's dlaswp_rowparallel_devfunc.
