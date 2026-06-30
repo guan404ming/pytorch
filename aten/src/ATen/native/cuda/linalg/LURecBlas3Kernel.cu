@@ -7,6 +7,8 @@
 #include <c10/util/complex.h>
 #include <ATen/native/cuda/MiscUtils.h>
 
+#include <thrust/swap.h>
+
 /*
   The following file contains implementation for a batched LU-factorization with partial pivoting.
   The approach is a recursive panel factorization with trailing matrix updates delegated to GEMMs/TRSMs.
@@ -274,9 +276,7 @@ setup_pivinfo_kernel(
       int local_src = i;                         // relative index of row (row_offset + i)
       int local_dst = swap_target - row_offset;  // relative index of swap target
       if (local_src != local_dst) {
-        int tmp = piv[local_src];
-        piv[local_src] = piv[local_dst];
-        piv[local_dst] = tmp;
+        thrust::swap(piv[local_src], piv[local_dst]);
       }
     }
   }
@@ -444,9 +444,7 @@ batched_panel_full_kernel(
       for (int j = tid; j < nb; j += BS) {
         size_t idx1 = k + static_cast<size_t>(col_start + j) * lda;
         size_t idx2 = pivot_row + static_cast<size_t>(col_start + j) * lda;
-        auto tmp = A[idx1];
-        A[idx1] = A[idx2];
-        A[idx2] = tmp;
+        thrust::swap(A[idx1], A[idx2]);
       }
     }
 
