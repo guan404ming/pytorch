@@ -357,7 +357,7 @@ class StructuredTraceTest(TestCase):
 
     @requires_cuda_and_triton
     def test_cudagraphs(self):
-        fn_opt = torch.compile(mode="reduce-overhead")(inductor_schedule_fn)
+        fn_opt = torch.compile(mode="reduce-overhead")(inductor_schedule_fn)  # noqa: UNSPECIFIED_BACKEND
         fn_opt(torch.ones(1000, 1000, device="cuda"))
         self.assertExpectedInline(
             self.buffer.getvalue(),
@@ -1123,7 +1123,7 @@ def forward(self, x_1: "f32[2][1]cpu"):
 
             return grads
 
-        fn_opt = torch.compile(fn)
+        fn_opt = torch.compile(fn)  # noqa: UNSPECIFIED_BACKEND
         fn_opt()
         self.assertParses()
         expected = [
@@ -1165,7 +1165,7 @@ def forward(self, x_1: "f32[2][1]cpu"):
         def f(x):
             return x + 1
 
-        f = torch.compile(f)
+        f = torch.compile(f)  # noqa: UNSPECIFIED_BACKEND
 
         def user_context() -> str:
             nonlocal num_calls
@@ -1199,7 +1199,7 @@ def forward(self, x_1: "f32[2][1]cpu"):
         def f(x):
             return x + 1
 
-        f = torch.compile(f)
+        f = torch.compile(f)  # noqa: UNSPECIFIED_BACKEND
 
         def user_context() -> str:
             return "user_context: " + str(step.step)
