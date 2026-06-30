@@ -267,7 +267,7 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::allgather(
   auto staging = at::empty(
       {static_cast<int64_t>(getSize()) * input.numel()},
       input.options().memory_format(at::MemoryFormat::Contiguous));
-  auto work = all_gather_single(staging, input, opts.asyncOp, timeout);
+  auto work = allGatherSingleImpl(staging, input, opts.asyncOp, timeout);
   work->setOutputs(outputList);
   auto rows = staging.view({getSize(), input.numel()});
   work->wait();
@@ -303,7 +303,7 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::
       outputs.size() == 1 && inputs.size() == 1,
       "Only single tensor supported");
   ensureInitialized(inputs.at(0).device());
-  auto work = all_gather_single(
+  auto work = allGatherSingleImpl(
       outputs.at(0),
       inputs.at(0),
       opts.asyncOp,
@@ -317,7 +317,7 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::_allgather_base(
     at::Tensor& inputBuffer,
     const ::c10d::AllgatherOptions& opts) {
   ensureInitialized(inputBuffer.device());
-  auto work = all_gather_single(
+  auto work = allGatherSingleImpl(
       outputBuffer, inputBuffer, opts.asyncOp, operationTimeout(opts.timeout));
   work->setOutputs(std::vector<at::Tensor>{outputBuffer});
   return work;
@@ -395,7 +395,7 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::
       outputs.size() == 1 && inputs.size() == 1,
       "Only single tensor supported");
   ensureInitialized(outputs.at(0).device());
-  auto work = reduce_scatter_single(
+  auto work = reduceScatterSingleImpl(
       outputs.at(0),
       inputs.at(0),
       opts.reduceOp,
@@ -410,7 +410,7 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::_reduce_scatter_base(
     at::Tensor& inputBuffer,
     const ::c10d::ReduceScatterOptions& opts) {
   ensureInitialized(outputBuffer.device());
-  auto work = reduce_scatter_single(
+  auto work = reduceScatterSingleImpl(
       outputBuffer,
       inputBuffer,
       opts.reduceOp,
@@ -430,7 +430,7 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::alltoall_base(
   auto timeout = operationTimeout(opts.timeout);
   if (outputSplitSizes.empty() && inputSplitSizes.empty()) {
     auto work =
-        all_to_all_single(outputBuffer, inputBuffer, opts.asyncOp, timeout);
+        allToAllSingleImpl(outputBuffer, inputBuffer, opts.asyncOp, timeout);
     work->setOutputs(std::vector<at::Tensor>{outputBuffer});
     return work;
   }
