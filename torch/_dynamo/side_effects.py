@@ -754,7 +754,7 @@ class SideEffects:
             obj = nn_module_new(user_cls)
         else:
             if isinstance(base_cls_vt, variables.BuiltinVariable):
-                base_cls = cast("type[Any]", base_cls_vt.fn)
+                base_cls = cast(Any, base_cls_vt.fn)
             elif isinstance(base_cls_vt, variables.DictBuiltinVariable):
                 base_cls = dict
             elif isinstance(base_cls_vt, variables.ListBuiltinVariable):
