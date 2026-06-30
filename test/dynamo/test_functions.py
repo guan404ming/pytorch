@@ -292,6 +292,30 @@ class FunctionTests(torch._dynamo.test_case.TestCase):
     def test_functools_partial(a, b):
         return clip01(a + b)
 
+    def test_functools_partial_from_unregistered_module(self):
+        module_name = "test_dynamo_unregistered_module"
+        self.assertNotIn(module_name, sys.modules)
+        module = types.ModuleType(module_name)
+        exec(
+            """
+import functools
+import torch
+
+def helper(x, scale):
+    return torch.nn.functional.normalize(x, dim=-1) * scale
+
+def fn(x, scale):
+    return helper(x, scale)
+
+partial_fn = functools.partial(fn, scale=2)
+""",
+            module.__dict__,
+        )
+
+        x = torch.randn(4, 4)
+        compiled_fn = torch.compile(module.partial_fn, backend="eager", fullgraph=True)
+        self.assertEqual(compiled_fn(x), module.partial_fn(x))
+
     @make_test
     def test_itertools_product(a, b):
         v = a
@@ -2602,6 +2626,60 @@ class FunctionTests(torch._dynamo.test_case.TestCase):
             return x + 1
         else:
             return x - 1
+
+    def test_backend_availability_predicates(self):
+        def is_mps_available():
+            return (
+                hasattr(torch.backends, "mps")
+                and torch.backends.mps.is_available()
+                and torch.backends.mps.is_built()
+            )
+
+        def is_mtia_available():
+            return hasattr(torch, "mtia") and torch.mtia.is_available()
+
+        def clear_device_cache_like(x):
+            if is_mps_available():
+                return x + 1
+            elif torch.mps.is_available():
+                return x + 2
+            elif is_mtia_available():
+                return x + 3
+            elif torch.cuda.is_available():
+                return x + 4
+            elif torch.xpu.is_available():
+                return x + 5
+            elif torch.accelerator.is_available():
+                return x + 6
+            return x - 1
+
+        x = torch.randn(3)
+        opt_fn = torch.compile(clear_device_cache_like, backend="eager", fullgraph=True)
+        self.assertEqual(opt_fn(x), clear_device_cache_like(x))
+
+        def top_level_predicates(x):
+            if torch.mps.is_available():
+                x = x + 7
+            else:
+                x = x - 7
+            if torch.mtia.is_available():
+                x = x + 11
+            else:
+                x = x - 11
+            return x
+
+        opt_fn = torch.compile(top_level_predicates, backend="eager", fullgraph=True)
+        self.assertEqual(opt_fn(x), top_level_predicates(x))
+
+    def test_backend_mps_is_built(self):
+        def fn(x):
+            if torch.backends.mps.is_built():
+                return x + 1
+            return x - 1
+
+        x = torch.randn(3)
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(opt_fn(x), fn(x))
 
     @unittest.skipIf(
         not torch.distributed.is_available(), "requires distributed package"

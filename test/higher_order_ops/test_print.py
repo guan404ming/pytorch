@@ -501,7 +501,7 @@ x = add_1, y = add_2);  getitem = None
         self.assertEqual(
             fusion_ops_no_print,
             fusion_ops_with_print,
-            f"Fusion patterns differ!\n"
+            lambda msg: f"{msg}\nFusion patterns differ!\n"
             f"Without print: {fusion_ops_no_print}\n"
             f"With print: {fusion_ops_with_print}",
         )
@@ -573,7 +573,7 @@ x = add_1, y = add_2);  getitem = None
         self.assertEqual(
             fusion_ops_no_print,
             fusion_ops_with_print,
-            f"Fusion patterns differ!\n"
+            lambda msg: f"{msg}\nFusion patterns differ!\n"
             f"Without print: {fusion_ops_no_print}\n"
             f"With print: {fusion_ops_with_print}",
         )
