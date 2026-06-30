@@ -279,7 +279,7 @@ from .nn_module import (
     UnspecializedNNModuleVariable,
 )
 from .optimizer import OptimizerVariable
-from .script_object import OpaqueObjectClassVariable, TorchScriptObjectVariable
+from .script_object import CustomClassObjectVariable, CustomClassVariable
 from .sdpa import SDPAParamsVariable
 from .sets import (
     DictKeySetVariable,
@@ -864,7 +864,7 @@ class VariableBuilder:
             TensorWithTFOverrideVariable,
             UserDefinedObjectVariable,
             NumpyNdarrayVariable,
-            TorchScriptObjectVariable,
+            CustomClassObjectVariable,
         }
 
     def get_source(self) -> Source:
@@ -1904,7 +1904,7 @@ class VariableBuilder:
                 )
 
             if is_opaque_type(value):
-                return OpaqueObjectClassVariable(
+                return CustomClassVariable(
                     value,
                     source=self.source,
                 )
@@ -1932,14 +1932,14 @@ class VariableBuilder:
             # tracing, but in dynamo we handle it as a regular object so that
             # trace_rules-based graph breaks (e.g. initial_seed, manual_seed)
             # work gracefully — allowing dynamo to compile code before and
-            # after the generator call. TorchScriptObjectVariable's var_getattr
+            # after the generator call. CustomClassObjectVariable's var_getattr
             # and call_method are decorated with @_raise_hard_error_if_graph_break,
             # which turns any graph break into a hard error that falls back to
             # eager for the entire function. Generator methods intentionally
             # graph-break (they mutate/read RNG state), so they need the
             # UserDefinedObjectVariable path which supports graceful graph breaks.
             return self.wrap_user_defined(value)
-        elif TorchScriptObjectVariable.is_matching_cls(type(value)):
+        elif CustomClassObjectVariable.is_matching_cls(type(value)):
             from ..source import (
                 FlattenScriptObjectSource,
                 ScriptObjectQualifiedNameSource,
@@ -1971,7 +1971,7 @@ class VariableBuilder:
                     False,
                     value,  # type: ignore[arg-type]
                 )
-                return TorchScriptObjectVariable.create(
+                return CustomClassObjectVariable.create(
                     proxy,
                     value,
                     source=self.source,
@@ -2047,7 +2047,7 @@ class VariableBuilder:
                     fake_script_obj,  # type: ignore[arg-type]
                 )
 
-            return TorchScriptObjectVariable.create(
+            return CustomClassObjectVariable.create(
                 proxy,  # pyrefly: ignore[bad-argument-type]
                 fake_script_obj,
                 source=self.source,
@@ -4063,7 +4063,7 @@ def handle_traced_output(
         # example_value is already a FakeScriptObject (e.g. returned by getitem
         # on a container whose fake kernel returns a FakeScriptObject).  No need
         # to convert it — just wrap the proxy directly.
-        return TorchScriptObjectVariable.create(
+        return CustomClassObjectVariable.create(
             proxy,
             example_value,
             tx=tx,
@@ -4071,7 +4071,7 @@ def handle_traced_output(
     elif is_opaque_type(type(example_value)):
         # This is for handling opaque objects in custom ops
         if is_opaque_constant_type(type(example_value)):
-            return TorchScriptObjectVariable.create(
+            return CustomClassObjectVariable.create(
                 example_value,  # pyrefly: ignore[bad-argument-type]
                 example_value,
                 tx=tx,
@@ -4079,7 +4079,7 @@ def handle_traced_output(
         fake_script_obj = torch._library.fake_class_registry.maybe_to_fake_obj(
             tx.output.fake_mode, example_value
         )
-        return TorchScriptObjectVariable.create(
+        return CustomClassObjectVariable.create(
             proxy,
             fake_script_obj,
             tx=tx,
@@ -5128,13 +5128,13 @@ class SourcelessBuilder:
             and not isinstance(value, enum.Enum)
             and not is_pybind11_enum_member(value)
         ):
-            return TorchScriptObjectVariable.create(value, value, tx=tx)
+            return CustomClassObjectVariable.create(value, value, tx=tx)
         elif is_opaque_symbolic_type(type(value)):
             # This is for handling opaque objects in custom ops
             fake_script_obj = torch._library.fake_class_registry.maybe_to_fake_obj(
                 tx.output.fake_mode, value
             )
-            return TorchScriptObjectVariable.create(
+            return CustomClassObjectVariable.create(
                 value,  # pyrefly: ignore[bad-argument-type]
                 fake_script_obj,
                 tx=tx,
