@@ -728,7 +728,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather(
   return work;
 }
 
-c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather_single(
+c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::allGatherSingleImpl(
     at::Tensor& output,
     const at::Tensor& input,
     bool async_op,
@@ -742,17 +742,17 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather_single(
 
   if (output.numel() != input.numel() * comm_size_) {
     throw std::runtime_error(
-        "Output tensor size must be input_size * comm_size for all_gather_single");
+        "Output tensor size must be input_size * comm_size for allGatherSingleImpl");
   }
 
   TracingGuard tracingGuard(
-      name_, comm_size_, "all_gather_single", rank_, input, output);
+      name_, comm_size_, "allGatherSingleImpl", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
   auto work = async_op ? createWork(stream, timeout, input)
                        : createWork(stream, timeout);
 
-  work->recordStart("all_gather_single");
+  work->recordStart("allGatherSingleImpl");
 
   NCCL_CHECK(
       nccl_api_,
@@ -860,7 +860,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter(
   return work;
 }
 
-c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter_single(
+c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduceScatterSingleImpl(
     at::Tensor& output,
     const at::Tensor& input,
     const ::c10d::ReduceOp& op,
@@ -875,18 +875,18 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter_single(
 
   if (input.numel() != output.numel() * comm_size_) {
     throw std::runtime_error(
-        "Input tensor size must be output_size * comm_size for reduce_scatter_single");
+        "Input tensor size must be output_size * comm_size for reduceScatterSingleImpl");
   }
 
   TracingGuard tracingGuard(
-      name_, comm_size_, "reduce_scatter_single", rank_, input, output);
+      name_, comm_size_, "reduceScatterSingleImpl", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
   auto work = async_op ? createWork(stream, timeout, input)
                        : createWork(stream, timeout);
 
   // Record start event before NCCL operation
-  work->recordStart("reduce_scatter_single");
+  work->recordStart("reduceScatterSingleImpl");
 
   const auto dataType = getNcclDataType(input);
   NCCL_CHECK(
@@ -911,7 +911,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter_single(
   return work;
 }
 
-c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all_single(
+c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::allToAllSingleImpl(
     at::Tensor& output,
     const at::Tensor& input,
     bool async_op,
@@ -925,23 +925,23 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all_single(
 
   if (input.numel() != output.numel()) {
     throw std::runtime_error(
-        "Input and output tensors must have same size for all_to_all_single");
+        "Input and output tensors must have same size for allToAllSingleImpl");
   }
 
   if (input.numel() % comm_size_ != 0) {
     throw std::runtime_error(
-        "Tensor size must be divisible by comm_size for all_to_all_single");
+        "Tensor size must be divisible by comm_size for allToAllSingleImpl");
   }
 
   TracingGuard tracingGuard(
-      name_, comm_size_, "all_to_all_single", rank_, input, output);
+      name_, comm_size_, "allToAllSingleImpl", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
   auto work = async_op ? createWork(stream, timeout, input)
                        : createWork(stream, timeout);
 
   // Record start event before NCCL operation
-  work->recordStart("all_to_all_single");
+  work->recordStart("allToAllSingleImpl");
 
   size_t chunk_size = input.numel() / comm_size_;
   const auto data_type = getNcclDataType(input);
@@ -972,7 +972,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all_single(
     if (opResult != ncclSuccess) {
       throw NCCLException(
           *nccl_api_,
-          "NCCL Send failed in all_to_all_single",
+          "NCCL Send failed in allToAllSingleImpl",
           opResult,
           nccl_comm_);
     }
@@ -983,7 +983,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all_single(
     if (opResult != ncclSuccess) {
       throw NCCLException(
           *nccl_api_,
-          "NCCL Recv failed in all_to_all_single",
+          "NCCL Recv failed in allToAllSingleImpl",
           opResult,
           nccl_comm_);
     }

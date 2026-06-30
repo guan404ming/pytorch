@@ -359,7 +359,7 @@ class TORCH_API ProcessGroupNCCLTC : public ::c10d::Backend {
       const at::Tensor& tensor,
       bool async_op,
       std::chrono::milliseconds timeout);
-  c10::intrusive_ptr<TorchWorkNCCL> all_gather_single(
+  c10::intrusive_ptr<TorchWorkNCCL> allGatherSingleImpl(
       at::Tensor& output,
       const at::Tensor& input,
       bool async_op,
@@ -370,13 +370,13 @@ class TORCH_API ProcessGroupNCCLTC : public ::c10d::Backend {
       const ::c10d::ReduceOp& op,
       bool async_op,
       std::chrono::milliseconds timeout);
-  c10::intrusive_ptr<TorchWorkNCCL> reduce_scatter_single(
+  c10::intrusive_ptr<TorchWorkNCCL> reduceScatterSingleImpl(
       at::Tensor& output,
       const at::Tensor& input,
       const ::c10d::ReduceOp& op,
       bool async_op,
       std::chrono::milliseconds timeout);
-  c10::intrusive_ptr<TorchWorkNCCL> all_to_all_single(
+  c10::intrusive_ptr<TorchWorkNCCL> allToAllSingleImpl(
       at::Tensor& output,
       const at::Tensor& input,
       bool async_op,
