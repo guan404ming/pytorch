@@ -4714,7 +4714,7 @@ class Scheduler:
                     )
                 for alt_name in buf.get_mutations():
                     alt_name = rename(alt_name)
-                    is_ordering_only = getattr(buf, "ordering_only", False)
+                    is_ordering_only = getattr(buf.node, "ordering_only", False)
                     if is_ordering_only:
                         add_user(alt_name, node, is_weak=True)
                         node.add_fake_dep(

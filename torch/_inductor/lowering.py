@@ -9018,10 +9018,10 @@ def control_deps_op_lowering(additional_deps, subgraph_fn, *args):
                 passthrough_vals.append(v)
     for val in passthrough_vals:
         barrier = ir.OrderingBarrier(val)
+        barrier_op = barrier.get_operation_name()
         for op in subgraph_ops:
-            op_name = op.operation_name
-            if op_name is not None:
-                V.graph.additional_buffer_deps[barrier.get_name()].add(op_name)
+            if isinstance(op, ir.Buffer) and op.name is not None:
+                V.graph.additional_buffer_deps[barrier_op].add(op.get_name())
 
     return output
 
