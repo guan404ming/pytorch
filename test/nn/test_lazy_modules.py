@@ -3,7 +3,6 @@ import pickle
 import unittest
 
 import torch
-import torch._dynamo.config
 import torch.nn as nn
 from torch.nn import Buffer, Parameter
 from torch.nn.parameter import UninitializedBuffer, UninitializedParameter

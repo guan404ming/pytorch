@@ -28,15 +28,6 @@ if torch.get_default_dtype() is not torch.float32:
 #   like torch.scatter and torch.gather.
 
 class TestScatterGather(TestCase):
-    def setUp(self):
-        super().setUp()
-        self._prior_ngb = torch._dynamo.config.nested_graph_breaks
-        torch._dynamo.config.nested_graph_breaks = False
-
-    def tearDown(self):
-        torch._dynamo.config.nested_graph_breaks = self._prior_ngb
-        super().tearDown()
-
     # Fills an index tensor with valid indices
     def _fill_indices(self, idx, dim, dim_size, elems_per_row, m, n, o, unique_indices=True):
         for i in range(1 if dim == 0 else m):
@@ -782,7 +773,7 @@ class TestScatterAddOverrideConds(TestCase):
         )
         self.assertEqual(
             self._conds(self_t, idx, src), (case.expected_tma, case.expected_vec),
-            msg=f"{case.name}: expected (TMA={case.expected_tma}, vec={case.expected_vec})",
+            msg=lambda msg: f"{msg}\n{case.name}: expected (TMA={case.expected_tma}, vec={case.expected_vec})",
         )
 
     def test_out_cond_rejects_misaligned_out(self):
@@ -804,7 +795,7 @@ class TestScatterAddOverrideConds(TestCase):
         )
         self.assertNotEqual(
             out_mis.data_ptr() % 16, 0,
-            msg=f"test bug: out should be misaligned, got {out_mis.data_ptr() % 16=}",
+            msg=lambda msg: f"{msg}\ntest bug: out should be misaligned, got {out_mis.data_ptr() % 16=}",
         )
         idx = _expanded_idx(
             torch.randint(0, M_out, (M_src,), device="cuda", dtype=torch.int64),

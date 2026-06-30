@@ -2020,6 +2020,30 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         y = f(x)
         self.assertEqual(y.shape, x.shape)
 
+    def test_check_compiles_when_predicate_true_and_message_string(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def f(x):
+            torch._check(x.shape[0] > 3, "Shape is not greater than 3")
+            return x + 1
+
+        x = torch.randn(4)
+        torch._dynamo.maybe_mark_dynamic(x, 0)
+
+        y = f(x)
+        self.assertEqual(y.shape, x.shape)
+
+    def test_check_raises_at_runtime_when_predicate_false_and_message_string(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def f(x):
+            torch._check(x.shape[0] > 3, "Shape is not greater than 3")
+            return x + 1
+
+        x = torch.randn(3)
+        torch._dynamo.maybe_mark_dynamic(x, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "Shape is not greater than 3"):
+            f(x)
+
     def test_check_compiles_when_predicate_true_constant_and_message_None(self):
         @torch.compile(backend="eager", fullgraph=True)
         def f(x):
@@ -3711,8 +3735,14 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
                 continue
             cnts = torch._dynamo.testing.CompileCounter()
             opt_fn = torch.compile(fn, backend=cnts)
-            self.assertEqual(result, opt_fn(op, t1, t2), msg=f"{op=} {t1_np=} {t2_np=}")
-            self.assertEqual(cnts.frame_count, 1, msg=f"{op=} {t1_np=} {t2_np=}")
+            self.assertEqual(
+                result,
+                opt_fn(op, t1, t2),
+                msg=lambda msg: f"{msg}\n{op=} {t1_np=} {t2_np=}",
+            )
+            self.assertEqual(
+                cnts.frame_count, 1, msg=lambda msg: f"{msg}\n{op=} {t1_np=} {t2_np=}"
+            )
             torch._dynamo.reset()
 
     def test_numpy_ndarray_graph_break(self):
@@ -15813,7 +15843,7 @@ assert functorch_config.error_on_custom_op_aliasing is True
         self.assertEqual(
             default_result.returncode,
             0,
-            msg=f"stdout:\n{default_result.stdout}\nstderr:\n{default_result.stderr}",
+            msg=lambda msg: f"{msg}\nstdout:\n{default_result.stdout}\nstderr:\n{default_result.stderr}",
         )
 
         script = """
@@ -15855,7 +15885,7 @@ with torch.library._scoped_library("mylib_ci", "FRAGMENT") as lib:
         self.assertEqual(
             result.returncode,
             0,
-            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            msg=lambda msg: f"{msg}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
     def test_make_contiguous_strides_for_under_compile(self):

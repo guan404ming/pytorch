@@ -715,6 +715,37 @@ _cupti_monitor.enable_hes_early()
         self.assertIn("monitor_region", user_names)
 
     @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    def test_cupti_monitor_observer_registration_failure_is_graceful(self):
+        # If the per-cycle ProfilerObserver fails to register with the CUPTI monitor (an
+        # intermittent CUPTI condition), the profiler must degrade gracefully: with no
+        # observer / trace window, stop_trace and export_chrome_trace skip the trace instead
+        # of asserting and taking down the run.
+        from torch.profiler._cupti import monitor as _cupti_monitor
+
+        cfg = _ExperimentalConfig(custom_profiler_config='{"backend":"cupti_monitor"}')
+        with patch.object(
+            _cupti_monitor.CuptiMonitor,
+            "register",
+            side_effect=RuntimeError("simulated observer registration failure"),
+        ):
+            with TemporaryFileName(mode="w+") as trace_path:
+                # Exiting the profiler runs stop_trace -- it must not raise even though the
+                # observer never registered.
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    experimental_config=cfg,
+                ) as prof:
+                    a = torch.randn(64, 64, device="cuda")
+                    _ = (a @ a).cpu()
+                    torch.cuda.synchronize()
+                # Registration failed -> observer unavailable, no trace window.
+                obs = prof._cupti_profiler_observer
+                self.assertTrue(obs is None or not obs.available)
+                # Must skip the export rather than assert/crash.
+                prof.export_chrome_trace(trace_path)
+                prof.wait_for_exports()
+
+    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
     def test_cupti_monitor_record_shapes(self):
         cfg = _ExperimentalConfig(
             custom_profiler_config='{"backend":"cupti_monitor"}',
@@ -1635,7 +1666,9 @@ class TestProfiler(TestCase):
         )
         expected_threads = prior_threads + 1
         self.assertEqual(
-            len(tid_counts), expected_threads, f"{expected_threads}, {tid_counts}"
+            len(tid_counts),
+            expected_threads,
+            lambda msg: f"{msg}\n{expected_threads}, {tid_counts}",
         )
         self.assertEqual(len(nodes), sum(tid_counts.values()))
 
@@ -2016,7 +2049,7 @@ class TestProfiler(TestCase):
             self.assertEqual(
                 missing,
                 set(),
-                f"{op}: metadata keys missing in trace_only: {missing}",
+                lambda msg: f"{msg}\n{op}: metadata keys missing in trace_only: {missing}",
             )
 
         if use_cuda:
@@ -2035,7 +2068,7 @@ class TestProfiler(TestCase):
                 self.assertEqual(
                     default_counts[cat],
                     trace_only_counts[cat],
-                    f"{cat} event count mismatch",
+                    lambda msg: f"{msg}\n{cat} event count mismatch",
                 )
 
         # events() must raise in trace_only mode
@@ -3980,7 +4013,7 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
                 self.assertEqual(
                     has_grid,
                     has_block,
-                    f"kernel '{name}' should provide grid and block together",
+                    lambda msg: f"{msg}\nkernel '{name}' should provide grid and block together",
                 )
                 has_kernel_launch_metadata |= has_grid
             self.assertTrue(
@@ -5293,7 +5326,7 @@ For a model PR to follow, see: https://github.com/pytorch/pytorch/pull/180100
             self.assertEqual(
                 actual_meta,
                 expected_meta,
-                f"{key}: structured metadata differs between events() and Chrome trace JSON",
+                lambda msg: f"{msg}\n{key}: structured metadata differs between events() and Chrome trace JSON",
             )
 
 
@@ -5346,7 +5379,7 @@ class TestPythonChromeTraceExport(TestCase):
         self.assertEqual(
             len(kineto_acts),
             len(py_acts),
-            f"Activity event count mismatch: kineto={len(kineto_acts)}, python={len(py_acts)}",
+            lambda msg: f"{msg}\nActivity event count mismatch: kineto={len(kineto_acts)}, python={len(py_acts)}",
         )
 
         from collections import Counter
@@ -5378,7 +5411,7 @@ class TestPythonChromeTraceExport(TestCase):
             self.assertEqual(
                 ke,
                 pe,
-                f"Event mismatch for {ke['cat']}::{ke['name']} at ts={ke['ts']}",
+                lambda msg: f"{msg}\nEvent mismatch for {ke['cat']}::{ke['name']} at ts={ke['ts']}",
             )
 
         # Flow event parity (ph, id, cat).
