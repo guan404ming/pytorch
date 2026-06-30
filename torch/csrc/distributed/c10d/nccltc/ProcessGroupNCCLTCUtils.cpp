@@ -1,11 +1,11 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include "torch/csrc/distributed/c10d/nccltc/ProcessGroupNCCLTC.hpp"
+#include <torch/csrc/distributed/c10d/nccltc/ProcessGroupNCCLTC.hpp>
 
 #include <stdexcept>
 #include <string>
-#include "nccl.h"
-#include "torch/csrc/distributed/c10d/nccltc/Logging.hpp"
+#include <nccl.h>
+#include <torch/csrc/distributed/c10d/nccltc/Logging.hpp>
 
 namespace c10d::nccltc {
 
