@@ -190,7 +190,18 @@ class TestMaxAutotune(TestCase):
         Verify that `max_autotune` includes all pointwise configs from
         `max_autotune_pointwise` for 1D, 2D, and 3D pointwise kernels.
         """
-        triton_meta = {"device": DeviceProperties.create(torch.device(GPU_TYPE, 0))}
+        # Fake device properties for this unit test; no CUDA state is needed.
+        triton_meta = {
+            "device": DeviceProperties(
+                type="cuda",
+                index=0,
+                multi_processor_count=1,
+                cc=80,
+                major=8,
+                max_threads_per_block=1024,
+                warp_size=32,
+            )
+        }
         inductor_meta_common = {"autotune_pointwise": False}
 
         for size_hints in (
@@ -1152,7 +1163,7 @@ class TestMaxAutotune(TestCase):
                 self.assertEqual(
                     len(kernel_events),
                     1,
-                    f"Expected exactly 1 kernel event, but got {len(kernel_events)}",
+                    lambda msg: f"{msg}\nExpected exactly 1 kernel event, but got {len(kernel_events)}",
                 )
 
                 # Check that grid size matches expected values based on carveout
@@ -1166,7 +1177,7 @@ class TestMaxAutotune(TestCase):
                 self.assertEqual(
                     kernel_events[0]["grid_size"],
                     expected_grid_size,
-                    f"Grid size {kernel_events[0]['grid_size']} doesn't match {expected_grid_size} for carveout={carveout}",
+                    lambda msg: f"{msg}\nGrid size {kernel_events[0]['grid_size']} doesn't match {expected_grid_size} for carveout={carveout}",
                 )
 
     @parametrize("dynamic", (False, True))
