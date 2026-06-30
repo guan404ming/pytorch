@@ -312,15 +312,15 @@ laswp_rowparallel_kernel(
   int tile_width = ::min(swp_width, ncols - tile_col_start);
 
   if (tid < nb) {
-    int mynewroworig = piv[tid] - 1;
-    int itsreplacement = piv[mynewroworig - row_offset] - 1;
+    int src = piv[tid] - 1;
+    int dst = piv[src - row_offset] - 1;
 
     // Pass 1: gather source into shared memory, patch dA
     for (int i = 0; i < tile_width; ++i) {
       int col = col_offset + tile_col_start + i;
-      sdata[tid + i * nb] = A[mynewroworig + static_cast<size_t>(col) * lda];
-      A[mynewroworig + static_cast<size_t>(col) * lda] =
-          A[itsreplacement + static_cast<size_t>(col) * lda];
+      sdata[tid + i * nb] = A[src + static_cast<size_t>(col) * lda];
+      A[src + static_cast<size_t>(col) * lda] =
+          A[dst + static_cast<size_t>(col) * lda];
     }
   }
   __syncthreads();
