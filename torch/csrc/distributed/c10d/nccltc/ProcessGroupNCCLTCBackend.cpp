@@ -1,0 +1,598 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+//
+// c10d::Backend surface for ProcessGroupNCCLTC: the constructor, lazy device
+// binding, and the virtual overrides that translate c10d option/tensor shapes
+// to the internal NCCL engine (the role BackendWrapper played upstream) and
+// return c10d::Work.
+
+#ifdef USE_C10D_NCCL
+
+#include "torch/csrc/distributed/c10d/nccltc/ProcessGroupNCCLTC.hpp"
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/csrc/cuda/CUDAPluggableAllocator.h>
+
+#include "torch/csrc/distributed/c10d/nccltc/Logging.hpp"
+
+namespace c10d::nccltc {
+
+namespace {
+
+// Extract the scaling factor from NCCL's PREMUL_SUM supplement (port of
+// BackendWrapper::getPreMulSumFactor).
+PreMulSumFactorT getPreMulSumFactor(const ::c10d::ReduceOp& op) {
+  TORCH_CHECK(
+      op.supplement_ != nullptr,
+      "PREMUL_SUM operation requires a supplement, but none was provided");
+  const auto* preMulSupplement =
+      dynamic_cast<const ::c10d::NCCLPreMulSumSupplement*>(
+          op.supplement_.get());
+  TORCH_CHECK(
+      preMulSupplement != nullptr,
+      "PREMUL_SUM operation supplement must be of type NCCLPreMulSumSupplement");
+  if (preMulSupplement->tensor_factor.defined()) {
+    return preMulSupplement->tensor_factor;
+  }
+  return preMulSupplement->double_factor;
+}
+
+std::vector<uint64_t> toVecUint64(const std::vector<int64_t>& vec) {
+  std::vector<uint64_t> out;
+  out.reserve(vec.size());
+  for (auto i : vec) {
+    out.push_back(static_cast<uint64_t>(i));
+  }
+  return out;
+}
+
+// Trivially-completed c10d::Work used for empty coalescing windows and for the
+// per-op sentinels returned while a coalescing batch is being accumulated.
+class CompletedWorkTC : public ::c10d::Work {
+ public:
+  explicit CompletedWorkTC(std::vector<at::Tensor> outputs = {})
+      : outputs_(std::move(outputs)) {}
+  bool isCompleted() override {
+    return true;
+  }
+  bool isSuccess() const override {
+    return true;
+  }
+  bool wait(std::chrono::milliseconds /*timeout*/ = kNoTimeout) override {
+    return true;
+  }
+  void synchronize() override {}
+  std::vector<at::Tensor> result() override {
+    return outputs_;
+  }
+
+ private:
+  std::vector<at::Tensor> outputs_;
+};
+
+} // namespace
+
+ProcessGroupNCCLTC::ProcessGroupNCCLTC(
+    c10::intrusive_ptr<::c10d::Store> store,
+    int rank,
+    int size,
+    c10::intrusive_ptr<Options> options)
+    : Backend(rank, size),
+      device_(at::kCUDA),
+      store_(store),
+      options_c10d_(options ? options : Options::create()) {
+  options_.store = store_;
+  options_.timeout = options_c10d_->timeout;
+  options_.is_high_priority_stream = options_c10d_->is_high_priority_stream;
+  options_.abort_process_on_timeout_or_error =
+      options_c10d_->abort_process_on_timeout_or_error;
+  options_.hints = options_c10d_->hints;
+  name_ = options_c10d_->group_name.empty() ? std::string(kBackendName)
+                                            : options_c10d_->group_name;
+}
+
+ReduceOp ProcessGroupNCCLTC::toReduceOp(const ::c10d::ReduceOp& op) {
+  switch (op) {
+    case ::c10d::ReduceOp::SUM:
+      return ReduceOp::SUM;
+    case ::c10d::ReduceOp::AVG:
+      return ReduceOp::AVG;
+    case ::c10d::ReduceOp::MIN:
+      return ReduceOp::MIN;
+    case ::c10d::ReduceOp::MAX:
+      return ReduceOp::MAX;
+    case ::c10d::ReduceOp::PRODUCT:
+      return ReduceOp::PRODUCT;
+    case ::c10d::ReduceOp::BAND:
+      return ReduceOp::BAND;
+    case ::c10d::ReduceOp::BOR:
+      return ReduceOp::BOR;
+    case ::c10d::ReduceOp::BXOR:
+      return ReduceOp::BXOR;
+    case ::c10d::ReduceOp::PREMUL_SUM:
+      return ReduceOp::make_nccl_premul_sum(getPreMulSumFactor(op));
+    default:
+      throw std::runtime_error("Unsupported reduce op");
+  }
+}
+
+std::chrono::milliseconds ProcessGroupNCCLTC::operationTimeout(
+    std::chrono::milliseconds opt_timeout) const {
+  // c10d leaves per-op timeouts unset as kUnsetTimeout (-1); fall back to
+  // the communicator default in that case (port of BackendWrapper).
+  return opt_timeout != ::c10d::kUnsetTimeout ? opt_timeout : options_.timeout;
+}
+
+void ProcessGroupNCCLTC::ensureInitialized(at::Device device) {
+  TORCH_CHECK(
+      device.is_cuda(), "ProcessGroupNCCLTC requires CUDA tensors/devices");
+  if (init_state_ == InitializationState::INITIALIZED) {
+    TORCH_CHECK(
+        device_.index() == device.index(),
+        "ProcessGroupNCCLTC is bound to device ",
+        device_,
+        " but an operation was issued on ",
+        device);
+    return;
+  }
+  TORCH_CHECK(
+      init_state_ == InitializationState::UNINITIALIZED,
+      "ProcessGroupNCCLTC has been finalized");
+  // Lazy one-time bootstrap (replaces torchcomms' eager init(device)).
+  options_.store = store_;
+  init(device, name_, options_);
+}
+
+c10::intrusive_ptr<::c10d::Backend::Options> ProcessGroupNCCLTC::
+    getBackendOptions() {
+  return c10::static_intrusive_pointer_cast<::c10d::Backend::Options>(
+      options_c10d_);
+}
+
+void ProcessGroupNCCLTC::setTimeout(std::chrono::milliseconds timeout) {
+  options_c10d_->timeout = timeout;
+  options_.timeout = timeout;
+}
+
+void ProcessGroupNCCLTC::eagerConnectSingleDevice(at::Device device) {
+  ensureInitialized(device);
+}
+
+void ProcessGroupNCCLTC::runAbortHooks() {
+  for (const auto& [_, hook] : abortHooks_) {
+    try {
+      hook();
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[TC] Abort hook threw exception: " << e.what();
+    } catch (...) {
+      LOG(ERROR) << "[TC] Abort hook threw unknown exception.";
+    }
+  }
+}
+
+void ProcessGroupNCCLTC::registerAbortHook(
+    int64_t hook_id,
+    ::c10d::AbortHook hook) {
+  abortHooks_.emplace(hook_id, std::move(hook));
+}
+
+void ProcessGroupNCCLTC::unregisterAbortHook(int64_t hook_id) {
+  abortHooks_.erase(hook_id);
+}
+
+void ProcessGroupNCCLTC::shutdown() {
+  // Called by destroy_process_group(). Drain in-flight work and close the comm
+  // gracefully. Idempotent: finalize-on-already-finalized throws, so swallow.
+  if (init_state_ != InitializationState::INITIALIZED) {
+    return;
+  }
+  try {
+    finalize();
+  } catch (const std::exception& e) {
+    TC_LOG(WARNING) << "ProcessGroupNCCLTC::shutdown: finalize() raised, "
+                    << "treating as no-op: " << e.what();
+  }
+}
+
+std::shared_ptr<c10::Allocator> ProcessGroupNCCLTC::getMemAllocator() {
+  // Symmetric (VMM-backed) CUDA allocator backed by ncclMemAlloc/ncclMemFree.
+  // Moved here from torchcomms' TorchCommFactory allocator registration.
+  static std::shared_ptr<c10::Allocator> allocator = [] {
+    auto nccl_api = std::make_shared<DefaultNcclApi>();
+    return torch::cuda::CUDAPluggableAllocator::createCustomAllocator(
+        [nccl_api](size_t size, int device, cudaStream_t stream) {
+          at::cuda::OptionalCUDAGuard gpuGuard(device);
+          void* ptr = nullptr;
+          ncclResult_t result = nccl_api->memAlloc(&ptr, size);
+          TORCH_CHECK(
+              result == ncclSuccess,
+              "ncclMemAlloc failed: ",
+              nccl_api->getErrorString(result));
+          return ptr;
+        },
+        [nccl_api](void* ptr, size_t size, int device, cudaStream_t stream) {
+          at::cuda::OptionalCUDAGuard gpuGuard(device);
+          ncclResult_t result = nccl_api->memFree(ptr);
+          TORCH_CHECK(
+              result == ncclSuccess,
+              "ncclMemFree failed: ",
+              nccl_api->getErrorString(result));
+        });
+  }();
+  return allocator;
+}
+
+// ---------------------------------------------------------------------------
+// Collective / point-to-point overrides. Each translates the c10d option and
+// tensor-list shape to the internal engine call, tags the work with its output
+// tensors (for result()/getFuture()), and returns it as c10d::Work.
+// ---------------------------------------------------------------------------
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::broadcast(
+    std::vector<at::Tensor>& tensors,
+    const ::c10d::BroadcastOptions& opts) {
+  TORCH_CHECK(tensors.size() == 1, "Only single tensor supported");
+  ensureInitialized(tensors.at(0).device());
+  BroadcastOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = broadcastImpl(
+      tensors.at(0), static_cast<int>(opts.rootRank), opts.asyncOp, bopts);
+  work->setOutputs(tensors);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::allreduce(
+    std::vector<at::Tensor>& tensors,
+    const ::c10d::AllreduceOptions& opts) {
+  TORCH_CHECK(tensors.size() == 1, "Only single tensor supported");
+  ensureInitialized(tensors.at(0).device());
+  AllReduceOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work =
+      all_reduce(tensors.at(0), toReduceOp(opts.reduceOp), opts.asyncOp, bopts);
+  work->setOutputs(tensors);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::allreduce_coalesced(
+    std::vector<at::Tensor>& tensors,
+    const ::c10d::AllreduceCoalescedOptions& opts) {
+  TORCH_CHECK(tensors.size() == 1, "Only single tensor supported");
+  ensureInitialized(tensors.at(0).device());
+  AllReduceOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work =
+      all_reduce(tensors.at(0), toReduceOp(opts.reduceOp), opts.asyncOp, bopts);
+  work->setOutputs(tensors);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::reduce(
+    std::vector<at::Tensor>& tensors,
+    const ::c10d::ReduceOptions& opts) {
+  TORCH_CHECK(tensors.size() == 1, "Only single tensor supported");
+  ensureInitialized(tensors.at(0).device());
+  ReduceOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = reduceImpl(
+      tensors.at(0),
+      static_cast<int>(opts.rootRank),
+      toReduceOp(opts.reduceOp),
+      opts.asyncOp,
+      bopts);
+  work->setOutputs(tensors);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::allgather(
+    std::vector<std::vector<at::Tensor>>& outputTensors,
+    std::vector<at::Tensor>& inputTensors,
+    const ::c10d::AllgatherOptions& opts) {
+  TORCH_CHECK(
+      outputTensors.size() == 1 && inputTensors.size() == 1,
+      "Only single tensor / single list supported");
+  ensureInitialized(inputTensors.at(0).device());
+  const auto& input = inputTensors.at(0);
+  auto& outputList = outputTensors.at(0);
+  TORCH_CHECK(
+      static_cast<int>(outputList.size()) == getSize(),
+      "Expected ",
+      getSize(),
+      " output tensors, got ",
+      outputList.size());
+
+  AllGatherOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+
+  // Fast path: distinct per-rank output buffers -> list-based all_gather.
+  bool aliased = outputList.size() > 1 &&
+      outputList[0].data_ptr() == outputList[1].data_ptr();
+  if (!aliased) {
+    auto work = all_gather(outputList, input, opts.asyncOp, bopts);
+    work->setOutputs(outputList);
+    return work;
+  }
+
+  // Slow path (aliased outputs): gather into a contiguous staging tensor and
+  // copy each rank's row back (port of BackendWrapper).
+  AllGatherSingleOptions sopts;
+  sopts.timeout = bopts.timeout;
+  auto staging = at::empty(
+      {static_cast<int64_t>(getSize()) * input.numel()},
+      input.options().memory_format(at::MemoryFormat::Contiguous));
+  auto work = all_gather_single(staging, input, opts.asyncOp, sopts);
+  work->setOutputs(outputList);
+  auto rows = staging.view({getSize(), input.numel()});
+  work->wait();
+  for (int r = 0; r < getSize(); ++r) {
+    outputList.at(r).copy_(rows[r].view_as(outputList.at(r)));
+  }
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::allgather_coalesced(
+    std::vector<std::vector<at::Tensor>>& outputTensorLists,
+    std::vector<at::Tensor>& inputTensors,
+    const ::c10d::AllgatherOptions& opts) {
+  TORCH_CHECK(
+      outputTensorLists.size() == 1 && inputTensors.size() == 1,
+      "Only single tensor / single list supported");
+  ensureInitialized(inputTensors.at(0).device());
+  AllGatherOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = all_gather(
+      outputTensorLists.at(0), inputTensors.at(0), opts.asyncOp, bopts);
+  work->setOutputs(outputTensorLists.at(0));
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::
+    allgather_into_tensor_coalesced(
+        std::vector<at::Tensor>& outputs,
+        std::vector<at::Tensor>& inputs,
+        const ::c10d::AllgatherOptions& opts) {
+  TORCH_CHECK(
+      outputs.size() == 1 && inputs.size() == 1,
+      "Only single tensor supported");
+  ensureInitialized(inputs.at(0).device());
+  AllGatherSingleOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work =
+      all_gather_single(outputs.at(0), inputs.at(0), opts.asyncOp, bopts);
+  work->setOutputs(outputs);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::_allgather_base(
+    at::Tensor& outputBuffer,
+    at::Tensor& inputBuffer,
+    const ::c10d::AllgatherOptions& opts) {
+  ensureInitialized(inputBuffer.device());
+  AllGatherSingleOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = all_gather_single(outputBuffer, inputBuffer, opts.asyncOp, bopts);
+  work->setOutputs(std::vector<at::Tensor>{outputBuffer});
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::gather(
+    std::vector<std::vector<at::Tensor>>& outputTensors,
+    std::vector<at::Tensor>& inputTensors,
+    const ::c10d::GatherOptions& opts) {
+  TORCH_CHECK(inputTensors.size() == 1, "Only single input tensor supported");
+  ensureInitialized(inputTensors.at(0).device());
+  if (getRank() == opts.rootRank) {
+    TORCH_CHECK(outputTensors.size() == 1, "Only single output list on root");
+  } else if (outputTensors.empty()) {
+    outputTensors.emplace_back();
+  } else {
+    TORCH_CHECK(outputTensors.size() == 1, "Only single output list");
+  }
+  GatherOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = gatherImpl(
+      outputTensors.at(0),
+      inputTensors.at(0),
+      static_cast<int>(opts.rootRank),
+      opts.asyncOp,
+      bopts);
+  work->setOutputs(outputTensors.at(0));
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::scatter(
+    std::vector<at::Tensor>& outputTensors,
+    std::vector<std::vector<at::Tensor>>& inputTensors,
+    const ::c10d::ScatterOptions& opts) {
+  TORCH_CHECK(outputTensors.size() == 1, "Only single output tensor supported");
+  ensureInitialized(outputTensors.at(0).device());
+  ScatterOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  if (getRank() == opts.rootRank) {
+    TORCH_CHECK(inputTensors.size() == 1, "Only single input list on root");
+  } else {
+    inputTensors.clear();
+    inputTensors.emplace_back();
+  }
+  auto work = scatterImpl(
+      outputTensors.at(0),
+      inputTensors.at(0),
+      static_cast<int>(opts.rootRank),
+      opts.asyncOp,
+      bopts);
+  work->setOutputs(outputTensors);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::reduce_scatter(
+    std::vector<at::Tensor>& outputTensors,
+    std::vector<std::vector<at::Tensor>>& inputTensors,
+    const ::c10d::ReduceScatterOptions& opts) {
+  TORCH_CHECK(
+      outputTensors.size() == 1 && inputTensors.size() == 1,
+      "Only single tensor / single list supported");
+  ensureInitialized(outputTensors.at(0).device());
+  ReduceScatterOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = reduce_scatter(
+      outputTensors.at(0),
+      inputTensors.at(0),
+      toReduceOp(opts.reduceOp),
+      opts.asyncOp,
+      bopts);
+  work->setOutputs(outputTensors);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::
+    reduce_scatter_tensor_coalesced(
+        std::vector<at::Tensor>& outputs,
+        std::vector<at::Tensor>& inputs,
+        const ::c10d::ReduceScatterOptions& opts) {
+  TORCH_CHECK(
+      outputs.size() == 1 && inputs.size() == 1,
+      "Only single tensor supported");
+  ensureInitialized(outputs.at(0).device());
+  ReduceScatterSingleOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = reduce_scatter_single(
+      outputs.at(0),
+      inputs.at(0),
+      toReduceOp(opts.reduceOp),
+      opts.asyncOp,
+      bopts);
+  work->setOutputs(outputs);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::_reduce_scatter_base(
+    at::Tensor& outputBuffer,
+    at::Tensor& inputBuffer,
+    const ::c10d::ReduceScatterOptions& opts) {
+  ensureInitialized(outputBuffer.device());
+  ReduceScatterSingleOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = reduce_scatter_single(
+      outputBuffer,
+      inputBuffer,
+      toReduceOp(opts.reduceOp),
+      opts.asyncOp,
+      bopts);
+  work->setOutputs(std::vector<at::Tensor>{outputBuffer});
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::alltoall_base(
+    at::Tensor& outputBuffer,
+    at::Tensor& inputBuffer,
+    std::vector<int64_t>& outputSplitSizes,
+    std::vector<int64_t>& inputSplitSizes,
+    const ::c10d::AllToAllOptions& opts) {
+  ensureInitialized(outputBuffer.device());
+  if (outputSplitSizes.empty() && inputSplitSizes.empty()) {
+    AllToAllSingleOptions bopts;
+    bopts.timeout = operationTimeout(opts.timeout);
+    auto work =
+        all_to_all_single(outputBuffer, inputBuffer, opts.asyncOp, bopts);
+    work->setOutputs(std::vector<at::Tensor>{outputBuffer});
+    return work;
+  }
+  AllToAllvSingleOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = all_to_all_v_single(
+      outputBuffer,
+      inputBuffer,
+      toVecUint64(outputSplitSizes),
+      toVecUint64(inputSplitSizes),
+      opts.asyncOp,
+      bopts);
+  work->setOutputs(std::vector<at::Tensor>{outputBuffer});
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::alltoall(
+    std::vector<at::Tensor>& outputTensors,
+    std::vector<at::Tensor>& inputTensors,
+    const ::c10d::AllToAllOptions& opts) {
+  TORCH_CHECK(!inputTensors.empty(), "alltoall requires input tensors");
+  ensureInitialized(inputTensors.at(0).device());
+  AllToAllOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  auto work = all_to_all(outputTensors, inputTensors, opts.asyncOp, bopts);
+  work->setOutputs(outputTensors);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::barrier(
+    const ::c10d::BarrierOptions& opts) {
+  // Resolve a device for lazy init: prefer an explicit device id, then the
+  // bound device, then the current CUDA device.
+  if (init_state_ != InitializationState::INITIALIZED) {
+    at::Device dev = at::Device(at::kCUDA, at::cuda::current_device());
+    if (!opts.device_ids.empty()) {
+      dev = at::Device(
+          at::kCUDA, static_cast<c10::DeviceIndex>(opts.device_ids[0]));
+    } else if (getBoundDeviceId().has_value()) {
+      dev = getBoundDeviceId().value();
+    }
+    ensureInitialized(dev);
+  }
+  BarrierOptions bopts;
+  bopts.timeout = operationTimeout(opts.timeout);
+  return barrierImpl(/*async_op=*/false, bopts);
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::send(
+    std::vector<at::Tensor>& tensors,
+    int dstRank,
+    int /*tag*/) {
+  TORCH_CHECK(tensors.size() == 1, "Only single tensor supported");
+  ensureInitialized(tensors.at(0).device());
+  if (coalescing_batch_.has_value()) {
+    coalescing_batch_->send(tensors.at(0), dstRank);
+    return c10::make_intrusive<CompletedWorkTC>(tensors);
+  }
+  auto work = sendImpl(tensors.at(0), dstRank, /*async_op=*/true);
+  work->setOutputs(tensors);
+  return work;
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::recv(
+    std::vector<at::Tensor>& tensors,
+    int srcRank,
+    int /*tag*/) {
+  TORCH_CHECK(tensors.size() == 1, "Only single tensor supported");
+  ensureInitialized(tensors.at(0).device());
+  if (coalescing_batch_.has_value()) {
+    coalescing_batch_->recv(tensors.at(0), srcRank);
+    return c10::make_intrusive<CompletedWorkTC>(tensors);
+  }
+  auto work = recvImpl(tensors.at(0), srcRank, /*async_op=*/true);
+  work->setOutputs(tensors);
+  return work;
+}
+
+void ProcessGroupNCCLTC::startCoalescing() {
+  TORCH_CHECK(
+      !coalescing_batch_.has_value(),
+      "startCoalescing called while a batch is already active");
+  coalescing_batch_.emplace();
+}
+
+c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCLTC::endCoalescing() {
+  TORCH_CHECK(
+      coalescing_batch_.has_value(),
+      "endCoalescing called without a matching startCoalescing");
+  auto batch = std::move(*coalescing_batch_);
+  coalescing_batch_.reset();
+  if (batch.ops.empty()) {
+    return c10::make_intrusive<CompletedWorkTC>();
+  }
+  BatchP2POptions bopts;
+  bopts.timeout = options_.timeout;
+  return batch_op_issue(batch.ops, /*async_op=*/true, bopts);
+}
+
+} // namespace c10d::nccltc
+
+#endif // USE_C10D_NCCL
