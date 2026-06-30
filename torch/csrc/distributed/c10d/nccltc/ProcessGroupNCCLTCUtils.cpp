@@ -224,95 +224,107 @@ void ProcessGroupNCCLTC::timeoutWatchdog() noexcept {
       cuda_api_->threadExchangeStreamCaptureMode(&mode),
       "Failed to swap capture mode for timeout thread");
 
-  while (!shutdown_) {
-    {
-      std::unique_lock<std::mutex> lock(timeout_mutex_);
-      // Wait for a shorter interval to check work objects periodically
-      // Wake up either after 1 second or immediately if shutdown is requested
-      timeout_cv_.wait_for(
-          lock, std::chrono::seconds(1), [this]() { return shutdown_.load(); });
+  // Honor the noexcept contract: the loop issues NCCL probes (NCCL_CHECK) and
+  // abort paths that can throw; swallow here so nothing escapes this thread.
+  try {
+    while (!shutdown_) {
+      {
+        std::unique_lock<std::mutex> lock(timeout_mutex_);
+        // Wait for a shorter interval to check work objects periodically
+        // Wake up either after 1 second or immediately if shutdown is requested
+        timeout_cv_.wait_for(lock, std::chrono::seconds(1), [this]() {
+          return shutdown_.load();
+        });
 
-      // If we're shutting down, exit the loop
+        // If we're shutting down, exit the loop
+        if (shutdown_) {
+          break;
+        }
+      }
+
+      // Check work objects for completion or timeout
+      // Thread-safety: checkWorkQueue() calls garbageCollect() which acquires
+      // work_queues_mutex_ before accessing the work queue, ensuring safe
+      // concurrent access with the main thread's enqueueWork() calls.
+      //
+      // NOTE: garbageCollect may pop a completed work item whose destruction
+      // releases the last shared_ptr to this comm, triggering our destructor.
+      // In that case, the destructor sets shutdown_=true and detaches this
+      // thread. We must check shutdown_ immediately after to avoid accessing
+      // potentially destroyed member state.
+      checkWorkQueue();
       if (shutdown_) {
         break;
       }
-    }
-
-    // Check work objects for completion or timeout
-    // Thread-safety: checkWorkQueue() calls garbageCollect() which acquires
-    // work_queues_mutex_ before accessing the work queue, ensuring safe
-    // concurrent access with the main thread's enqueueWork() calls.
-    //
-    // NOTE: garbageCollect may pop a completed work item whose destruction
-    // releases the last shared_ptr to this comm, triggering our destructor.
-    // In that case, the destructor sets shutdown_=true and detaches this
-    // thread. We must check shutdown_ immediately after to avoid accessing
-    // potentially destroyed member state.
-    checkWorkQueue();
-    if (shutdown_) {
-      break;
-    }
-    if (comm_state_ != CommState::NORMAL &&
-        options_c10d_->abort_process_on_timeout_or_error &&
-        !options_c10d_->enable_reconfigure) {
-      if (comm_state_ == CommState::TIMEOUT) {
-        TC_LOG(ERROR, this)
-            << "Aborting process due to timeout on rank " << rank_
-            << " - timeout watchdog detected operation timeout";
-      } else if (comm_state_ == CommState::ERROR) {
-        TC_LOG(ERROR, this) << "Aborting process due to error on rank " << rank_
-                            << " - timeout watchdog detected operation error. ";
-      }
-
-      runAbortHooks();
-
-      ::abort();
-    }
-
-    // Detect a communicator-level async error while the comm is still healthy.
-    if (comm_state_ == CommState::NORMAL) {
-      ncclResult_t asyncErr;
-      NCCL_CHECK(
-          nccl_api_,
-          nccl_comm_,
-          nccl_api_->commGetAsyncError(nccl_comm_, &asyncErr),
-          "failed to get async error");
-      if (asyncErr != ncclSuccess) {
-        comm_state_ = CommState::ERROR;
-        if (!options_c10d_->enable_reconfigure) {
+      if (comm_state_ != CommState::NORMAL &&
+          options_c10d_->abort_process_on_timeout_or_error &&
+          !options_c10d_->enable_reconfigure) {
+        if (comm_state_ == CommState::TIMEOUT) {
+          TC_LOG(ERROR, this)
+              << "Aborting process due to timeout on rank " << rank_
+              << " - timeout watchdog detected operation timeout";
+        } else if (comm_state_ == CommState::ERROR) {
           TC_LOG(ERROR, this)
               << "Aborting process due to error on rank " << rank_
-              << " - nccl hit async error: " << ncclGetErrorString(asyncErr);
+              << " - timeout watchdog detected operation error. ";
+        }
 
-          runAbortHooks();
+        runAbortHooks();
 
-          abort();
-        } else {
-          // Revoked below by the reconfigurable-mode handler.
-          TC_LOG(ERROR, this)
-              << "Async error on rank " << rank_ << ": "
-              << ncclGetErrorString(asyncErr) << " (reconfigurable mode)";
+        ::abort();
+      }
+
+      // Detect a communicator-level async error while the comm is still
+      // healthy.
+      if (comm_state_ == CommState::NORMAL) {
+        ncclResult_t asyncErr;
+        NCCL_CHECK(
+            nccl_api_,
+            nccl_comm_,
+            nccl_api_->commGetAsyncError(nccl_comm_, &asyncErr),
+            "failed to get async error");
+        if (asyncErr != ncclSuccess) {
+          comm_state_ = CommState::ERROR;
+          if (!options_c10d_->enable_reconfigure) {
+            TC_LOG(ERROR, this)
+                << "Aborting process due to error on rank " << rank_
+                << " - nccl hit async error: " << ncclGetErrorString(asyncErr);
+
+            runAbortHooks();
+
+            abort();
+          } else {
+            // Revoked below by the reconfigurable-mode handler.
+            TC_LOG(ERROR, this)
+                << "Async error on rank " << rank_ << ": "
+                << ncclGetErrorString(asyncErr) << " (reconfigurable mode)";
+          }
         }
       }
-    }
 
-    // In reconfigurable mode, gracefully revoke the communicator on any failure
-    // -- timeout or error, whether surfaced by the work queue or an async comm
-    // error -- so in-flight operations are stopped and the comm can later be
-    // reconfigured. This is the only revoke path under CUDA graph replay, where
-    // no synchronous collective reaches checkAndAbortIfTimedOutOrError();
-    // isAborted() then reports the revoked state to the caller.
-    // revokeNcclComm() is idempotent and the revoked_ check keeps the watchdog
-    // from logging every iteration.
-    if (comm_state_ != CommState::NORMAL && options_c10d_->enable_reconfigure &&
-        !revoked_.load()) {
-      TC_LOG(ERROR, this) << "Revoking communicator on rank " << rank_
-                          << " - watchdog detected "
-                          << (comm_state_ == CommState::TIMEOUT ? "timeout"
-                                                                : "error")
-                          << " (reconfigurable mode)";
-      revokeNcclComm();
+      // In reconfigurable mode, gracefully revoke the communicator on any
+      // failure
+      // -- timeout or error, whether surfaced by the work queue or an async
+      // comm error -- so in-flight operations are stopped and the comm can
+      // later be reconfigured. This is the only revoke path under CUDA graph
+      // replay, where no synchronous collective reaches
+      // checkAndAbortIfTimedOutOrError(); isAborted() then reports the revoked
+      // state to the caller. revokeNcclComm() is idempotent and the revoked_
+      // check keeps the watchdog from logging every iteration.
+      if (comm_state_ != CommState::NORMAL &&
+          options_c10d_->enable_reconfigure && !revoked_.load()) {
+        TC_LOG(ERROR, this)
+            << "Revoking communicator on rank " << rank_
+            << " - watchdog detected "
+            << (comm_state_ == CommState::TIMEOUT ? "timeout" : "error")
+            << " (reconfigurable mode)";
+        revokeNcclComm();
+      }
     }
+  } catch (const std::exception& e) {
+    TC_LOG(ERROR, this) << "Timeout watchdog caught exception: " << e.what();
+  } catch (...) {
+    TC_LOG(ERROR, this) << "Timeout watchdog caught unknown exception.";
   }
 
   TC_LOG(INFO, this) << "Timeout thread exiting for rank: " << rank_;
