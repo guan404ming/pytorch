@@ -70,15 +70,10 @@ ProcessGroupNCCLTC::~ProcessGroupNCCLTC() {
   detachMemoryHook();
 }
 
-void ProcessGroupNCCLTC::init(
-    at::Device device,
-    const std::string& name,
-    const CommOptions& options) {
+void ProcessGroupNCCLTC::init(at::Device device) {
   TC_LOG(INFO, this) << "Initializing ProcessGroupNCCLTC for device: "
                      << device;
   device_ = device;
-  name_ = name;
-  options_ = options;
 
   if (init_state_ == InitializationState::INITIALIZED) {
     throw std::runtime_error("ProcessGroupNCCLTC already initialized");
@@ -94,27 +89,19 @@ void ProcessGroupNCCLTC::init(
     cuda_api_ = std::make_unique<DefaultCudaApi>();
   }
 
-  if (options.enable_reconfigure) {
-    options_.enable_reconfigure = true;
-    reconfigure_store_ = options_.store;
-    TC_LOG(INFO, this)
-        << "ProcessGroupNCCLTC dynamic regime enabled, deferring initialization";
-    return;
-  }
-
   if (device_.index() == -1 || nccl_comm_ == nullptr) {
     auto bootstrap = std::make_unique<TorchCommNCCLBootstrap>(
-        options_.store,
+        store_,
         device_,
         getRank(),
         getSize(),
         nccl_api_,
         cuda_api_,
-        options_.timeout);
+        options_c10d_->timeout);
     device_ = bootstrap->getDevice();
 
     if (nccl_comm_ == nullptr) {
-      nccl_comm_ = bootstrap->createNcclComm(name, options);
+      nccl_comm_ = bootstrap->createNcclComm(name_, options_c10d_->hints);
     }
   }
 
@@ -145,8 +132,7 @@ void ProcessGroupNCCLTC::initNcclResources() {
       cuda_api_->memGetInfo(&free_memory, &total_memory),
       fmt::format("Failed to get memory info for device {}", device_.index()));
 
-  is_high_priority_stream_ =
-      options_.getHint<bool>(kHintIsHighPriorityStream, false);
+  is_high_priority_stream_ = options_c10d_->is_high_priority_stream;
 
   int stream_priority = 0;
 
@@ -185,11 +171,10 @@ void ProcessGroupNCCLTC::initNcclResources() {
         "Failed to allocate barrier buffer");
   }
 
-  max_event_pool_size_ =
-      options_.getHint<size_t>(kHintMaxEventPoolSize, kDefaultMaxEventPoolSize);
-
-  if (options_.store) {
-    options_.store.reset();
+  max_event_pool_size_ = kDefaultMaxEventPoolSize;
+  if (auto it = options_c10d_->hints.find(std::string(kHintMaxEventPoolSize));
+      it != options_c10d_->hints.end()) {
+    max_event_pool_size_ = static_cast<size_t>(std::stoull(it->second));
   }
 
   NCCL_CHECK(
@@ -212,7 +197,7 @@ void ProcessGroupNCCLTC::initNcclResources() {
 }
 
 void ProcessGroupNCCLTC::abort() {
-  if (options_.enable_reconfigure) {
+  if (options_c10d_->enable_reconfigure) {
     revokeNcclComm();
   } else {
     abortNcclComm();
@@ -335,8 +320,8 @@ void ProcessGroupNCCLTC::abortNcclComm() {
   }
   // Never abort the process in reconfigurable mode: callers fall back to
   // revoke + throw so the failure can be handled by reconfiguring.
-  if (options_.abort_process_on_timeout_or_error &&
-      !options_.enable_reconfigure) {
+  if (options_c10d_->abort_process_on_timeout_or_error &&
+      !options_c10d_->enable_reconfigure) {
     TC_LOG(ERROR, this) << "Aborting process due to timeout";
     runAbortHooks();
     ::abort();
@@ -366,22 +351,12 @@ int64_t ProcessGroupNCCLTC::getCommPtr() const {
   return reinterpret_cast<int64_t>(nccl_comm_);
 }
 
-static inline std::chrono::milliseconds getOperationTimeout(
-    std::chrono::milliseconds timeout,
-    std::chrono::milliseconds default_timeout) {
-  // If timeout is kNoTimeout (0ms), use the default timeout from options
-  if (timeout == kNoTimeout) {
-    return default_timeout;
-  }
-  return timeout;
-}
-
 // Point-to-Point Operations
 c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::sendImpl(
     const at::Tensor& tensor,
     int dst,
     bool async_op,
-    const SendOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
@@ -390,13 +365,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::sendImpl(
   TracingGuard tracingGuard(name_, comm_size_, "send", dst, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            tensor)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, tensor)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("send");
@@ -426,7 +396,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::recvImpl(
     at::Tensor& tensor,
     int src,
     bool async_op,
-    const RecvOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
@@ -435,8 +405,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::recvImpl(
   TracingGuard tracingGuard(name_, comm_size_, "recv", src, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = createWork(
-      stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("recv");
@@ -466,7 +435,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::recvImpl(
 c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::batch_op_issue(
     const std::vector<BatchSendRecv::P2POp>& ops,
     bool async_op,
-    const BatchP2POptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   if (ops.empty()) {
@@ -501,10 +470,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::batch_op_issue(
       output_tensors);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = createWork(
-      stream,
-      getOperationTimeout(options.timeout, options_.timeout),
-      input_tensors);
+  auto work = createWork(stream, timeout, input_tensors);
 
   // Record start event before NCCL operations
   work->recordStart("batch_op_issue");
@@ -568,7 +534,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::broadcastImpl(
     at::Tensor& tensor,
     int root,
     bool async_op,
-    const BroadcastOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
@@ -579,13 +545,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::broadcastImpl(
 
   cudaStream_t stream = getOperationStream(async_op);
 
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            tensor)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, tensor)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("broadcast");
@@ -613,9 +574,9 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::broadcastImpl(
 
 c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_reduce(
     at::Tensor& tensor,
-    const ReduceOp& op,
+    const ::c10d::ReduceOp& op,
     bool async_op,
-    const AllReduceOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
@@ -625,13 +586,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_reduce(
       name_, comm_size_, "all_reduce", rank_, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            tensor)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, tensor)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("all_reduce");
@@ -662,9 +618,9 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_reduce(
 c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduceImpl(
     const at::Tensor& tensor,
     int root,
-    const ReduceOp& op,
+    const ::c10d::ReduceOp& op,
     bool async_op,
-    const ReduceOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
@@ -673,13 +629,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduceImpl(
   TracingGuard tracingGuard(name_, comm_size_, "reduce", root, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            tensor)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, tensor)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("reduce");
@@ -712,7 +663,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather(
     const std::vector<at::Tensor>& tensor_list,
     const at::Tensor& tensor,
     bool async_op,
-    const AllGatherOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   if (tensor_list.size() != static_cast<size_t>(comm_size_)) {
@@ -739,13 +690,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather(
       name_, comm_size_, "all_gather", rank_, tensor_list, {tensor});
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            tensor)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, tensor)
+                       : createWork(stream, timeout);
 
   work->recordStart("all_gather");
 
@@ -782,85 +728,11 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather(
   return work;
 }
 
-c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather_v(
-    const std::vector<at::Tensor>& tensor_list,
-    const at::Tensor& tensor,
-    bool async_op,
-    const AllGatherOptions& options) {
-  checkInitialized();
-  checkAndAbortIfTimedOutOrError();
-  if (tensor_list.size() != static_cast<size_t>(comm_size_)) {
-    throw std::runtime_error(
-        "tensor_list size must equal comm_size for all_gather_v");
-  }
-
-  ensureTensorContiguous(tensor);
-  for (const auto& t : tensor_list) {
-    ensureTensorContiguous(t);
-  }
-
-  checkTensorDevice(tensor);
-  checkTensorsDevice(tensor_list);
-
-  TracingGuard tracingGuard(
-      name_, comm_size_, "all_gather_v", rank_, tensor_list, {tensor});
-
-  cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            tensor)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
-
-  work->recordStart("all_gather_v");
-
-  // Use multiple broadcast operations for all_gather_v
-  NCCL_CHECK(
-      nccl_api_, nccl_comm_, nccl_api_->groupStart(), "NCCL GroupStart failed");
-
-  for (int i = 0; i < comm_size_; ++i) {
-    // For all_gather_v, each rank broadcasts its input tensor to all others
-    auto& output = tensor_list[i];
-    auto& input = (i == rank_) ? tensor : output;
-    if (input.numel() != output.numel()) {
-      throw std::runtime_error(
-          "Output tensor size must equal input tensor size for all_gather_v");
-    }
-    ncclResult_t opResult = nccl_api_->broadcast(
-        input.data_ptr(),
-        output.data_ptr(),
-        input.numel(),
-        getNcclDataType(output),
-        i,
-        nccl_comm_,
-        stream);
-    if (opResult != ncclSuccess) {
-      throw NCCLException(
-          *nccl_api_,
-          "NCCL Broadcast failed in all_gather_v",
-          opResult,
-          nccl_comm_);
-    }
-  }
-
-  NCCL_CHECK(
-      nccl_api_, nccl_comm_, nccl_api_->groupEnd(), "NCCL GroupEnd failed");
-
-  work->recordEnd();
-
-  // Enqueue the work after events have been recorded
-  enqueueWork(work, stream);
-
-  return work;
-}
-
 c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather_single(
     at::Tensor& output,
     const at::Tensor& input,
     bool async_op,
-    const AllGatherSingleOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
@@ -877,13 +749,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather_single(
       name_, comm_size_, "all_gather_single", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            input)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, input)
+                       : createWork(stream, timeout);
 
   work->recordStart("all_gather_single");
 
@@ -910,9 +777,9 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_gather_single(
 c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter(
     at::Tensor& output,
     const std::vector<at::Tensor>& input_list,
-    const ReduceOp& op,
+    const ::c10d::ReduceOp& op,
     bool async_op,
-    const ReduceScatterOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
@@ -938,13 +805,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter(
       name_, comm_size_, "reduce_scatter", rank_, input_list, {output});
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            input_list)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, input_list)
+                       : createWork(stream, timeout);
 
   work->recordStart("reduce_scatter");
 
@@ -998,104 +860,12 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter(
   return work;
 }
 
-c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter_v(
-    at::Tensor& output,
-    const std::vector<at::Tensor>& input_list,
-    const ReduceOp& op,
-    bool async_op,
-    const ReduceScatterOptions& options) {
-  checkInitialized();
-  checkAndAbortIfTimedOutOrError();
-  ensureTensorContiguous(output);
-
-  if (input_list.size() != static_cast<size_t>(comm_size_)) {
-    throw std::runtime_error(
-        "input_list size must equal comm_size for reduce_scatter_v");
-  }
-
-  for (const auto& t : input_list) {
-    ensureTensorContiguous(t);
-  }
-
-  checkTensorsDevice(input_list);
-  checkTensorDevice(output);
-
-  TracingGuard tracingGuard(
-      name_, comm_size_, "reduce_scatter_v", rank_, input_list, {output});
-
-  cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            input_list)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
-
-  work->recordStart("reduce_scatter_v");
-
-  // Use multiple reduce operations for reduce_scatter_v
-  NCCL_CHECK(
-      nccl_api_, nccl_comm_, nccl_api_->groupStart(), "NCCL GroupStart failed");
-
-  for (int i = 0; i < comm_size_; ++i) {
-    const auto dataType = getNcclDataType(input_list[i]);
-    ncclResult_t opResult;
-    if (i == rank_) {
-      // This rank receives the reduced result
-      auto& input_tensor = input_list[i];
-      auto& output_tensor = output;
-      if (input_tensor.numel() != output_tensor.numel()) {
-        throw std::runtime_error(
-            "Output tensor size must equal input tensor size for reduce_scatter_v");
-      }
-      opResult = nccl_api_->reduce(
-          input_tensor.data_ptr(),
-          output_tensor.data_ptr(),
-          output_tensor.numel(),
-          dataType,
-          getNcclReduceOp(op, nccl_comm_, dataType),
-          i,
-          nccl_comm_,
-          stream);
-    } else {
-      // Other ranks contribute to the reduction
-      opResult = nccl_api_->reduce(
-          input_list[i].data_ptr(),
-          nullptr, // Non-root ranks don't receive
-          input_list[i].numel(),
-          dataType,
-          getNcclReduceOp(op, nccl_comm_, dataType),
-          i,
-          nccl_comm_,
-          stream);
-    }
-    if (opResult != ncclSuccess) {
-      throw NCCLException(
-          *nccl_api_,
-          "NCCL Reduce failed in reduce_scatter_v",
-          opResult,
-          nccl_comm_);
-    }
-  }
-
-  NCCL_CHECK(
-      nccl_api_, nccl_comm_, nccl_api_->groupEnd(), "NCCL GroupEnd failed");
-
-  work->recordEnd();
-
-  // Enqueue the work after events have been recorded
-  enqueueWork(work, stream);
-
-  return work;
-}
-
 c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter_single(
     at::Tensor& output,
     const at::Tensor& input,
-    const ReduceOp& op,
+    const ::c10d::ReduceOp& op,
     bool async_op,
-    const ReduceScatterSingleOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
@@ -1112,13 +882,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::reduce_scatter_single(
       name_, comm_size_, "reduce_scatter_single", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            input)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, input)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("reduce_scatter_single");
@@ -1150,7 +915,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all_single(
     at::Tensor& output,
     const at::Tensor& input,
     bool async_op,
-    const AllToAllSingleOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
@@ -1172,13 +937,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all_single(
       name_, comm_size_, "all_to_all_single", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            input)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, input)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("all_to_all_single");
@@ -1248,7 +1008,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all_v_single(
     const std::vector<uint64_t>& output_split_sizes,
     const std::vector<uint64_t>& input_split_sizes,
     bool async_op,
-    const AllToAllvSingleOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
@@ -1289,13 +1049,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all_v_single(
       name_, comm_size_, "all_to_all_v_single", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            input)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, input)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("all_to_all_v_single");
@@ -1381,7 +1136,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all(
     const std::vector<at::Tensor>& output_tensor_list,
     const std::vector<at::Tensor>& input_tensor_list,
     bool async_op,
-    const AllToAllOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   checkTensorsDevice(output_tensor_list);
@@ -1407,13 +1162,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all(
       output_tensor_list);
 
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            input_tensor_list)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, input_tensor_list)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operations
   work->recordStart("all_to_all");
@@ -1463,14 +1213,13 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::all_to_all(
 
 c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::barrierImpl(
     bool async_op,
-    const BarrierOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
 
   TracingGuard tracingGuard(name_, comm_size_, "barrier", rank_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = createWork(
-      stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = createWork(stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("barrier");
@@ -1503,7 +1252,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::scatterImpl(
     const std::vector<at::Tensor>& input_tensor_list,
     int root,
     bool async_op,
-    const ScatterOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output_tensor);
@@ -1534,10 +1283,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::scatterImpl(
   if (async_op && rank_ == root) {
     input_tensors = input_tensor_list;
   }
-  auto work = createWork(
-      stream,
-      getOperationTimeout(options.timeout, options_.timeout),
-      input_tensors);
+  auto work = createWork(stream, timeout, input_tensors);
 
   // Record start event before NCCL operations
   work->recordStart("scatter");
@@ -1608,7 +1354,7 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::gatherImpl(
     const at::Tensor& input_tensor,
     int root,
     bool async_op,
-    const GatherOptions& options) {
+    std::chrono::milliseconds timeout) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(input_tensor);
@@ -1639,13 +1385,8 @@ c10::intrusive_ptr<TorchWorkNCCL> ProcessGroupNCCLTC::gatherImpl(
   if (rank_ == root) {
     output_tensors = output_tensor_list;
   }
-  auto work = async_op
-      ? createWork(
-            stream,
-            getOperationTimeout(options.timeout, options_.timeout),
-            input_tensor)
-      : createWork(
-            stream, getOperationTimeout(options.timeout, options_.timeout));
+  auto work = async_op ? createWork(stream, timeout, input_tensor)
+                       : createWork(stream, timeout);
 
   // Record start event before NCCL operations
   work->recordStart("gather");
