@@ -596,7 +596,8 @@ def scatter_single_dim_strategy(
 
 
 @register_single_dim_strategy(
-    aten.scatter_add.default, schema_info=RuntimeSchemaInfo(1)
+    [aten.scatter_add.default, aten.scatter_add_.default],
+    schema_info=RuntimeSchemaInfo(1),
 )
 def scatter_add_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType

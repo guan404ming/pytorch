@@ -287,6 +287,31 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertTrue(res is dt_to_inplace_add)
         self.assertTrue(res.placements == tuple(shard_spec))
 
+    def test_logical_and_inplace(self):
+        self.assertIn(
+            torch.ops.aten.logical_and_.default,
+            DTensor._op_dispatcher.sharding_propagator.op_single_dim_strategy_funcs,
+        )
+
+        mesh = self.build_device_mesh()
+        rows = self.world_size * 2
+        input_tensor = (
+            torch.arange(rows * 4, device=self.device_type).reshape(rows, 4) % 2 == 0
+        )
+        other_tensor = (
+            torch.arange(rows * 4, device=self.device_type).reshape(rows, 4) % 3 == 0
+        )
+        expected = input_tensor.clone()
+        expected.logical_and_(other_tensor)
+
+        input_dt = distribute_tensor(input_tensor.clone(), mesh, [Shard(0)])
+        other_dt = distribute_tensor(other_tensor, mesh, [Shard(0)])
+        result = input_dt.logical_and_(other_dt)
+
+        self.assertTrue(result is input_dt)
+        self.assertEqual(input_dt.placements, (Shard(0),))
+        self.assertEqual(input_dt.full_tensor(), expected)
+
     def test_op_out_variant(self):
         mesh = self.build_device_mesh()
         input_tensor = torch.randn((12, 3), device=self.device_type)
@@ -748,6 +773,35 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         output_dt = torch.scatter(input_dt, scatter_dim, index_dt, src_dt)
         # the sharded strategy is not offered, so the op falls back to replicate
         self.assertEqual(output_dt.placements, [Replicate()])
+        self.assertEqual(output_dt.full_tensor(), global_output)
+
+        # case 4 scatter_add_ uses the same non-scatter-dim sharding strategy
+        # as scatter/scatter_add and must preserve self for inplace semantics.
+        self.assertIn(
+            torch.ops.aten.scatter_add_.default,
+            DTensor._op_dispatcher.sharding_propagator.op_single_dim_strategy_funcs,
+        )
+        global_input = torch.zeros(rows, 5)
+        global_index = torch.arange(rows * 3).reshape(rows, 3) % 5
+        global_src = torch.arange(
+            1,
+            rows * 3 + 1,
+            dtype=global_input.dtype,
+        ).reshape(rows, 3)
+        global_output = global_input.clone()
+        global_output.scatter_add_(scatter_dim, global_index, global_src)
+
+        input_dt = distribute_tensor(
+            global_input.clone(), device_mesh, [Shard(shard_dim)]
+        )
+        index_dt = distribute_tensor(global_index, device_mesh, [Shard(shard_dim)])
+        src_dt = distribute_tensor(global_src, device_mesh, [Shard(shard_dim)])
+        with comm_mode:
+            output_dt = input_dt.scatter_add_(scatter_dim, index_dt, src_dt)
+
+        self.assertEqual(comm_mode.get_total_counts(), 0)
+        self.assertTrue(output_dt is input_dt)
+        self.assertEqual(output_dt.placements, (Shard(shard_dim),))
         self.assertEqual(output_dt.full_tensor(), global_output)
 
     def test_gather(self):
