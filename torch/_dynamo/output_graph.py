@@ -189,6 +189,7 @@ from .variables.user_defined import UserDefinedDictVariable
 if TYPE_CHECKING:
     from torch._dynamo.dynamo_profiler import DynamoProfilerState
     from torch._dynamo.package import CompilePackage
+    from torch._dynamo.pgo import FrameStateSizeEntry
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
     from torch._inductor import _CudagraphAnnotation
     from torch.multiprocessing.reductions import StorageWeakRef
@@ -751,8 +752,8 @@ class OutputGraph(OutputGraphCommon):
         compiler_fn: CompilerFn | None,
         root_tx: "InstructionTranslatorBase",
         export: bool,
-        export_constraints: Sequence[_ConstraintTarget],
-        frame_state: Any,
+        export_constraints: Sequence[_ConstraintTarget] | None,
+        frame_state: "dict[str, int | FrameStateSizeEntry] | None",
         local_scope: Scope,
         global_scope: Scope,
         f_code: CodeType,
@@ -2670,7 +2671,7 @@ class OutputGraph(OutputGraphCommon):
             if len(device_types) != 1:
                 raise AssertionError(
                     "Expect only one device type but got {}".format(
-                        "+".join(device_types)
+                        "+".join(d.type for d in device_types)
                     )
                 )
             with (
@@ -3671,7 +3672,7 @@ class DynamoTracerOutput:
     f_globals: dict[str, Any]
 
     def __init__(
-        self, tracer: "InstructionTranslatorBase", error: Any | None = None
+        self, tracer: "InstructionTranslatorBase", error: bool = False
     ) -> None:
         self.error_on_graph_break = tracer.error_on_graph_break
         self.is_tracing_resume_prologue = tracer.is_tracing_resume_prologue

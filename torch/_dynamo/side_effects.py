@@ -31,7 +31,7 @@ import traceback
 import weakref
 from collections.abc import Generator, MutableMapping
 from types import CellType
-from typing import Any, TYPE_CHECKING
+from typing import Any, cast, TYPE_CHECKING
 
 import torch
 import torch.nn
@@ -754,7 +754,7 @@ class SideEffects:
             obj = nn_module_new(user_cls)
         else:
             if isinstance(base_cls_vt, variables.BuiltinVariable):
-                base_cls = base_cls_vt.fn
+                base_cls = cast(Any, base_cls_vt.fn)
             elif isinstance(base_cls_vt, variables.DictBuiltinVariable):
                 base_cls = dict
             elif isinstance(base_cls_vt, variables.ListBuiltinVariable):

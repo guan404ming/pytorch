@@ -1462,7 +1462,7 @@ class VariableBuilder:
             )
             return GetAttrVariable(
                 AutogradFunctionVariable(
-                    value.__self__,
+                    cast("type[torch.autograd.Function]", value.__self__),
                     source=AttrSource(self.source, member="__self__"),
                 ),
                 "apply",
@@ -5106,7 +5106,7 @@ class SourcelessBuilder:
             and value.node.expr in tx.output.bound_symbols
         ):
             proxy = tx.output.bound_symbols[value.node.expr]
-            return SymNodeVariable.create(tx, proxy)
+            return SymNodeVariable.create(tx, cast("torch.fx.Proxy", proxy))
         elif isinstance(value, slice):
             items = [
                 SourcelessBuilder.create(tx, getattr(value, k))

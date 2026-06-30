@@ -917,7 +917,7 @@ class AutogradFunctionVariable(VariableTracker):
         *VariableTracker._nonvar_fields,
     }
 
-    def __init__(self, fn_cls: Any, **kwargs: Any) -> None:
+    def __init__(self, fn_cls: type[torch.autograd.Function], **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.fn_cls = fn_cls
 

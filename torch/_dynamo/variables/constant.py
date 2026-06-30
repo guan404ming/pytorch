@@ -30,6 +30,7 @@ from .base import ValueMutationNew, VariableTracker
 
 
 if TYPE_CHECKING:
+    from torch._dynamo.codegen import PyCodegen
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
 
     from .functions import UserFunctionVariable
@@ -448,7 +449,7 @@ class ConstantVariable(VariableTracker):
             tree_map_kwargs,
         )
 
-    def reconstruct_pycode(self, codegen) -> str:
+    def reconstruct_pycode(self, codegen: PyCodegen) -> str:
         return repr(self.value)
 
     @override
@@ -935,7 +936,7 @@ class FakeIdVariable(VariableTracker):
             ],
         )
 
-    def reconstruct(self, codegen: Any) -> None:
+    def reconstruct(self, codegen: PyCodegen) -> None:
         unimplemented(
             gb_type="Reconstruction of FakeIdVariable",
             context=str(self.value),

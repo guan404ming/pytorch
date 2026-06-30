@@ -44,6 +44,7 @@ from torch.fx.experimental.symbolic_shapes import (
     is_symbolic,
     SymTypes,
 )
+from torch.types import PySymType
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 from .. import config, graph_break_hints, variables
@@ -2560,8 +2561,8 @@ class SymNodeVariable(VariableTracker):
     def create(
         cls,
         tx: "InstructionTranslatorBase",
-        proxy: Any,
-        sym_num: Any | None = None,
+        proxy: torch.fx.Proxy,
+        sym_num: PySymType | int | bool | sympy.Integer | None = None,
         **options: Any,
     ) -> "VariableTracker":
         if sym_num is None:
@@ -2582,7 +2583,12 @@ class SymNodeVariable(VariableTracker):
             tx.output.current_tracer.record_proxyable_vt(out)
         return out
 
-    def __init__(self, proxy: Any, sym_num: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        proxy: torch.fx.Proxy,
+        sym_num: PySymType | int | bool | sympy.Integer,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.proxy = proxy
         # TODO: Should we allow non SymTypes here?  Today it is allowed
