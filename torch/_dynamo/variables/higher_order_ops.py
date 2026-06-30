@@ -31,10 +31,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast, Optional, TYPE_CHECKING, Union
 
-from torch._compiler_types import SetSubgraphInputs
 import torch._C
 import torch.fx
 import torch.nn
+from torch._compiler_types import SetSubgraphInputs
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.utils import get_fake_value
 from torch._dynamo.variables.constant import ConstantVariable

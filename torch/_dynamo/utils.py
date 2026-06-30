@@ -68,13 +68,13 @@ import torch._functorch.config
 import torch.fx.experimental.symbolic_shapes
 import torch.utils._pytree as pytree
 from torch import fx
-from torch._compiler_types import OptimizeDdpMode, StaticAddressType
 from torch._C import (
     _instruction_counter,
     _len_torch_function_stack,
     _pop_torch_function_stack,
     _push_on_torch_function_stack,
 )
+from torch._compiler_types import OptimizeDdpMode, StaticAddressType
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.metrics_context import MetricsContext, RuntimeMetricsContext
 from torch._guards import CompileId, Source, TracingContext

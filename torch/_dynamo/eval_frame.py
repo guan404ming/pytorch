@@ -69,7 +69,6 @@ from torch._C._dynamo.eval_frame import (  # noqa: F401
     set_skip_guard_eval_unsafe,
     unsupported,
 )
-from torch._compiler_types import StanceStr
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.types import ConvertFrameReturn, FrameAction, FrameExecStrategy
 from torch._export.utils import _compiling_state_context
@@ -128,6 +127,7 @@ from .utils import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
+    from torch._compiler_types import StanceStr
     from torch._dynamo.package import CompilePackage
     from torch._dynamo.repro.after_dynamo import WrapBackendDebug
     from torch._subclasses import fake_tensor

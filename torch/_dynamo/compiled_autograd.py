@@ -80,6 +80,7 @@ TURN_OFF_MSG = """You can turn off compiled autograd by either:
 compiled_autograd_log = getArtifactLogger(__name__, "compiled_autograd")
 verbose_log = getArtifactLogger(__name__, "compiled_autograd_verbose")
 
+
 def snapshot_verbose_logging_enabled() -> bool:
     return torch._logging._internal.log_state.is_artifact_enabled(
         "compiled_autograd_verbose"
