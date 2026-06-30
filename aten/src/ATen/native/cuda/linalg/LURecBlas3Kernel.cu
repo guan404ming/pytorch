@@ -344,57 +344,7 @@ laswp_rowparallel_kernel(
 // After this call, swap_buf[0:nb, 0:ncols] contains the permuted rows,
 // and dA rows below nb are patched correctly.
 // The caller must copy swap_buf back into dA (or feed it into TRSM).
-template <typename scalar_t>
-void laswp_rowparallel(
-  scalar_t* dA,
-  int64_t matrix_stride,
-  int lda,
-  int m,              // total rows in matrix
-  int col_start,      // row offset (first pivot row)
-  int nb,             // number of pivots (= number of rows gathered)
-  const int* dipiv,
-  int ipiv_stride,
-  LUWorkspace<scalar_t>& ws,
-  int col_lo,         // first column to swap
-  int col_hi,         // last column (exclusive)
-  int batch_count
-) {
-  auto ncols = col_hi - col_lo;
-  if (ncols <= 0 || nb <= 0) return;
-
-  int nrows = m - col_start;
-
-  // Step 1: Convert ipiv to absolute permutation vector (1-based)
-  {
-    int constexpr BS = 256;
-    setup_pivinfo_kernel<BS><<<batch_count, BS, 0, at::cuda::getCurrentCUDAStream()>>>(
-      ws.pivinfo, ws.pivinfo_m,
-      dipiv, ipiv_stride,
-      col_start, nrows, nb
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  }
-
-  // Step 2: Gather nb rows into swap_buf + patch dA, tiled across columns via grid.x
-  // Max columns per tile limited by shared memory: nb * swp_width * sizeof(scalar_t) <= 48KB
-  int swp_width = (48 * 1024) / (nb * sizeof(scalar_t));
-  if (swp_width < 1) swp_width = 1;
-  if (swp_width > ncols) swp_width = ncols;
-
-  int col_tiles = (ncols + swp_width - 1) / swp_width;
-  size_t shmem = nb * swp_width * sizeof(scalar_t);
-  auto grid = dim3(col_tiles, 1, batch_count);
-
-  laswp_rowparallel_kernel<scalar_t><<<grid, nb, shmem, at::cuda::getCurrentCUDAStream()>>>(
-    dA, matrix_stride, lda,
-    ws.swap_buf, ws.swap_stride, ws.swap_ld,
-    ws.pivinfo, ws.pivinfo_m,
-    col_start, nb,
-    ncols, col_lo, swp_width
-  );
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
+//
 // Full parallel pivot application for use in the recursive panel.
 // Does: setup_pivinfo -> laswp_rowparallel (gather + patch), then copy back.
 template <typename scalar_t>
@@ -416,11 +366,37 @@ void batched_apply_pivots_parallel(
   if (ncols <= 0 || nb <= 0) return;
 
   // Gather nb permuted rows into swap_buf + patch dA
-  laswp_rowparallel<scalar_t>(
-    dA, matrix_stride, lda, m,
-    col_start, nb, dipiv, ipiv_stride,
-    ws, col_lo, col_hi, batch_count
+  int nrows = m - col_start;
+
+  // Convert ipiv to absolute permutation vector (1-based)
+  {
+    int constexpr BS = 256;
+    setup_pivinfo_kernel<BS><<<batch_count, BS, 0, at::cuda::getCurrentCUDAStream()>>>(
+      ws.pivinfo, ws.pivinfo_m,
+      dipiv, ipiv_stride,
+      col_start, nrows, nb
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  // Gather nb rows into swap_buf + patch dA, tiled across columns via grid.x
+  // Max columns per tile limited by shared memory: nb * swp_width * sizeof(scalar_t) <= 48KB
+  int swp_width = (48 * 1024) / (nb * sizeof(scalar_t));
+  if (swp_width < 1) swp_width = 1;
+  if (swp_width > ncols) swp_width = ncols;
+
+  int col_tiles = (ncols + swp_width - 1) / swp_width;
+  size_t shmem = nb * swp_width * sizeof(scalar_t);
+  auto grid = dim3(col_tiles, 1, batch_count);
+
+  laswp_rowparallel_kernel<scalar_t><<<grid, nb, shmem, at::cuda::getCurrentCUDAStream()>>>(
+    dA, matrix_stride, lda,
+    ws.swap_buf, ws.swap_stride, ws.swap_ld,
+    ws.pivinfo, ws.pivinfo_m,
+    col_start, nb,
+    ncols, col_lo, swp_width
   );
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   // Copy the nb gathered rows back into dA
   // A[col_start:col_start + nb, col_lo:col_hi] = swap[:nb, :ncols]
