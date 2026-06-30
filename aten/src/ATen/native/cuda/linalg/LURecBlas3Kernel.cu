@@ -71,7 +71,7 @@ inline LUTuning get_tuning() {
 //           Used as TRSM input; TRSM result written back to dA via pointer arrays.
 template <typename scalar_t>
 struct LUWorkspace {
-  LUWorkspace(const Tensor& input, int nb) {
+  LUWorkspace(const Tensor& input, int nb) : A{const_cast<Tensor&>(input)} {
     batch_count = cuda_int_cast(batchCount(input), "batchCount");
     int m = cuda_int_cast(input.size(-2), "input.size(-2)");
     int n = cuda_int_cast(input.size(-1), "input.size(-1)");
@@ -86,13 +86,14 @@ struct LUWorkspace {
     pivinfo = static_cast<int*>(pivinfo_buffer.data_ptr());
     pivinfo_m = m;
 
-    // Out-of-place swap buffer: nb rows x n columns per batch (column-major, ld = nb)
-    swap_buffer = at::empty({batch_count * nb * n}, input.options());
+    // Out-of-place swap buffer
+    swap_buffer = at::empty({batch_count, n, nb}, input.options()).transpose_(-2, -1);
     swap_buf = static_cast<scalar_t*>(swap_buffer.data_ptr());
     swap_ld = nb;
     swap_stride = static_cast<int64_t>(n) * nb;
   }
 
+  Tensor& A;
   int batch_count;
   Tensor buffer;
 
@@ -394,29 +395,6 @@ void laswp_rowparallel(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// Copy nb rows from swap_buf back into dA rows [row_offset, row_offset+nb).
-template <typename scalar_t>
-__global__ void
-copy_back_kernel(
-  scalar_t* __restrict__ dA, int64_t matrix_stride, int lda,
-  const scalar_t* __restrict__ dout, int64_t out_stride, int out_ld,
-  int row_offset, int nb, int ncols, int col_offset
-) {
-  int batch = blockIdx.z;
-  int tid = threadIdx.x;
-  if (tid >= nb) return;
-
-  auto* A = dA + batch * matrix_stride;
-  const auto* out = dout + batch * out_stride;
-
-  int dst_row = row_offset + tid;
-  for (int c = 0; c < ncols; ++c) {
-    int col = col_offset + c;
-    A[dst_row + static_cast<size_t>(col) * lda] =
-        out[tid + static_cast<size_t>(c) * out_ld];
-  }
-}
-
 // Full parallel pivot application for use in the recursive panel.
 // Does: setup_pivinfo -> laswp_rowparallel (gather + patch), then copy back.
 template <typename scalar_t>
@@ -445,15 +423,9 @@ void batched_apply_pivots_parallel(
   );
 
   // Copy the nb gathered rows back into dA
-  {
-    auto grid = dim3(1, 1, batch_count);
-    copy_back_kernel<scalar_t><<<grid, nb, 0, at::cuda::getCurrentCUDAStream()>>>(
-      dA, matrix_stride, lda,
-      ws.swap_buf, ws.swap_stride, ws.swap_ld,
-      col_start, nb, ncols, col_lo
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  }
+  // A[col_start:col_start + nb, col_lo:col_hi] = swap[:nb, :ncols]
+  ws.A.narrow(-2, col_start, nb).narrow(-1, col_lo, ncols)
+    .copy_(ws.swap_buffer.narrow(-2, 0, nb).narrow(-1, 0, ncols));
 }
 
 template <typename scalar_t, int BS>
