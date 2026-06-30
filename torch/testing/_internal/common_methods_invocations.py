@@ -18222,8 +18222,6 @@ op_db: list[OpInfo] = [
         check_batched_forward_grad=False,
         supports_cow_input_no_materialize_forward=False,
         decorators=[onlyCPU],
-        skips=(
-        )
     ),
     OpInfo(
         'torch.ops.aten._efficient_attention_forward',
