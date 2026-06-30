@@ -1,6 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include "torch/csrc/distributed/c10d/nccltc/CudaApi.hpp"
+#include <torch/csrc/distributed/c10d/nccltc/CudaApi.hpp>
 #include <ATen/cuda/CUDAContext.h>
 
 #include <c10/cuda/driver_api.h>

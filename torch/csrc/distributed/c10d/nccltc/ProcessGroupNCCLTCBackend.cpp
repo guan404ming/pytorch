@@ -7,13 +7,13 @@
 
 #ifdef USE_C10D_NCCL
 
-#include "torch/csrc/distributed/c10d/nccltc/ProcessGroupNCCLTC.hpp"
+#include <torch/csrc/distributed/c10d/nccltc/ProcessGroupNCCLTC.hpp>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
 
-#include "torch/csrc/distributed/c10d/nccltc/Logging.hpp"
+#include <torch/csrc/distributed/c10d/nccltc/Logging.hpp>
 
 namespace c10d::nccltc {
 
