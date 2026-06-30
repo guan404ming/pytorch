@@ -16119,10 +16119,6 @@ op_db: list[OpInfo] = [
                          "TestCompositeCompliance", "test_cow_input",
                          device_type="cuda",
                          active_if=TEST_WITH_ROCM or IS_LINUX or TEST_WITH_TORCHINDUCTOR),
-            # In-place buffer accumulation in the recompute backward.
-            DecorateInfo(unittest.skip("chunked none backward uses in-place buffer "
-                                       "accumulation; not composite compliant"),
-                         "TestCompositeCompliance", "test_backward"),
             # No jvp / vmap / second derivatives; the recompute backward also
             # breaks vmap-over-grad (batched cotangent into in-place buffers).
             DecorateInfo(unittest.expectedFailure, "TestOperators", "test_grad"),
