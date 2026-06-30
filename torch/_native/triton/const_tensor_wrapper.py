@@ -14,14 +14,20 @@ class ConstTensorWrapper:
 
     Only wrap arguments the kernel treats as read-only (loads, never stores).
     Triton does not enforce this; wrapping a written argument is a bug.
+
+    Accessors run under DisableTorchFunctionSubclass so the wrapper never
+    re-enters __torch_function__: const_data_ptr() and friends are dispatched
+    methods, and re-entering while an override is mid-redispatch trips the
+    "cannot skip two levels of __torch_function__" guard.
     """
 
     def __init__(self, tensor: torch.Tensor) -> None:
         self._tensor = tensor
 
     def data_ptr(self) -> int:
-        # const_data_ptr() exists at runtime but is absent from the type stubs.
-        return self._tensor.const_data_ptr()  # type: ignore[attr-defined]
+        with torch._C.DisableTorchFunctionSubclass():
+            # const_data_ptr() exists at runtime but is absent from the stubs.
+            return self._tensor.const_data_ptr()  # type: ignore[attr-defined]
 
     @property
     def dtype(self) -> torch.dtype:
@@ -40,13 +46,17 @@ class ConstTensorWrapper:
         return self._tensor.ndim
 
     def dim(self) -> int:
-        return self._tensor.dim()
+        with torch._C.DisableTorchFunctionSubclass():
+            return self._tensor.dim()
 
     def size(self, dim: int | None = None) -> torch.Size | int:
-        return self._tensor.size() if dim is None else self._tensor.size(dim)
+        with torch._C.DisableTorchFunctionSubclass():
+            return self._tensor.size() if dim is None else self._tensor.size(dim)
 
     def stride(self, dim: int | None = None) -> tuple[int, ...] | int:
-        return self._tensor.stride() if dim is None else self._tensor.stride(dim)
+        with torch._C.DisableTorchFunctionSubclass():
+            return self._tensor.stride() if dim is None else self._tensor.stride(dim)
 
     def element_size(self) -> int:
-        return self._tensor.element_size()
+        with torch._C.DisableTorchFunctionSubclass():
+            return self._tensor.element_size()
