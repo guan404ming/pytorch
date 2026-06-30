@@ -86,8 +86,7 @@ struct LUWorkspace {
     pivinfo = static_cast<int*>(pivinfo_buffer.data_ptr());
     pivinfo_m = m;
 
-    // Out-of-place swap buffer: nb rows × n columns per batch (column-major, ld = nb)
-    // Exactly like MAGMA's dwork: sized n * nb per batch.
+    // Out-of-place swap buffer: nb rows x n columns per batch (column-major, ld = nb)
     swap_buffer = at::empty({batch_count * nb * n}, input.options());
     swap_buf = static_cast<scalar_t*>(swap_buffer.data_ptr());
     swap_ld = nb;
@@ -96,6 +95,8 @@ struct LUWorkspace {
 
   int batch_count;
   Tensor buffer;
+
+  // TRSM arrays
   scalar_t** dL11_array;
   scalar_t** dA12_array;
 
