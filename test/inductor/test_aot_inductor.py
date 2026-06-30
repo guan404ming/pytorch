@@ -7967,7 +7967,7 @@ class AOTInductorTestsTemplate:
             self.assertIn(
                 actual_grid,
                 expected_grids,
-                f"grid_0={actual_grid} not in expected {expected_grids} from kernel configs",
+                lambda msg: f"{msg}\ngrid_0={actual_grid} not in expected {expected_grids} from kernel configs",
             )
 
     @requires_autotune_at_compile_time
@@ -8026,7 +8026,7 @@ class AOTInductorTestsTemplate:
             self.assertIn(
                 actual_grid,
                 expected_grids,
-                f"grid_0={actual_grid} not in expected {expected_grids} from kernel configs",
+                lambda msg: f"{msg}\ngrid_0={actual_grid} not in expected {expected_grids} from kernel configs",
             )
 
     @patch.dict(os.environ, {"TRITON_DEBUG": "1"})
