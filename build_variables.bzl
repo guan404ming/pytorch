@@ -781,8 +781,6 @@ libtorch_cuda_distributed_extra_sources = [
     "torch/csrc/distributed/c10d/nccltc/StoreManager.cpp",
     "torch/csrc/distributed/c10d/nccltc/TracingGuard.cpp",
     "torch/csrc/distributed/c10d/nccltc/Utils.cpp",
-    "torch/csrc/distributed/c10d/nccltc/TorchCommTypes.cpp",
-    "torch/csrc/distributed/c10d/nccltc/TorchCommOptions.cpp",
     "torch/csrc/distributed/c10d/nccltc/NcclApi.cpp",
     "torch/csrc/distributed/c10d/nccltc/TorchWorkNCCL.cpp",
     "torch/csrc/distributed/c10d/nccltc/TorchWorkNCCLQueue.cpp",
