@@ -1,4 +1,5 @@
 # Owner(s): ["module: ci"]
+# ci-shard-experiment: A/B control (original shard counts)
 name: pull
 
 on:
