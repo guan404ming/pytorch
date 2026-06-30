@@ -418,7 +418,7 @@ copy_back_kernel(
 }
 
 // Full parallel pivot application for use in the recursive panel.
-// Does: setup_pivinfo → laswp_rowparallel (gather + patch) → copy back.
+// Does: setup_pivinfo -> laswp_rowparallel (gather + patch), then copy back.
 template <typename scalar_t>
 void batched_apply_pivots_parallel(
   scalar_t* dA,
