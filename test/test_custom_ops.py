@@ -260,7 +260,6 @@ class TestCustomOpTesting(CustomOpTestCaseBase):
         torch.library.opcheck(f, args=[example])
 
     # https://github.com/pytorch/pytorch/issues/150472
-    @torch._dynamo.config.patch(nested_graph_breaks=False)
     def test_single_element_tuple_output(self, device):
         # Helper function to register id_tuple custom and the fake tensor implementation
         # so that Dynamo has the fake tensor implementation
@@ -1049,7 +1048,9 @@ class TestCustomOp(CustomOpTestCaseBase):
 
                     op = self.get_op(f"{self.test_ns}::foo")
                     result = op(torch.randn([]))
-                    self.assertEqual(result, example, msg=f"{typ} {example}")
+                    self.assertEqual(
+                        result, example, msg=lambda msg: f"{msg}\n{typ} {example}"
+                    )
                 finally:
                     custom_ops._destroy(f"{self.test_ns}::foo")
 
@@ -1069,7 +1070,9 @@ class TestCustomOp(CustomOpTestCaseBase):
                     op = self.get_op(f"{self.test_ns}::foo")
                     result = op(torch.randn([]))
                     expected = (example, example)
-                    self.assertEqual(result, expected, msg=f"{typ} {example}")
+                    self.assertEqual(
+                        result, expected, msg=lambda msg: f"{msg}\n{typ} {example}"
+                    )
                 finally:
                     custom_ops._destroy(f"{self.test_ns}::foo")
 
@@ -1092,7 +1095,9 @@ class TestCustomOp(CustomOpTestCaseBase):
                 for example in self._generate_examples(typ):
                     op = self.get_op(f"{self.test_ns}::foo")
                     op(torch.randn([]), example)
-                    self.assertEqual(yeet, example, msg=f"{typ} {example}")
+                    self.assertEqual(
+                        yeet, example, msg=lambda msg: f"{msg}\n{typ} {example}"
+                    )
                     yeet = None
             finally:
                 custom_ops._destroy(f"{TestCustomOp.test_ns}::foo")
@@ -4230,7 +4235,6 @@ class TestCustomOpAPI(TestCase):
         script = """\
 import warnings
 import torch
-import torch._dynamo.config
 from torch import Tensor
 
 with warnings.catch_warnings(record=True) as w:
