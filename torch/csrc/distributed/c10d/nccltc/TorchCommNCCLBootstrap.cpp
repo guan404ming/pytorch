@@ -1,15 +1,15 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include <torch/csrc/distributed/c10d/nccltc/TorchCommNCCLBootstrap.hpp>
 #include <ATen/cuda/CUDAContext.h>
 #include <fmt/core.h>
-#include <torch/csrc/distributed/c10d/TCPStore.hpp>
-#include <set>
 #include <nccl.h>
+#include <torch/csrc/distributed/c10d/TCPStore.hpp>
 #include <torch/csrc/distributed/c10d/nccltc/Logging.hpp>
 #include <torch/csrc/distributed/c10d/nccltc/ProcessGroupNCCLTC.hpp>
 #include <torch/csrc/distributed/c10d/nccltc/StoreManager.hpp>
+#include <torch/csrc/distributed/c10d/nccltc/TorchCommNCCLBootstrap.hpp>
 #include <torch/csrc/distributed/c10d/nccltc/Utils.hpp>
+#include <set>
 
 namespace c10d::nccltc {
 
@@ -197,21 +197,21 @@ void TorchCommNCCLBootstrap::cleanupTCPStore(ncclComm_t nccl_comm) {
 // (ProcessGroupNCCLTC::init), not by ncclConfig.  Skip them here to avoid
 // spurious "unsupported hint" warnings.
 static const std::set<std::string> kTorchCommLayerHints = {
-    std::string(kHintIsHighPriorityStream),
+    "is_high_priority_stream",
     std::string(kHintMaxEventPoolSize),
 };
 
 // Helper function to populate NCCL config from hints
 void populateNcclConfigFromHints(
     ncclConfig_t& config,
-    const CommOptions& options,
+    const std::unordered_map<std::string, std::string>& hints,
     const std::string& name) {
   // Iterate over the hints and set the corresponding fields in the config.  For
   // string arguments, NCCL uses a "const char*" instead of a std::string.  The
   // strings only need to be valid for the duration of the
   // ncclCommInitRankConfig call, so we use .c_str() directly.
 
-  for (const auto& [key, val] : options.hints) {
+  for (const auto& [key, val] : hints) {
     if (kTorchCommLayerHints.count(key)) {
       continue;
     } else if (key == "blocking") {
@@ -288,7 +288,7 @@ void populateNcclConfigFromHints(
 
 ncclComm_t TorchCommNCCLBootstrap::createNcclComm(
     const std::string& name,
-    const CommOptions& options) {
+    const std::unordered_map<std::string, std::string>& hints) {
   ncclUniqueId uniqueId;
   ncclComm_t nccl_comm = nullptr;
 
@@ -303,7 +303,7 @@ ncclComm_t TorchCommNCCLBootstrap::createNcclComm(
 #endif
 
   // Populate NCCL config from user-provided hints
-  populateNcclConfigFromHints(config, options, name);
+  populateNcclConfigFromHints(config, hints, name);
 
   ncclResult_t ncclErr = nccl_api_->commInitRankConfig(
       &nccl_comm, comm_size_, uniqueId, rank_, &config);

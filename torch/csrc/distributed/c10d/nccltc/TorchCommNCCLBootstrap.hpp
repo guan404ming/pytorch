@@ -3,6 +3,8 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <unordered_map>
 
 #include <ATen/ATen.h>
 #include <cuda_runtime.h>
@@ -11,7 +13,6 @@
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/nccltc/CudaApi.hpp>
 #include <torch/csrc/distributed/c10d/nccltc/NcclApi.hpp>
-#include <torch/csrc/distributed/c10d/nccltc/TorchCommOptions.hpp>
 
 namespace c10d::nccltc {
 
@@ -40,7 +41,7 @@ class TorchCommNCCLBootstrap {
 
   ncclComm_t createNcclComm(
       const std::string& name,
-      const CommOptions& options = {});
+      const std::unordered_map<std::string, std::string>& hints = {});
   static std::string getNCCLStoreKey();
   static std::string getNCCLStoreKeyPrefix();
   static int getNCCLStoreKeyCounter();
@@ -81,7 +82,7 @@ class TorchCommNCCLBootstrap {
 // Helper function to populate NCCL config from hints
 void populateNcclConfigFromHints(
     ncclConfig_t& config,
-    const CommOptions& options,
+    const std::unordered_map<std::string, std::string>& hints,
     const std::string& name);
 
 } // namespace c10d::nccltc

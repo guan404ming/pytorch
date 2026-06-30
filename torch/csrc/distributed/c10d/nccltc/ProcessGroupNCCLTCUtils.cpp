@@ -2,14 +2,36 @@
 
 #include <torch/csrc/distributed/c10d/nccltc/ProcessGroupNCCLTC.hpp>
 
-#include <stdexcept>
-#include <string>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/nccltc/Logging.hpp>
+#include <stdexcept>
+#include <string>
+#include <variant>
 
 namespace c10d::nccltc {
 
 namespace {
+
+// Scaling factor for a PREMUL_SUM reduction: either a per-element device tensor
+// or a host scalar.
+using PreMulSumFactorT = std::variant<at::Tensor, double>;
+
+// Extract the scaling factor from a c10d PREMUL_SUM ReduceOp supplement.
+PreMulSumFactorT getPreMulSumFactor(const ::c10d::ReduceOp& op) {
+  TORCH_CHECK(
+      op.supplement_ != nullptr,
+      "PREMUL_SUM operation requires a supplement, but none was provided");
+  const auto* preMulSupplement =
+      dynamic_cast<const ::c10d::NCCLPreMulSumSupplement*>(
+          op.supplement_.get());
+  TORCH_CHECK(
+      preMulSupplement != nullptr,
+      "PREMUL_SUM operation supplement must be of type NCCLPreMulSumSupplement");
+  if (preMulSupplement->tensor_factor.defined()) {
+    return preMulSupplement->tensor_factor;
+  }
+  return preMulSupplement->double_factor;
+}
 
 ncclDataType_t getNcclDataTypeInternal(const at::Tensor& tensor) {
   switch (tensor.scalar_type()) {
@@ -66,22 +88,16 @@ ProcessGroupNCCLTC::RedOpRAII::RedOpRAII(ncclRedOp_t op)
     : ncclRedOp_(op), comm_(nullptr) {}
 
 ProcessGroupNCCLTC::RedOpRAII::RedOpRAII(
-    const ReduceOp& op,
+    const ::c10d::ReduceOp& op,
     const ncclComm_t comm,
     const ncclDataType_t dataType,
     std::shared_ptr<NcclApi> nccl_api)
     : comm_(comm), nccl_api_(std::move(nccl_api)) {
   TORCH_INTERNAL_ASSERT(
-      op == ReduceOp::RedOpType::PREMUL_SUM,
+      op == ::c10d::ReduceOp::PREMUL_SUM,
       "Constructing premul_sum RedOpRAII with non-premul_sum RedOpType");
 
-  if (!op.factor().has_value()) {
-    ncclRedOp_ = ncclSum;
-    comm_ = nullptr;
-    return;
-  }
-
-  const auto& factor = op.factor().value();
+  const auto factor = getPreMulSumFactor(op);
   switch (dataType) {
     case ncclFloat16:
       createPreMulSum<at::Half, ncclFloat16>(
@@ -154,27 +170,27 @@ ncclDataType_t ProcessGroupNCCLTC::getNcclDataType(const at::Tensor& tensor) {
 }
 
 ProcessGroupNCCLTC::RedOpRAII ProcessGroupNCCLTC::getNcclReduceOp(
-    const ReduceOp& op,
+    const ::c10d::ReduceOp& op,
     const ncclComm_t comm,
     const ncclDataType_t dataType) {
   switch (op) {
-    case ReduceOp::RedOpType::SUM:
+    case ::c10d::ReduceOp::SUM:
       return ncclSum;
-    case ReduceOp::RedOpType::PRODUCT:
+    case ::c10d::ReduceOp::PRODUCT:
       return ncclProd;
-    case ReduceOp::RedOpType::MIN:
+    case ::c10d::ReduceOp::MIN:
       return ncclMin;
-    case ReduceOp::RedOpType::MAX:
+    case ::c10d::ReduceOp::MAX:
       return ncclMax;
-    case ReduceOp::RedOpType::BAND:
+    case ::c10d::ReduceOp::BAND:
       throw std::runtime_error("Cannot use ReduceOp.BAND with NCCL");
-    case ReduceOp::RedOpType::BOR:
+    case ::c10d::ReduceOp::BOR:
       throw std::runtime_error("Cannot use ReduceOp.BOR with NCCL");
-    case ReduceOp::RedOpType::BXOR:
+    case ::c10d::ReduceOp::BXOR:
       throw std::runtime_error("Cannot use ReduceOp.BXOR with NCCL");
-    case ReduceOp::RedOpType::PREMUL_SUM:
+    case ::c10d::ReduceOp::PREMUL_SUM:
       return RedOpRAII(op, comm, dataType, nccl_api_);
-    case ReduceOp::RedOpType::AVG:
+    case ::c10d::ReduceOp::AVG:
       return ncclAvg;
     default:
       throw std::runtime_error("Unsupported reduce operation");
@@ -237,8 +253,8 @@ void ProcessGroupNCCLTC::timeoutWatchdog() noexcept {
       break;
     }
     if (comm_state_ != CommState::NORMAL &&
-        options_.abort_process_on_timeout_or_error &&
-        !options_.enable_reconfigure) {
+        options_c10d_->abort_process_on_timeout_or_error &&
+        !options_c10d_->enable_reconfigure) {
       if (comm_state_ == CommState::TIMEOUT) {
         TC_LOG(ERROR, this)
             << "Aborting process due to timeout on rank " << rank_
@@ -263,7 +279,7 @@ void ProcessGroupNCCLTC::timeoutWatchdog() noexcept {
           "failed to get async error");
       if (asyncErr != ncclSuccess) {
         comm_state_ = CommState::ERROR;
-        if (!options_.enable_reconfigure) {
+        if (!options_c10d_->enable_reconfigure) {
           TC_LOG(ERROR, this)
               << "Aborting process due to error on rank " << rank_
               << " - nccl hit async error: " << ncclGetErrorString(asyncErr);
@@ -288,7 +304,7 @@ void ProcessGroupNCCLTC::timeoutWatchdog() noexcept {
     // isAborted() then reports the revoked state to the caller.
     // revokeNcclComm() is idempotent and the revoked_ check keeps the watchdog
     // from logging every iteration.
-    if (comm_state_ != CommState::NORMAL && options_.enable_reconfigure &&
+    if (comm_state_ != CommState::NORMAL && options_c10d_->enable_reconfigure &&
         !revoked_.load()) {
       TC_LOG(ERROR, this) << "Revoking communicator on rank " << rank_
                           << " - watchdog detected "
@@ -318,12 +334,12 @@ void ProcessGroupNCCLTC::checkAndAbortIfTimedOutOrError() {
   checkWorkQueue();
 
   if (comm_state_ == CommState::TIMEOUT) {
-    if (options_.enable_reconfigure) {
+    if (options_c10d_->enable_reconfigure) {
       revokeNcclComm();
       throw std::runtime_error("NCCL operation timed out");
     } else {
       abortNcclComm();
-      if (options_.abort_process_on_timeout_or_error) {
+      if (options_c10d_->abort_process_on_timeout_or_error) {
         TC_LOG(ERROR, this) << "Aborting process due to timeout";
         runAbortHooks();
         ::abort();
@@ -340,14 +356,14 @@ void ProcessGroupNCCLTC::checkAndAbortIfTimedOutOrError() {
         "failed to get async error");
     NCCLException ncclException(
         *nccl_api_, "NCCL Async Error", asyncErr, nccl_comm_);
-    if (options_.enable_reconfigure) {
+    if (options_c10d_->enable_reconfigure) {
       // In reconfigurable mode we never abort the process: revoke the comm so
       // it can be reconfigured and surface the error to the caller.
       revokeNcclComm();
       throw ncclException;
     }
     abortNcclComm();
-    if (options_.abort_process_on_timeout_or_error) {
+    if (options_c10d_->abort_process_on_timeout_or_error) {
       TC_LOG(ERROR, this) << "Aborting process due to error: "
                           << ncclException.what();
       runAbortHooks();
