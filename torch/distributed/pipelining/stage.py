@@ -1,12 +1,11 @@
 # mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
-import contextlib
 import logging
 import operator
 import warnings
 import weakref
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import Any, cast
 
 import torch
@@ -1780,6 +1779,9 @@ class PipelineStage(_PipelineStageBase):
         self._fwd_outputs_for_bwd_meta: tuple[torch.Tensor, ...] | None = None
         self._fwd_inputs_for_bwd_meta: tuple[torch.Tensor, ...] | None = None
         self._fwd_kwargs_tensors_for_bwd_meta: tuple[torch.Tensor, ...] | None = None
+        self._metadata_inference_buffer_backup: (
+            list[tuple[torch.Tensor, torch.Tensor]] | None
+        ) = None
 
         # Validate and normalize args to tuples
         inputs = validate_and_normalize_to_tuple(input_args)
@@ -1973,25 +1975,25 @@ class PipelineStage(_PipelineStageBase):
             )
         return local_ones
 
-    @contextlib.contextmanager
-    def _preserve_module_buffers(self) -> Iterator[None]:
-        """Restore module buffers after dynamic metadata inference.
+    def _pre_metadata_inference_backup(self) -> None:
+        """Back up state that dynamic metadata inference must not publish.
 
         Dynamic metadata inference executes representative real forwards and
         backwards before the first runtime microbatch. Those executions are
         allowed to observe module buffers, but they must not publish training
         state updates such as running counters or routing statistics.
         """
-        saved_buffers = [
+        if self._inference_mode != InferenceMode.DYNAMIC:
+            return
+        if self._metadata_inference_buffer_backup is not None:
+            raise RuntimeError(
+                "Metadata inference buffer backup already exists. "
+                "Run _post_metadata_inference_cleanup before backing up again."
+            )
+        self._metadata_inference_buffer_backup = [
             (buffer, buffer.detach().clone())
             for _, buffer in self.submod.named_buffers(remove_duplicate=False)
         ]
-        try:
-            yield
-        finally:
-            with torch.no_grad():
-                for buffer, saved_buffer in saved_buffers:
-                    buffer.copy_(saved_buffer)
 
     def _forward_metadata_inference(
         self,
@@ -2222,9 +2224,19 @@ class PipelineStage(_PipelineStageBase):
             return None
 
     def _post_metadata_inference_cleanup(self) -> None:
-        """Clean up FSDP side effects (unsharded params, stale grads, stored
-        tensors) after metadata inference with real tensors.
+        """Restore state and clean up side effects from metadata inference.
+
+        Buffer restore is intentionally delayed until after both forward and
+        backward metadata inference. Restoring immediately after forward can
+        bump autograd version counters for buffers saved by the forward graph.
         """
+        buffer_backup = self._metadata_inference_buffer_backup
+        if buffer_backup is not None:
+            with torch.no_grad():
+                for buffer, saved_buffer in buffer_backup:
+                    buffer.copy_(saved_buffer)
+            self._metadata_inference_buffer_backup = None
+
         # Clear stored inference tensors (frees autograd graph + activations)
         self._fwd_outputs_for_bwd_meta = None
         self._fwd_inputs_for_bwd_meta = None
@@ -2255,13 +2267,12 @@ class PipelineStage(_PipelineStageBase):
         if self._inference_mode == InferenceMode.DYNAMIC:
             # DYNAMIC mode: run backward metadata inference
             # received_grad_meta is used for same-rank V-schedule stages
-            with self._preserve_module_buffers():
-                grad_meta_result = self._backward_metadata_inference(
-                    loss_fn=loss_fn,
-                    target=target,
-                    received_grad_meta=received_grad_meta,
-                    loss_kwargs=loss_kwargs,
-                )
+            grad_meta_result = self._backward_metadata_inference(
+                loss_fn=loss_fn,
+                target=target,
+                received_grad_meta=received_grad_meta,
+                loss_kwargs=loss_kwargs,
+            )
             # Validate dynamically inferred metadata against user-provided metadata
             self._validate_inferred_metadata()
         else:
@@ -2338,10 +2349,9 @@ class PipelineStage(_PipelineStageBase):
         if self._inference_mode == InferenceMode.DYNAMIC:
             # DYNAMIC mode: run forward metadata inference
             # args may be _StageForwardMeta for same-rank V-schedule stages
-            with self._preserve_module_buffers():
-                fwd_meta_output = self._forward_metadata_inference(
-                    args, kwargs, has_backward
-                )
+            fwd_meta_output = self._forward_metadata_inference(
+                args, kwargs, has_backward
+            )
             # Validate dynamically inferred metadata against user-provided metadata
             self._validate_inferred_metadata()
         # STATIC mode: metadata comes from user inputs, no validation needed

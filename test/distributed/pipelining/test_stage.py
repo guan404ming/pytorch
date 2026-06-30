@@ -14,7 +14,7 @@ from torch.distributed.pipelining import (
     PipelineStage,
     ScheduleGPipe,
 )
-from torch.distributed.pipelining._utils import InferenceMode, PipeliningMetadataError
+from torch.distributed.pipelining._utils import PipeliningMetadataError
 from torch.testing._internal.common_distributed import (
     MultiProcContinuousTest,
     requires_accelerator_dist_backend,
@@ -47,11 +47,12 @@ class PipelineStageMetadataInferenceTest(TestCase):
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
                 self.register_buffer("counter", torch.zeros(4))
+                self.register_buffer("scale", torch.ones(4))
 
             def forward(self, x):
                 with torch.no_grad():
                     self.counter.add_(1)
-                out = self.linear(x)
+                out = self.linear(x) * self.scale
                 if out.requires_grad:
                     out.register_hook(self._backward_hook)
                 return out
@@ -79,19 +80,24 @@ class PipelineStageMetadataInferenceTest(TestCase):
                     num_stages=1,
                     device=device,
                 )
-                stage._inference_mode = InferenceMode.DYNAMIC
+                schedule = ScheduleGPipe(
+                    stage,
+                    n_microbatches=1,
+                    loss_fn=lambda out, target: out.sum() + target.sum() * 0,
+                )
 
                 initial_counter = mod.counter.clone()
+                initial_scale = mod.scale.clone()
                 x = torch.randn(2, 4, device=device, requires_grad=True)
-                stage._prepare_forward_infra(1, (x,), {}, has_backward=True)
-                self.assertEqual(mod.counter, initial_counter)
-
-                def loss_fn(out, target):
-                    return out.sum() + target.sum() * 0
-
                 target = torch.zeros((), device=device)
-                stage._prepare_backward_infra(1, loss_fn=loss_fn, target=target)
+
+                # This exercises the full metadata-inference lifecycle. The
+                # scale buffer is saved by autograd, so restoring buffers before
+                # backward metadata inference would bump its version counter.
+                schedule._initialize_stage((x,), {}, target=target)
+
                 self.assertEqual(mod.counter, initial_counter)
+                self.assertEqual(mod.scale, initial_scale)
             finally:
                 if init_pg:
                     dist.destroy_process_group()
