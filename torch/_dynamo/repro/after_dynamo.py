@@ -62,6 +62,11 @@ log = logging.getLogger(__name__)
 inductor_config = import_module("torch._inductor.config")
 use_buck = inductor_config.is_fbcode()
 
+
+def _no_compiler_config() -> CompilerConfig | None:
+    return None
+
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
 #                           MAIN ENTRY POINT
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
@@ -97,7 +102,7 @@ class WrapBackendDebug:
         if isinstance(unconfigured_compiler_fn, CompilerConfigProvider):
             self.get_compiler_config = unconfigured_compiler_fn.get_compiler_config
         else:
-            self.get_compiler_config = lambda: None
+            self.get_compiler_config = _no_compiler_config
 
     def __call__(
         self, gm: torch.fx.GraphModule, example_inputs: list[Any], **kwargs: Any
