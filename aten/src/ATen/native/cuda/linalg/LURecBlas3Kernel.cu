@@ -260,23 +260,21 @@ setup_pivinfo_kernel(
   int batch = blockIdx.x;
   int tid = threadIdx.x;
 
-  int* piv = pivinfo + batch * pivinfo_m + row_offset;
+  int* piv = pivinfo + batch * pivinfo_m;
   const int* ip = ipiv + batch * ipiv_stride;
 
   // Initialize identity (1-based absolute row indices, like MAGMA)
-  for (int i = tid; i < nrows; i += BS) {
-    piv[i] = row_offset + i + 1;
+  for (int dst = tid + row_offset; dst < row_offset + nrows; dst += BS) {
+    piv[dst] = dst + 1;
   }
   __syncthreads();
 
   // Thread 0 replays the sequential swaps
   if (tid == 0) {
-    for (int i = 0; i < nb; i++) {
-      int swap_target = ip[row_offset + i] - 1; // convert 1-based to 0-based
-      int local_src = i;                         // relative index of row (row_offset + i)
-      int local_dst = swap_target - row_offset;  // relative index of swap target
-      if (local_src != local_dst) {
-        thrust::swap(piv[local_src], piv[local_dst]);
+    for (int src = row_offset; src < row_offset + nb; ++src) {
+      auto dst = ip[src] - 1;
+      if (src != dst) {
+        thrust::swap(piv[src], piv[dst]);
       }
     }
   }
@@ -441,10 +439,10 @@ batched_panel_full_kernel(
 
     // 2. Row swaps
     if (pivot_row != k) {
-      for (int j = tid; j < nb; j += BS) {
-        size_t idx1 = k + static_cast<size_t>(col_start + j) * lda;
-        size_t idx2 = pivot_row + static_cast<size_t>(col_start + j) * lda;
-        thrust::swap(A[idx1], A[idx2]);
+      for (int j = tid + col_start; j < nb + col_start; j += BS) {
+        auto src = k + static_cast<size_t>(j) * lda;
+        auto dst = pivot_row + static_cast<size_t>(j) * lda;
+        thrust::swap(A[src], A[dst]);
       }
     }
 
