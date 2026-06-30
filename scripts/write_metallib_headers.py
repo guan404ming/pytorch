@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from torch.utils._cpp_embed_headers import embed_headers
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "torch" / "utils"))
+from _cpp_embed_headers import embed_headers
 
 
 def write_metallib_headers(metal_filename: str, output_filename: str):
