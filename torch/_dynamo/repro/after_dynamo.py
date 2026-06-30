@@ -26,7 +26,7 @@ import sys
 import textwrap
 from collections.abc import Callable, Sequence
 from importlib import import_module
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.fx as fx
@@ -92,8 +92,10 @@ class WrapBackendDebug:
             self.__name__ = unconfigured_compiler_fn.__name__
         if hasattr(unconfigured_compiler_fn, "compiler_name"):
             self.__name__ = unconfigured_compiler_fn.compiler_name  # type: ignore[attr-defined]
-        if isinstance(unconfigured_compiler_fn, CompilerConfigProvider):
-            self.get_compiler_config = unconfigured_compiler_fn.get_compiler_config  # type: ignore[attr-defined]
+        if hasattr(unconfigured_compiler_fn, "get_compiler_config"):
+            self.get_compiler_config = cast(
+                CompilerConfigProvider, unconfigured_compiler_fn
+            ).get_compiler_config
 
     def __call__(
         self, gm: torch.fx.GraphModule, example_inputs: list[Any], **kwargs: Any

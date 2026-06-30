@@ -44,7 +44,7 @@ from collections.abc import Generator, Sized
 from dataclasses import dataclass
 from enum import Enum
 from os.path import dirname, join
-from typing import Any, Literal, NamedTuple, TYPE_CHECKING
+from typing import Any, cast, Literal, NamedTuple, TYPE_CHECKING
 from unittest.mock import patch
 
 import sympy
@@ -1818,8 +1818,8 @@ def _optimize(
         and not config.debug_force_graph_break_on_leaf_return,
         dynamic=dynamic,
         compiler_config=(
-            backend.get_compiler_config()
-            if isinstance(backend, CompilerConfigProvider)
+            cast(CompilerConfigProvider, backend).get_compiler_config()
+            if hasattr(backend, "get_compiler_config")
             else None
         ),
         rebuild_ctx=rebuild_ctx,
