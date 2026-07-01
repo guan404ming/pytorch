@@ -505,6 +505,52 @@ class LoopOrderingTest(TestCase):
         torch.testing.assert_close(actual, ref, atol=1e-2, rtol=1e-2)
         self.assertEqual(1, metrics.generated_kernel_count)
 
+    @skipUnless(HAS_GPU, "requires GPU")
+    def test_transpose_contiguous_clone_reindexing(self):
+        """
+        A producer writes [B, S, H], then a view + transpose + contiguous clone
+        changes the layout to [B, heads, S, D]. Reindexing the clone to the
+        producer iteration domain should let vertical fusion remove the copy
+        kernel and write the final layout directly.
+        """
+
+        def rotate_every_two(x):
+            return torch.stack((-x[..., 1::2], x[..., 0::2]), dim=-1).flatten(-2)
+
+        def f(token_ids, embedding_weight, norm_weight, cos, sin):
+            x = F.embedding(token_ids, embedding_weight)
+            inv_rms = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-6)
+            x = x * inv_rms * norm_weight
+            x = (x * cos) + (rotate_every_two(x) * sin)
+            x = x.view(token_ids.shape[0], token_ids.shape[1], 4, 8)
+            return x.transpose(1, 2).contiguous()
+
+        bsz, seq, vocab, hidden = 2, 16, 128, 32
+        token_ids = torch.randint(0, vocab, (bsz, seq), device=GPU_TYPE)
+        embedding_weight = torch.randn(vocab, hidden, device=GPU_TYPE)
+        norm_weight = torch.randn(hidden, device=GPU_TYPE)
+        pos = torch.arange(seq, device=GPU_TYPE, dtype=torch.float32)[:, None]
+        dim = torch.arange(hidden, device=GPU_TYPE, dtype=torch.float32)[None, :]
+        freqs = pos / (10000.0 ** (dim / hidden))
+        cos = torch.cos(freqs)[None, :, :]
+        sin = torch.sin(freqs)[None, :, :]
+
+        ref = f(token_ids, embedding_weight, norm_weight, cos, sin)
+        actual, code = run_and_get_code(
+            torch.compile(f),
+            token_ids,
+            embedding_weight,
+            norm_weight,
+            cos,
+            sin,
+        )
+
+        torch.testing.assert_close(actual, ref)
+        self.assertEqual(actual.stride(), (512, 128, 8, 1))
+        FileCheck().check_count("@triton.jit", 1, exactly=True).check_not(
+            "triton_poi_fused_clone"
+        ).run(code[0])
+
     def test_reindex_unfusable_write_read_dep(self):
         """
         Grouped quantization where a custom op consumes both the

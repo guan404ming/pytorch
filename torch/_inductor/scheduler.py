@@ -57,7 +57,7 @@ from torch._inductor.ir import TritonTemplateCallerBase
 from torch._inductor.metrics import get_metric_table, is_metric_table_enabled
 from torch._inductor.stream_utils import get_stream_name
 from torch.fx.experimental.symbolic_shapes import free_symbols
-from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch.utils._sympy.symbol import free_symbol_is_type, symbol_is_type, SymT
 from torch.utils._triton import has_triton
 
@@ -2361,6 +2361,30 @@ class SchedulerNode(BaseSchedulerNode):
 
         self._before_loop_state_mutation()
         self._body = self._body.reindex_iter_loops(new_iter_sizes)
+        self._sizes = self._body.sizes
+
+        device = self.node.get_device_or_error()
+        group_fn = self.scheduler.get_backend(device).group_fn
+        self.group = (device, group_fn(self._sizes))
+
+        self.refresh_dependencies(normalize=False, need_clear_tiling_cache=True)
+
+    def apply_loop_reindexing_with_indexer(
+        self,
+        new_iter_sizes: Sequence[sympy.Expr],
+        indexer: Callable[
+            [Sequence[sympy.Expr], Sequence[sympy.Expr]], Sequence[sympy.Expr]
+        ],
+    ) -> None:
+        if not isinstance(self.node, (ir.ComputedBuffer, ir.TemplateBuffer)):
+            raise AssertionError(
+                "expected self.node to be a ComputedBuffer or TemplateBuffer"
+            )
+
+        self._before_loop_state_mutation()
+        self._body = self._body.reindex_iter_loops_with_indexer(
+            new_iter_sizes, indexer
+        )
         self._sizes = self._body.sizes
 
         device = self.node.get_device_or_error()
@@ -7021,6 +7045,12 @@ class Scheduler:
         if not isinstance(node1_write, MemoryDep):
             return -1
 
+        score = self._try_reindex_transpose_contiguous_clone(
+            node1, node2, node1_write, node2_read, node2_write
+        )
+        if score >= 0:
+            return score
+
         # We are checking for compatibility with the normalized node1 write
         # then modifying node2 reads/writes. since the node1 write will be just used
         # for compatibility, while node2 will be used in actual modification, just
@@ -7101,6 +7131,98 @@ class Scheduler:
             raise AssertionError("expected score to be an int")
 
         fusion_log.info("Shared memory after inversion: %d", score)
+        return score
+
+    def _try_reindex_transpose_contiguous_clone(
+        self,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        node1_write: MemoryDep,
+        node2_read: MemoryDep,
+        node2_write: MemoryDep,
+    ) -> int:
+        """
+        Reindex a layout-changing clone after a producer of [B, S, H].
+
+        This handles the common attention layout transition:
+
+            producer[B, S, H] -> view(B, S, heads, D)
+                -> transpose(1, 2).contiguous()
+
+        The clone initially iterates in output order [B, heads, S, D] and reads
+        the producer storage with a permuted index. Reindexing the clone to the
+        producer domain [B, S, H] makes its read dependency match the producer
+        write while preserving the final contiguous output store.
+        """
+        if not isinstance(node2, SchedulerNode):
+            return -1
+
+        if node2.is_reduction():
+            return -1
+
+        if len(node2.read_writes.reads) != 1 or len(node2.read_writes.writes) != 1:
+            return -1
+
+        body = node2._body
+        if len(body.indexing_exprs) != 2 or body.subblocks:
+            return -1
+        if "index0" not in body.indexing_exprs or "index1" not in body.indexing_exprs:
+            return -1
+
+        read_exprs = OrderedSet(expr for expr in body.get_read_exprs())
+        if len(read_exprs) != 1:
+            return -1
+        if next(iter(read_exprs)) not in body.indexing_exprs.values():
+            return -1
+
+        producer_size = list(node1_write.size)
+        clone_read_size = list(node2_read.size)
+        clone_write_size = list(node2_write.size)
+        if (
+            len(producer_size) != 3
+            or len(clone_read_size) != 4
+            or clone_read_size != clone_write_size
+        ):
+            return -1
+
+        bsz, seq, hidden = producer_size
+        read_bsz, heads, read_seq, head_dim = clone_read_size
+        if not (
+            V.graph.sizevars.statically_known_equals(bsz, read_bsz)
+            and V.graph.sizevars.statically_known_equals(seq, read_seq)
+            and V.graph.sizevars.statically_known_equals(hidden, heads * head_dim)
+            and V.graph.sizevars.statically_known_equals(
+                sympy_product(producer_size), sympy_product(clone_read_size)
+            )
+        ):
+            return -1
+
+        old_score = self.score_fusion_memory(node1, node2)
+        state = node2.snapshot_loop_state()
+
+        def indexer(
+            new_iter_idx: Sequence[sympy.Expr],
+            old_iter_sizes: Sequence[sympy.Expr],
+        ) -> Sequence[sympy.Expr]:
+            b, s, h = new_iter_idx
+            return [
+                b,
+                FloorDiv(h, old_iter_sizes[3]),
+                s,
+                ModularIndexing(h, 1, old_iter_sizes[3]),
+            ]
+
+        node2.apply_loop_reindexing_with_indexer(producer_size, indexer)
+        score = self.score_fusion_memory(node1, node2)
+        if not isinstance(score, int):
+            raise AssertionError("expected score to be an int")
+        if score <= old_score:
+            node2.restore_loop_state(state)
+            return -1
+
+        fusion_log.info(
+            "Shared memory after transpose-contiguous clone reindex: %d", score
+        )
         return score
 
     def shared_data_after_reordering_loop(
