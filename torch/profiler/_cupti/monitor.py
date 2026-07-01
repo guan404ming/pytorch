@@ -16,7 +16,15 @@ from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 import torch
 
 from . import cupti_python
-from .records import Api, FIELD_REGISTRY, Kernel, STRING_FIELDS, Sync
+from .records import (
+    Api,
+    Ctype,
+    FIELD_CTYPE,
+    FIELD_REGISTRY,
+    Kernel,
+    STRING_FIELDS,
+    Sync,
+)
 
 
 # A registration request: either a plain iterable of activity kinds (meaning "all
@@ -172,10 +180,11 @@ class CuptiMonitorBuffer:
         out: dict[int, dict[int, Any]] = {}
         for kind, pos_arr in positions.items():
             fields = layouts[kind][1]
-            str_fields = STRING_FIELDS.get(kind, frozenset())
+            ctypes_ = FIELD_CTYPE.get(kind, {})
             cols: dict[int, Any] = {}
             for fid, (off, size) in fields.items():
-                if fid in str_fields and size == 8:
+                ct = ctypes_.get(fid, Ctype.UINT)
+                if ct is Ctype.CSTR and size == 8:
                     # const char* field: deref each pointer to a str now.
                     ptrs = (
                         raw[pos_arr[:, None] + np.arange(off, off + 8)]
@@ -189,8 +198,11 @@ class CuptiMonitorBuffer:
                     continue
                 if size not in (1, 2, 4, 8):
                     continue
+                # ctype gives the interpretation (u/i/f); the width is the layout's. A CSTR
+                # field whose size isn't pointer-width has no pointer to deref -> read raw.
+                dtype = f"<u{size}" if ct is Ctype.CSTR else ct.numpy(size)
                 idx = pos_arr[:, None] + np.arange(off, off + size)
-                cols[fid] = raw[idx].copy().view(f"<u{size}").ravel()
+                cols[fid] = raw[idx].copy().view(dtype).ravel()
             if cols:
                 out[kind] = cols
         return out
