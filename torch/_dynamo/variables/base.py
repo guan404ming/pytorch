@@ -28,7 +28,13 @@ from typing import Any, NoReturn, TYPE_CHECKING
 
 from .. import graph_break_hints, variables
 from ..current_scope_id import current_scope_id
-from ..exc import raise_observed_exception, raise_type_error, unimplemented
+from ..exc import (
+    ObservedAttributeError,
+    raise_observed_exception,
+    raise_type_error,
+    unimplemented,
+    Unsupported,
+)
 from ..guards import GuardBuilder, install_guard
 from ..source import AttrSource, Source
 from ..utils import format_source_range, istype, raise_args_mismatch
@@ -693,6 +699,26 @@ class VariableTracker(metaclass=VariableTrackerMeta):
     def call_obj_hasattr(
         self, tx: InstructionTranslatorBase, name: str
     ) -> ConstantVariable:
+        """Dynamo's hasattr(): try getattro_impl, catch AttributeError.
+
+        Mirrors CPython's PyObject_HasAttr: call PyObject_GetAttr (full
+        attribute access including descriptors/__getattr__), suppress
+        AttributeError, return True/False.
+        """
+        result = self._hasattr_check_side_effects(tx, name)
+        if result is not None:
+            return result
+
+
+        try:
+            self.getattro_impl(tx, name)
+            return variables.ConstantVariable.create(True)
+        except ObservedAttributeError:
+            tx.exn_vt_stack.clear_current_exception()
+            return variables.ConstantVariable.create(False)
+        except (NotImplementedError, Unsupported):
+            pass
+
         unimplemented(
             gb_type="Unsupported hasattr call",
             context=f"call_obj_hasattr {self} {name}",
