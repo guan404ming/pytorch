@@ -53,25 +53,33 @@ class GroupedTensorSSALayout:
     def reduce_dims(self) -> tuple[int, ...]:
         return (-1, 2) if self.axis == 1 else (-2, 1)
 
-    @property
-    def fragment_group_size(self) -> int:
-        return min(self.group_size, 32)
-
-    @property
-    def tensorssa_shape(self) -> str:
-        if self.axis == 1:
-            return f"((1, {self.fragment_group_size}, {32 // self.fragment_group_size}), 1, 1)"
+    def fragment_group_size_expr(self, source: Any) -> str:
+        """Return the local group size available in this epilogue fragment."""
         return (
-            f"(({self.fragment_group_size}, 1, {32 // self.fragment_group_size}), 1, 1)"
+            f"cutlass.const_expr(min({self.group_size}, "
+            f"cute.size({source}.shape, mode=[0])))"
         )
 
-    @property
-    def keepdim_shape(self) -> str:
-        return f"((1, 1, {32 // self.fragment_group_size}), 1, 1)"
+    def fragment_repeat_expr(self, source: Any) -> str:
+        """Return the repeat count needed to cover the current epilogue fragment."""
+        return (
+            f"cutlass.const_expr(cute.size({source}.shape, mode=[0]) "
+            f"// min({self.group_size}, cute.size({source}.shape, mode=[0])))"
+        )
+
+    def tensorssa_shape(self, source: Any) -> str:
+        fragment_group_size = self.fragment_group_size_expr(source)
+        repeats = self.fragment_repeat_expr(source)
+        if self.axis == 1:
+            return f"((1, {fragment_group_size}, {repeats}), 1, 1)"
+        return f"(({fragment_group_size}, 1, {repeats}), 1, 1)"
+
+    def keepdim_shape(self, source: Any) -> str:
+        return f"((1, 1, {self.fragment_repeat_expr(source)}), 1, 1)"
 
     @property
     def needs_physical_combine(self) -> bool:
-        return self.axis == 0 or self.group_size > self.fragment_group_size
+        return self.axis == 0 or self.group_size > 16
 
     @property
     def reduction_profile(self) -> str:
@@ -301,7 +309,7 @@ def _keepdim_and_broadcast(
 ) -> tuple[Any, Any]:
     """Materialize keepdim and store-shaped forms of a grouped reduction."""
     keepdim_source = _generate_like(
-        kernel, f"{reduced}.reshape({info.layout.keepdim_shape})", reduced
+        kernel, f"{reduced}.reshape({info.layout.keepdim_shape(source)})", reduced
     )
     return keepdim_source, _generate_like(
         kernel, f"{keepdim_source}.broadcast_to({source}.shape)", keepdim_source, source
@@ -499,7 +507,7 @@ def lower_view_or_reshape(
     if preserve_value_layout:
         return source
     return _generate_like(
-        kernel, f"{source}.reshape({grouped_layout.tensorssa_shape})", source
+        kernel, f"{source}.reshape({grouped_layout.tensorssa_shape(source)})", source
     )
 
 
