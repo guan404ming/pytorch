@@ -31,7 +31,7 @@ from torch.testing._internal.common_utils import \
      runOnRocmArch, MI200_ARCH, MI300_ARCH, MI350_ARCH, NAVI_ARCH, TEST_CUDA,
      skipIfNoNvmath)
 from torch.testing._internal.common_device_type import \
-    (instantiate_device_type_tests, dtypes, has_cusolver, onlyCPU, skipIf, skipCPUIfNoLapack, precisionOverride,
+    (instantiate_device_type_tests, dtypes, has_cusolver, onlyCPU, skipCPUIfNoLapack, precisionOverride,
      skipCUDAIf,
      skipCUDAIfNoCusolver, skipCUDAIfNoMagmaAndNoCusolver, skipCUDAIfNoMagmaAndNoLinalgsolver,
      skipCUDAIfRocm, onlyNativeDeviceTypes, dtypesIfCUDA,
