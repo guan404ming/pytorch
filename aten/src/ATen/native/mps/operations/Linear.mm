@@ -130,7 +130,7 @@ Tensor _mps_linear(const Tensor& input, const Tensor& weight_arg, const std::opt
   // No-graph execution causes nonsense if these are non-contiguous.
   const bool is_contiguous = input.is_contiguous() && weight.is_contiguous() && bias.is_contiguous();
 
-  if (is_macos_13_or_newer(MacOSVersion::MACOS_VER_15_0_PLUS) && is_contiguous && !is_complex) {
+  if (is_macos_at_least(MacOSVersion::MACOS_15_0) && is_contiguous && !is_complex) {
     if (needs_nd_workaround(input) && (!is_bias_defined || bias.dim() <= 1)) {
       auto input2d = input.flatten(0, -2);
       auto output2d = output.flatten(0, -2);
@@ -246,7 +246,7 @@ static Tensor _mps_linear_backward_input(IntArrayRef input_size, const Tensor& g
       // (https://github.com/pytorch/pytorch/issues/114942), so flatten >4D to 2D first. macOS 27 handles N-D
       // matmul directly and instead crashes the MLIR pass manager on the in-graph reshape -> matmul -> reshape
       // (https://github.com/pytorch/pytorch/issues/187201), so skip the reshape there.
-      bool needReshape = grad_output.dim() > 4 && !is_macos_13_or_newer(MacOSVersion::MACOS_VER_27_0_PLUS);
+      bool needReshape = grad_output.dim() > 4 && !is_macos_at_least(MacOSVersion::MACOS_27_0);
       auto gradOutputTensor = needReshape
           ? [mpsGraph flatten2DTensor:newCachedGraph->gradOutputTensor_ axis:-1 name:nil]
           : newCachedGraph->gradOutputTensor_;
