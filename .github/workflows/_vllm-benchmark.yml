@@ -48,8 +48,10 @@ jobs:
     container:
       image: ${{ inputs.docker_image }}
       options: --gpus all --ipc=host --tty
-      volumes:
-        - /mnt/hf_cache:/mnt/hf_cache
+      # OSDC runners get /mnt/hf_cache injected by the runner hook (declaring it here
+      # would break the hook's bind-mount check). DGX B200 (non-OSDC) has no injection,
+      # so bind-mount its writable host cache dir instead.
+      volumes: ${{ contains(inputs.runner, 'b200') && fromJSON('["/mnt/hf_cache:/mnt/hf_cache"]') || fromJSON('[]') }}
     steps:
       - name: Install system dependencies
         run: |
@@ -199,20 +201,48 @@ jobs:
           find .buildkite/performance-benchmarks/tests -type f -exec cat {} \;
           popd
 
+      - name: Resolve HF cache mode
+        shell: bash
+        run: |
+          OFFLINE=1
+          if [[ "${{ inputs.is_nightly }}" == "true" ]]; then
+            OFFLINE=0
+          fi
+          {
+            echo "TRANSFORMERS_OFFLINE=${OFFLINE}"
+            echo "HF_DATASETS_OFFLINE=${OFFLINE}"
+          } >> "${GITHUB_ENV}"
+
       - name: Run vLLM benchmark
+        id: run-benchmark
         working-directory: vllm-project/vllm
         env:
-          FLASHINFER_WORKSPACE_BASE: /mnt/hf_cache
           HF_TOKEN: ${{ secrets.VLLM_TEST_HUGGING_FACE_TOKEN }}
-          HF_HOME: /mnt/hf_cache
-          # Nightly runs download from HF to periodically refresh the local cache
-          TRANSFORMERS_OFFLINE: ${{ inputs.is_nightly && '0' || '1' }}
-          # vLLM-related environment variables
           ENGINE_VERSION: v1
           SAVE_TO_PYTORCH_BENCHMARK_FORMAT: 1
         shell: bash
         run: |
           set -eux
+
+          # HF models + FlashInfer workspace share one cache root at /mnt/hf_cache:
+          # a read-only rclone mount on OSDC, a writable host dir on DGX B200.
+          #   - offline (default): read /mnt/hf_cache in place.
+          #   - online + writable mount (B200): refresh /mnt/hf_cache in place.
+          #   - online + read-only/absent mount (OSDC): download into a writable dir
+          #     that "Refresh the HF cache in S3" syncs back to the bucket.
+          if [[ "${TRANSFORMERS_OFFLINE}" == "1" && -d /mnt/hf_cache ]]; then
+            export HF_HOME=/mnt/hf_cache
+          elif [[ -w /mnt/hf_cache ]]; then
+            export HF_HOME=/mnt/hf_cache
+            mkdir -p "${HF_HOME}/flashinfer"
+          else
+            export HF_HOME="${RUNNER_TEMP}/hf_cache"
+            mkdir -p "${HF_HOME}/flashinfer"
+            export TRANSFORMERS_OFFLINE=0
+            export HF_DATASETS_OFFLINE=0
+          fi
+          export FLASHINFER_WORKSPACE_BASE="${HF_HOME}/flashinfer"
+
           bash .buildkite/performance-benchmarks/scripts/run-performance-benchmarks.sh
 
       - name: Check the benchmark results
@@ -242,3 +272,31 @@ jobs:
           dry-run: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
           if-no-files-found: error
+
+      - name: Authenticate to refresh the HF cache in S3
+        if: always() && steps.run-benchmark.conclusion && env.TRANSFORMERS_OFFLINE == '0'
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_hf-cache-write
+          aws-region: us-east-1
+
+      - name: Refresh the HF cache in S3
+        if: always() && steps.run-benchmark.conclusion && env.TRANSFORMERS_OFFLINE == '0'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -x
+          HF_CACHE="${RUNNER_TEMP}/hf_cache"
+          if [[ -z "${HF_CACHE_S3_BUCKET:-}" ]]; then
+            echo "HF_CACHE_S3_BUCKET unset (not an hf-cache runner) - skipping sync"
+            exit 0
+          fi
+          for sub in hub flashinfer; do
+            if [[ -d "${HF_CACHE}/${sub}" ]]; then
+              aws s3 sync "${HF_CACHE}/${sub}" "s3://${HF_CACHE_S3_BUCKET}/${sub}" \
+                --region "${HF_CACHE_S3_REGION}" --no-progress
+            else
+              echo "No ${HF_CACHE}/${sub} to sync - skipping"
+            fi
+          done
