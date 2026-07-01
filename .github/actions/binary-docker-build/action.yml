@@ -45,10 +45,6 @@ runs:
     - name: Set up Docker Buildx (remote, no bootstrap)
       if: ${{ inputs.use-remote-buildkit == 'true' }}
       shell: bash
-      # NOT docker/setup-buildx-action: it runs `buildx inspect --bootstrap`,
-      # whose ~20s connect timeout fails on a cold/burst start before the
-      # autoscaled pool can add a pod. `create` (no --bootstrap) just registers
-      # the builder; build.sh retries the build to wait out scale-up.
       run: |
         set -ex
         docker buildx create \
