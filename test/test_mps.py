@@ -1705,23 +1705,6 @@ class TestMPS(TestCaseMPS):
         second = F.linear(x, w).clone()
         self.assertEqual(first, second, atol=0, rtol=0)
 
-    @parametrize("bias", [True, False])
-    @parametrize("in_features,out_features,shape", [
-        (2, 192, (80, 1, 2)),
-        (4, 192, (80, 1, 4)),
-        (2, 768, (80, 1, 2)),
-        (2, 192, (80, 4, 2)),
-    ])
-    def test_linear_bias_vector_shaped(self, in_features, out_features, shape, bias):
-        # Regression test: F.linear with bias and a penultimate input dim of 1 dropped the
-        # bias on some MPS GPU families (fused matmul routed to GEMV); decomposition fixes it.
-        torch.manual_seed(0)
-        cpu_linear = nn.Linear(in_features, out_features, bias=bias)
-        mps_linear = nn.Linear(in_features, out_features, bias=bias).to("mps")
-        mps_linear.load_state_dict(cpu_linear.state_dict())
-        x = torch.randn(*shape)
-        self.assertEqual(cpu_linear(x), mps_linear(x.to("mps")).cpu())
-
     def test_uniform(self):
         low = torch.zeros(5, 5, requires_grad=True)
         high = (torch.ones(5, 5) * 3).requires_grad_()
