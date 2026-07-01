@@ -224,24 +224,33 @@ jobs:
         run: |
           set -eux
 
-          # HF models + FlashInfer workspace share one cache root at /mnt/hf_cache:
-          # a read-only rclone mount on OSDC, a writable host dir on DGX B200.
-          #   - offline (default): read /mnt/hf_cache in place.
-          #   - online + writable mount (B200): refresh /mnt/hf_cache in place.
-          #   - online + read-only/absent mount (OSDC): download into a writable dir
-          #     that "Refresh the HF cache in S3" syncs back to the bucket.
+          # HF model cache: offline reads /mnt/hf_cache in place (read-only on OSDC,
+          # writable host dir on B200); online (nightly) downloads into a writable dir.
           if [[ "${TRANSFORMERS_OFFLINE}" == "1" && -d /mnt/hf_cache ]]; then
             export HF_HOME=/mnt/hf_cache
           elif [[ -w /mnt/hf_cache ]]; then
             export HF_HOME=/mnt/hf_cache
-            mkdir -p "${HF_HOME}/flashinfer"
           else
             export HF_HOME="${RUNNER_TEMP}/hf_cache"
-            mkdir -p "${HF_HOME}/flashinfer"
+            mkdir -p "${HF_HOME}"
             export TRANSFORMERS_OFFLINE=0
             export HF_DATASETS_OFFLINE=0
           fi
-          export FLASHINFER_WORKSPACE_BASE="${HF_HOME}/flashinfer"
+
+          # FlashInfer JIT-compiles into its workspace, so it always needs a writable
+          # dir (never the read-only OSDC mount). B200: compile in place on the host
+          # mount. OSDC: compile in a local dir warmed from the cached kernels, which
+          # the refresh step syncs back to S3 on nightly. A cold cache just recompiles.
+          if [[ -w /mnt/hf_cache ]]; then
+            export FLASHINFER_WORKSPACE_BASE=/mnt/hf_cache/flashinfer
+            mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
+          else
+            export FLASHINFER_WORKSPACE_BASE="${RUNNER_TEMP}/hf_cache/flashinfer"
+            mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
+            if [[ -d /mnt/hf_cache/flashinfer ]]; then
+              cp -a /mnt/hf_cache/flashinfer/. "${FLASHINFER_WORKSPACE_BASE}/" 2>/dev/null || true
+            fi
+          fi
 
           bash .buildkite/performance-benchmarks/scripts/run-performance-benchmarks.sh
 
