@@ -1650,7 +1650,7 @@ class UserMethodVariable(UserFunctionVariable):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.fn}, {self.obj})"
 
-    def hash_impl(self, tx: Any) -> tuple[int, bool]:
+    def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
         # CPython method_hash: hash(self) ^ hash(func)
         # https://github.com/python/cpython/blob/e76aa128fe/Objects/classobject.c#L304
         if self.source:
@@ -2865,7 +2865,9 @@ class CollectiveFunctionRewriteVariable(UserFunctionVariable):
 
                 ops.append(op_var)
                 tensors.append(item.var_getattr(tx, "tensor"))
-                peers.append(item.var_getattr(tx, "peer"))
+                # batch_p2p_ops expects a group-local rank, which is what
+                # P2POp.group_peer provides.
+                peers.append(item.var_getattr(tx, "group_peer"))
                 tags.append(item.var_getattr(tx, "tag"))
                 if group_var is None:
                     group_var = item.var_getattr(tx, "group")
@@ -4071,7 +4073,7 @@ class MethodWrapperVariable(VariableTracker):
         codegen(self.obj)
         codegen.extend_output(codegen.create_load_attrs(self.descriptor.__name__))
 
-    def hash_impl(self, tx: Any) -> tuple[int, bool]:
+    def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
         try:
             # CPython wrapper_hash:
             # https://github.com/python/cpython/blob/3.13/Objects/descrobject.c#L1347

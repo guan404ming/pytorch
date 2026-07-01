@@ -770,7 +770,7 @@ class ConstDictVariable(VariableTracker):
 
     def nb_or_impl(
         self,
-        tx: Any,
+        tx: "InstructionTranslatorBase",
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
@@ -784,7 +784,7 @@ class ConstDictVariable(VariableTracker):
 
     def nb_inplace_or_impl(
         self,
-        tx: Any,
+        tx: "InstructionTranslatorBase",
         other: VariableTracker,
     ) -> VariableTracker:
         # ref: https://github.com/python/cpython/blob/3.13/Objects/dictobject.c#L4660-L4667
@@ -1085,6 +1085,16 @@ class DictViewVariable(VariableTracker):
         if name in self.python_type().__dict__:
             return ConstantVariable.create(True)
         return ConstantVariable.create(False)
+
+    def var_getattr(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> VariableTracker:
+        # dictview_mapping getset returns a read-only mappingproxy of the
+        # underlying dict for dict_keys/values/items.
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/dictobject.c#L5032-L5040
+        if name == "mapping":
+            return MappingProxyVariable(self.dv_dict)
+        return super().var_getattr(tx, name)
 
     def repr_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
         if self.kv == "keys":
@@ -1546,10 +1556,12 @@ class SideEffectsProxyDict(collections.abc.MutableMapping[kV, VariableTracker]):
         return self.item_dict[name]
 
     def __setitem__(self, key: kV, value: VariableTracker) -> None:
-        # Find a way to not hash the key using HashableTracker
+        # Find a way to not hash the key using HashableTracker. CPython's
+        # instance __dict__ accepts arbitrary hashable keys when set via the
+        # mapping API (only attribute access via setattr requires str), and
+        # instance-dict mutations replay with object_setattr_ignore_descriptor
+        # (a plain __dict__ store), so a non-str constant key is fine.
         name = self._maybe_unwrap_key(key)
-        if not istype(name, str):
-            raise AssertionError(f"Expected str key, got {type(name)}")
         self.side_effects.store_instance_dict_attr(self.item, name, value)
 
     def __delitem__(self, key: kV) -> None:
