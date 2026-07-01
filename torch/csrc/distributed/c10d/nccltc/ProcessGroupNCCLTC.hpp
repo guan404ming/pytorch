@@ -490,7 +490,9 @@ class TORCH_API ProcessGroupNCCLTC : public ::c10d::Backend {
     GraphCleanupData(ProcessGroupNCCLTC* comm_, unsigned long long id)
         : comm(comm_), graph_id(id) {}
   };
-  static void CUDART_CB graphCleanupCallback(void* userData);
+  // NOTE: no CUDART_CB here -- it is empty on Linux CUDA and undefined under
+  // HIP/ROCm; the plain void(void*) signature matches cuda/hipHostFn_t.
+  static void graphCleanupCallback(void* userData);
 };
 
 } // namespace c10d::nccltc
