@@ -285,7 +285,7 @@ class TorchScriptObjectVariable(UserDefinedObjectVariable):
         ctor_arg_sources: tuple[Source | None, ...] | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(value, **kwargs)
+        super().__init__(value, source=source, **kwargs)
         self.proxy = proxy
         if isinstance(self.proxy, torch.fx.Proxy):
             self.proxy.node.meta["example_value"] = value
