@@ -2,7 +2,6 @@
 
 import operator
 import random
-import unittest
 import warnings
 from functools import reduce
 from itertools import product
@@ -23,6 +22,7 @@ from torch.testing._internal.common_device_type import (
     onlyAccelerator,
     onlyCPU,
     onlyNativeDeviceTypes,
+    skipCUDAIf,
     skipMPS,
     skipXLA,
     skipXPUIf,
@@ -2403,11 +2403,11 @@ class NumpyTests(TestCase):
             IndexError, "shape mismatch", a.__setitem__, ([0, 1], [0, 1, 2]), 0
         )
 
+    @skipXPUIf(True, "XPU asserts instead of raising an exception")
+    @skipCUDAIf(True, "CUDA asserts instead of raising an exception")
     def test_trivial_fancy_out_of_bounds(self, device):
         a = torch.zeros(5, device=device)
         ind = torch.ones(20, dtype=torch.int64, device=device)
-        if a.device.type in ["cuda", "xpu"]:
-            raise unittest.SkipTest("CUDA/XPU asserts instead of raising an exception")
         ind[-1] = 10
         self.assertRaises(IndexError, a.__getitem__, ind)
         self.assertRaises(IndexError, a.__setitem__, ind, 0)
