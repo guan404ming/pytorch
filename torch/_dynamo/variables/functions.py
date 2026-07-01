@@ -1188,8 +1188,10 @@ class LocalGeneratorObjectVariable(VariableTracker):
         with save, disallow, temp:
             tracer = self.inline_tracer
             if not tracer.generator_exhausted:
-                self.remaining_items = unpack_iterable(tx, self)  # type: ignore[bad-argument-type]
-            variables.ListIteratorVariable(self.remaining_items).reconstruct(codegen)
+                remaining_items = unpack_iterable(tx, self)  # type: ignore[bad-argument-type]
+            else:
+                remaining_items: list[VariableTracker] = []
+            variables.ListIteratorVariable(remaining_items).reconstruct(codegen)
 
     def get_globals(self) -> dict[str, Any]:
         return self.f_globals

@@ -1606,6 +1606,43 @@ class NestedGraphBreakTests(torch._dynamo.test_case.TestCase):
         inp = torch.randn(3)
         self.assertEqual(fn(inp), inp + 1)
 
+    def test_exhausted_generator_across_graph_break(self):
+        """Reconstruct an exhausted generator after a graph break.
+
+        Regression test: LocalGeneratorObjectVariable.reconstruct() crashed
+        with AttributeError on 'remaining_items' when the generator was
+        exhausted, because the field was only set inside a conditional.
+        The generator must be fully consumed (exhausted) and still in locals
+        when a graph break occurs inside a nested inlined function -- the NGB
+        stack reconstruction includes outer locals, so the exhausted generator
+        gets reconstruct()'d.
+        """
+        cnts = torch._dynamo.testing.CompileCounter()
+
+        def my_generator(n):
+            for i in range(n):  # noqa: UP028
+                yield i
+
+        def inner(x, val):
+            torch._dynamo.graph_break()
+            return x + val
+
+        @torch.compile(backend=cnts)
+        def fn(x):
+            gen = my_generator(3)
+            total = 0
+            for val in gen:
+                total += val
+            result = inner(x, total)
+            # Reference gen after the graph break to keep it live in locals
+            # during NGB stack reconstruction.
+            type(gen)
+            return result
+
+        inp = torch.tensor(10.0)
+        result = fn(inp)
+        self.assertEqual(result, inp + 3)
+
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
