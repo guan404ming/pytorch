@@ -8,6 +8,9 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+import pandas as pd
+
+from .check_accuracy import check_accuracy
 from .common import parse_args, run
 from .torchbench import setup_torchbench_cwd, TorchBenchmarkRunner
 
@@ -128,6 +131,29 @@ class TestDynamoBenchmark(unittest.TestCase):
         ):
             self.assertTrue(runner.use_iou_for_bool_accuracy(name))
             self.assertEqual(runner.get_iou_threshold(name), 0.99)
+
+    def test_cpu_amp_freezing_detectron2_maskrcnn_expected_failures(self) -> None:
+        expected_filename = os.path.join(
+            os.path.dirname(__file__),
+            "ci_expected_accuracy",
+            "cpu_inductor_amp_freezing_torchbench_inference.csv",
+        )
+        actual = pd.read_csv(
+            io.StringIO(
+                "\n".join(
+                    [
+                        "name,accuracy,graph_breaks",
+                        "detectron2_maskrcnn_r_101_fpn,fail_accuracy,63",
+                        "detectron2_maskrcnn_r_50_c4,fail_accuracy,57",
+                    ]
+                )
+            )
+        )
+        expected = pd.read_csv(expected_filename)
+
+        failed, msg = check_accuracy(actual, expected, expected_filename)
+
+        self.assertFalse(failed, msg)
 
     @unittest.skipIf(is_asan_or_tsan(), "ASAN/TSAN not supported")
     def test_benchmark_infra_runs(self) -> None:
