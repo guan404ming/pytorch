@@ -57,7 +57,6 @@ runs:
       if: ${{ inputs.use-remote-buildkit == 'true' }}
       env:
         REMOTE_BUILDKIT: "1"
-        CI: "1"
         DOCKER_TOKEN: ${{ inputs.DOCKER_TOKEN }}
         DOCKER_ID: ${{ inputs.DOCKER_ID }}
         DOCKER_IMAGE_NAME: ${{ inputs.docker-image-name }}
