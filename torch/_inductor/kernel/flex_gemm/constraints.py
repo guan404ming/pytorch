@@ -78,10 +78,7 @@ LOCAL_REDUCE_C_ALPHA_BETA_ERROR = (
 LOCAL_REDUCE_SWAP_AB_ERROR = (
     "FlexGEMM local reductions do not support swap_ab configs yet"
 )
-LOCAL_REDUCE_AUX_OUT_COMPOSITION_ERROR = (
-    "FlexGEMM local-reduce aux outputs cannot be combined with aux_out yet"
-)
-LOCAL_REDUCE_AUX_SAME_SHAPE_COMPOSITION_ERROR = "FlexGEMM local-reduce aux outputs cannot be combined with same-shape aux outputs yet"
+LOCAL_REDUCE_AUX_OUT_COMPOSITION_ERROR = "FlexGEMM feed-main local reductions cannot be combined with same-shape aux outputs yet"
 LOCAL_REDUCE_AUX_METADATA_ERROR = (
     "FlexGEMM local-reduce aux outputs require aux output metadata"
 )
