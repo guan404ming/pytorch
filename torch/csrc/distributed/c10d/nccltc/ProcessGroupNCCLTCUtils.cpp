@@ -492,7 +492,7 @@ void ProcessGroupNCCLTC::enqueueWork(
 }
 
 // Static callback function for CUDA user object cleanup
-void CUDART_CB ProcessGroupNCCLTC::graphCleanupCallback(void* userData) {
+void ProcessGroupNCCLTC::graphCleanupCallback(void* userData) {
   auto* cleanup_data = static_cast<GraphCleanupData*>(userData);
   if (cleanup_data == nullptr || cleanup_data->comm == nullptr) {
     throw std::runtime_error("Invalid cleanup data");
