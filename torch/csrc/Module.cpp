@@ -31,6 +31,7 @@
 #include <c10/util/AbortHandler.h>
 #include <c10/util/Backtrace.h>
 #include <c10/util/Logging.h>
+#include <c10/util/TypeCast.h>
 #include <c10/util/irange.h>
 #include <c10/util/thread_name.h>
 #include <libshm.h>
@@ -158,6 +159,30 @@ namespace py = pybind11;
 static PyObject* module;
 
 static THPGenerator* THPDefaultCPUGenerator = nullptr;
+
+namespace {
+
+struct THPOpaqueBasePybindShim {};
+
+py::object createOpaqueBasePybindType(PyObject* module) {
+  auto py_module = py::reinterpret_borrow<py::module>(module);
+  // Use a normal hidden pybind type so pybind owns the value/holder lifecycle.
+  // The Python-level OpaqueBase inherits from this marker and can therefore be
+  // passed as an explicit Python base to unrelated py::class_ bindings.
+  py::class_<THPOpaqueBasePybindShim>(py_module, "_OpaqueBase")
+      .def(py::init<>());
+  return py_module.attr("_OpaqueBase");
+}
+
+void installOpaqueBase(PyObject* module) {
+  auto py_module = py::reinterpret_borrow<py::module>(module);
+  auto pybind_opaque_base = createOpaqueBasePybindType(module);
+  py_module.attr("_OpaqueBase") = pybind_opaque_base;
+  auto opaque_base_module = py::module_::import("torch._opaque_base");
+  opaque_base_module.attr("_install_opaque_base")(pybind_opaque_base);
+}
+
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
@@ -694,7 +719,7 @@ static PyObject* THPModule_torchDeviceToDLDevice(
 }
 
 struct TorchDLPackExchangeAPI : public DLPackExchangeAPI {
-  TorchDLPackExchangeAPI() {
+  TorchDLPackExchangeAPI() : DLPackExchangeAPI{} {
     header.version.major = DLPACK_MAJOR_VERSION;
     header.version.minor = DLPACK_MINOR_VERSION;
     header.prev_api = nullptr;
@@ -705,7 +730,7 @@ struct TorchDLPackExchangeAPI : public DLPackExchangeAPI {
     current_work_stream = CurrentWorkStream;
   }
 
-  static const DLPackExchangeAPI* Global() {
+  static DLPackExchangeAPI* Global() {
     static TorchDLPackExchangeAPI inst;
     return &inst;
   }
@@ -764,11 +789,13 @@ struct TorchDLPackExchangeAPI : public DLPackExchangeAPI {
     try {
       at::IntArrayRef shape(
           prototype->shape, prototype->shape + prototype->ndim);
+      const auto device_index = c10::checked_convert<c10::DeviceIndex>(
+          prototype->device.device_id, "c10::DeviceIndex");
       at::TensorOptions options =
           at::TensorOptions()
               .dtype(at::toScalarType(prototype->dtype))
               .device(at::dlDeviceToTorchDevice(
-                  prototype->device.device_type, prototype->device.device_id));
+                  prototype->device.device_type, device_index));
       at::Tensor tensor = at::empty(shape, options);
       *out = at::toDLPackVersioned(tensor);
       return 0;
@@ -790,8 +817,10 @@ struct TorchDLPackExchangeAPI : public DLPackExchangeAPI {
         return 0;
       }
       if (at::torchDeviceToDLDevice(*acc_type).device_type == device_type) {
+        const auto device_index = c10::checked_convert<c10::DeviceIndex>(
+            device_id, "c10::DeviceIndex");
         *out_stream =
-            at::accelerator::getCurrentStream(device_id).native_handle();
+            at::accelerator::getCurrentStream(device_index).native_handle();
       }
       return 0;
     } catch (const std::exception& e) {
@@ -806,9 +835,7 @@ static PyObject* THPModule_DLPackExchangeAPI(
     PyObject* noargs) {
   HANDLE_TH_ERRORS
   return PyCapsule_New(
-      const_cast<DLPackExchangeAPI*>(TorchDLPackExchangeAPI::Global()),
-      "dlpack_exchange_api",
-      nullptr);
+      TorchDLPackExchangeAPI::Global(), "dlpack_exchange_api", nullptr);
   END_HANDLE_TH_ERRORS
 }
 
@@ -2311,6 +2338,7 @@ class WeakTensorRef {
   c10::weak_intrusive_ptr<c10::TensorImpl> weakref_;
 
  public:
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   WeakTensorRef(const at::Tensor& t) : weakref_(t.getIntrusivePtr()) {}
 
   bool expired() {
@@ -2454,6 +2482,7 @@ PyObject* initModule() {
   ASSERT_TRUE(THPVariable_initModule(module));
   ASSERT_TRUE(THPFunction_initModule(module));
   ASSERT_TRUE(THPEngine_initModule(module));
+  installOpaqueBase(module);
   // NOTE: We need to be able to access OperatorExportTypes from ONNX for use in
   // the export side of JIT, so this ONNX init needs to appear before the JIT
   // init.
@@ -2658,7 +2687,7 @@ Call this whenever a new thread is created in order to propagate values from
   });
 
   py::class_<WeakTensorRef>(py_module, "_WeakTensorRef")
-      .def(py::init([](py::object tensor) {
+      .def(py::init([](const py::object& tensor) {
         return WeakTensorRef(THPVariable_Unpack(tensor.ptr()));
       }))
       .def("expired", &WeakTensorRef::expired);
@@ -2698,7 +2727,7 @@ Call this whenever a new thread is created in order to propagate values from
          at::SymIntArrayRef dilation_,
          bool transposed_,
          at::SymIntArrayRef output_padding_,
-         c10::SymInt groups_) {
+         const c10::SymInt& groups_) {
         return at::native::select_conv_backend(
             input,
             weight,
@@ -2708,7 +2737,7 @@ Call this whenever a new thread is created in order to propagate values from
             dilation_,
             transposed_,
             output_padding_,
-            std::move(groups_),
+            groups_,
             std::nullopt);
       },
       py::arg("input"),
@@ -2732,7 +2761,7 @@ Call this whenever a new thread is created in order to propagate values from
          at::SymIntArrayRef dilation_,
          bool transposed_,
          at::SymIntArrayRef output_padding_,
-         c10::SymInt groups_,
+         const c10::SymInt& groups_,
          std::optional<std::vector<c10::SymInt>> bias_sizes_opt) {
         c10::OptionalArrayRef<c10::SymInt> ref = std::nullopt;
         if (bias_sizes_opt) {
@@ -2747,7 +2776,7 @@ Call this whenever a new thread is created in order to propagate values from
             dilation_,
             transposed_,
             output_padding_,
-            std::move(groups_),
+            groups_,
             ref);
       },
       py::arg("input"),
