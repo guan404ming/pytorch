@@ -79,13 +79,12 @@ def handlers():
         sympy.Mul: "mul",
         FloatPow: "pow",
         PowByNatural: "pow_by_natural",
-        # sympy simplifies x * x into Pow(x, 2), so we need to handle this.
-        # Do NOT use builtin Pow for floats
+        # sympy.Pow is handled specially in _run_sympy_handler because
+        # only nonnegative integer exponents can use pow_by_natural.
         # TODO: There is a hazard here, if we have float * float it will
         # also get turned into Pow(float, 2) but we don't want this because
         # pow_by_natural is assumed to only be integers.  Probably the fix is
         # to add a FloatMul to impede this optimization
-        sympy.Pow: "pow_by_natural",
         Mod: "mod",
         PythonMod: "python_mod",
         # TODO: Inductor can generate these, but it's ill-specified which
@@ -124,11 +123,16 @@ ASSOCIATIVE_OPS = {"minimum", "maximum", "mul", "add", "and_", "or_"}
 
 def _run_sympy_handler(analysis, args, expr, index_dtype=torch.int64):
     # Special cases
-    if isinstance(expr, sympy.Pow) and isinstance(
-        expr.args[1], sympy.core.numbers.Half
-    ):
-        return analysis.sqrt(args[0])
-    if isinstance(expr, ToFloat):
+    handler_name = None
+    if isinstance(expr, sympy.Pow):
+        exponent = expr.args[1]
+        if isinstance(exponent, sympy.core.numbers.Half):
+            return analysis.sqrt(args[0])
+        if exponent.is_integer is True and exponent.is_nonnegative is True:
+            handler_name = "pow_by_natural"
+        else:
+            handler_name = "pow"
+    elif isinstance(expr, ToFloat):
         return analysis.to_dtype(args[0], torch.float64)
 
     # These handlers are special because they take an extra dtype argument
@@ -146,7 +150,10 @@ def _run_sympy_handler(analysis, args, expr, index_dtype=torch.int64):
         CeilToInt: "ceil_to_int",
         RoundToInt: "round_to_int",
     }
-    if (handler_name := INDEX_DTYPE_HANDLERS.get(expr.func)) is not None:
+    if (
+        handler_name is None
+        and (handler_name := INDEX_DTYPE_HANDLERS.get(expr.func)) is not None
+    ):
         return getattr(analysis, handler_name)(*args, index_dtype)
 
     # Fastpath for n-ary integral addition
@@ -155,10 +162,11 @@ def _run_sympy_handler(analysis, args, expr, index_dtype=torch.int64):
         log.debug("sym_sum(%s) -> %s", args, r)
         return r
 
-    if hasattr(expr.func, "_torch_handler_name"):
-        handler_name = expr.func._torch_handler_name
-    else:
-        handler_name = handlers()[expr.func]
+    if handler_name is None:
+        if hasattr(expr.func, "_torch_handler_name"):
+            handler_name = expr.func._torch_handler_name
+        else:
+            handler_name = handlers()[expr.func]
     handler = getattr(analysis, handler_name)
     try:
         if handler_name in ASSOCIATIVE_OPS:

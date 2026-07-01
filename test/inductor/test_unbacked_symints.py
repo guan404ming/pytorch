@@ -22,6 +22,7 @@ from torch.testing._internal.common_device_type import (
 )
 from torch.testing._internal.common_utils import parametrize, skipIfXpu
 from torch.testing._internal.inductor_utils import HAS_GPU
+from torch.utils._sympy.functions import FloorDiv
 
 
 class TestUnbackedSymints(InductorTestCase):
@@ -1102,6 +1103,33 @@ class TestUnbackedSymints(InductorTestCase):
                 side_effect=AssertionError("unexpected optimization hint"),
             ):
                 self.assertFalse(layout.is_stride_ordered([1, 0]))
+
+    def test_stride_ordered_handles_reciprocal_in_divisibility_check(self, device):
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape_env = ShapeEnv()
+        seq = shape_env.create_unbacked_symint().node.expr
+        shape_env.constrain_symbol_range(seq, 4, 1024)
+        half = FloorDiv(seq, 2)
+        reduced = FloorDiv(half**2, half)
+        left = 16 * reduced - 30
+        right = 16 * (64 * half * reduced - 120 * half - 120 * reduced + 225)
+        sizevars = SizeVarAllocator(shape_env)
+        graph = mock.Mock(sizevars=sizevars)
+
+        layout = ir.FixedLayout(
+            torch.device(device),
+            torch.float32,
+            size=[seq, 2],
+            stride=[left, right],
+        )
+        with V.set_graph_handler(graph):
+            with mock.patch.object(
+                sizevars,
+                "optimization_hint",
+                side_effect=AssertionError("unexpected optimization hint"),
+            ):
+                self.assertTrue(layout.is_stride_ordered([0, 1]))
 
     @skipGPUIf(not HAS_GPU, "requires gpu and triton")
     @dynamo_config.patch({"capture_dynamic_output_shape_ops": True})
