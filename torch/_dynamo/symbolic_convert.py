@@ -189,7 +189,12 @@ from .variables.misc import (
     UnknownVariable,
 )
 from .variables.nn_module import NNModuleVariable, UnspecializedNNModuleVariable
-from .variables.object_protocol import generic_bool, generic_contains, generic_getiter
+from .variables.object_protocol import (
+    generic_bool,
+    generic_contains,
+    generic_getattr,
+    generic_getiter,
+)
 from .variables.sets import SetVariable
 from .variables.streams import SymbolicStreamState
 from .variables.tensor import supported_comparison_ops, SymNodeVariable, TensorVariable
@@ -3168,12 +3173,11 @@ class InstructionTranslatorBase(
         )
 
     def _load_attr(self, attr: Any) -> None:
-        obj = self.pop()
-        result = VariableTracker.build(self, getattr).call_function(
-            self,  # type: ignore[arg-type]
-            [obj, VariableTracker.build(self, attr)],
-            {},
-        )
+        # Python-constant objects with unresolvable descriptors (e.g.
+        # C extension member_descriptors) are handled by const_getattr
+        # inside the base getattro_impl, so no fallback is needed here.
+        obj = self.pop().realize()
+        result = generic_getattr(self, obj, attr)
         self.push(result)
 
     def LOAD_ATTR(self, inst: Instruction) -> None:
