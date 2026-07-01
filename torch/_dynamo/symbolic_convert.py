@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import _warnings
 
-import collections
-import collections.abc
 import contextlib
 import copy
 import dataclasses
@@ -172,7 +170,7 @@ from .variables.functions import (
     SkipFunctionVariable,
     UserFunctionVariable,
 )
-from .variables.iter import IteratorVariable, MAX_ITERATOR_LIMIT
+from .variables.iter import MAX_ITERATOR_LIMIT
 from .variables.lazy import LazyVariableTracker
 from .variables.lists import (
     BaseListVariable,
@@ -189,7 +187,12 @@ from .variables.misc import (
     UnknownVariable,
 )
 from .variables.nn_module import NNModuleVariable, UnspecializedNNModuleVariable
-from .variables.object_protocol import generic_bool, generic_contains, generic_getiter
+from .variables.object_protocol import (
+    generic_bool,
+    generic_contains,
+    generic_getiter,
+    pyiter_check,
+)
 from .variables.sets import SetVariable
 from .variables.streams import SymbolicStreamState
 from .variables.tensor import supported_comparison_ops, SymNodeVariable, TensorVariable
@@ -6502,51 +6505,33 @@ class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):
     def SEND(self, inst: Instruction) -> None:
         if not (len(self.stack) >= 2):
             raise AssertionError("expected len(self.stack) >= 2 to be true")
+
         val = self.pop()
         if sys.version_info >= (3, 15):
             receiver = self.stack[-2]
         else:
             receiver = self.stack[-1]
-        if isinstance(receiver, (IteratorVariable, LocalGeneratorObjectVariable)) or (
-            isinstance(receiver, UserDefinedObjectVariable)
-            and isinstance(receiver.value, collections.abc.Iterator)
-        ):
-            if val.is_constant_none():
-                try:
-                    val = receiver.next_variable(self)  # type: ignore[arg-type]
-                except (
-                    StopIteration,
-                    exc.ObservedUserStopIteration,
-                    exc.ObservedIndexError,
-                ):
-                    # To implement SEND, we have to look at the implementation
-                    # when the iterator returns StopIteration. This translates to this code
-                    # 3.11: https://github.com/python/cpython/blob/3.11/Python/ceval.c#L2613-L2619
-                    # 3.12: https://github.com/python/cpython/blob/3.12/Python/bytecodes.c#L863-L866
-                    # The implementation is different in 3.11 and 3.12. In 3.12, we rely
-                    # on END_SEND to clean up. In 3.11, SEND does the cleanup as well.
-                    if sys.version_info < (3, 12):
-                        self.pop()  # Python 3.12 uses new opcode END_SEND
-                    self.push(val)
-                    self.jump(inst)
-                else:
-                    self.push(val)
+
+        try:
+            receiver_T = receiver.python_type()
+            if val.is_constant_none() and pyiter_check(receiver_T):
+                val = receiver.tp_iternext_impl(self)
             else:
-                # invoke send
-                # Unreachable code - if you hit this, you are implementing generator support and have
-                # lifted the `unimplemented("generator")` in frame conversion. This codepath handles
-                # subgenerator and lines up with this line in Python 3.11
-                # https://github.com/python/cpython/blob/3.11/Python/ceval.c#L2597
-                unimplemented(
-                    gb_type="Unreachable sub-generator code",
-                    context="",
-                    explanation="Should only be encountered while implementing generator support.",
-                    hints=[],
-                )
+                val = receiver.call_method(self, "send", [val], {})
+        except exc.ObservedUserStopIteration:
+            # To implement SEND, we have to look at the implementation
+            # when the iterator returns StopIteration. This translates to this code
+            # 3.11: https://github.com/python/cpython/blob/3.11/Python/ceval.c#L2613-L2619
+            # 3.12: https://github.com/python/cpython/blob/3.12/Python/bytecodes.c#L863-L866
+            # The implementation is different in 3.11 and 3.12. In 3.12, we rely
+            # on END_SEND to clean up. In 3.11, SEND does the cleanup as well.
+            ex = self.exn_vt_stack.get_raised_exception()
+            self.exn_vt_stack.clear_current_exception()
+
+            val = ex.args[0] if ex.args else ConstantVariable.create(None)
+            if sys.version_info < (3, 12):
+                self.pop()  # Python 3.12 uses new opcode END_SEND
+            self.push(val)
+            self.jump(inst)
         else:
-            unimplemented(
-                gb_type="SEND with bad type",
-                context=f"TOS type: {typestr(receiver)}",
-                explanation=f"Attempted to SEND with unsupported type {typestr(receiver)}.",
-                hints=[],
-            )
+            self.push(val)
