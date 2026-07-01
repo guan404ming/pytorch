@@ -1,10 +1,9 @@
 # Owner(s): ["module: nn"]
 
-import unittest
-
 import torch
 from torch._native.ops.bmm_outer_product.triton_impl import _is_outer_product
 from torch.testing._internal.common_device_type import (
+    deviceCountAtLeast,
     instantiate_device_type_tests,
     onlyAccelerator,
     skipXPUIf,
@@ -98,6 +97,27 @@ class TestBmmOuterProductDevice(TestCase):
         with self.assertRaises(RuntimeError):
             torch.bmm(a, b)
 
+    @onlyAccelerator
+    @deviceCountAtLeast(2)
+    def test_non_current_device_outer_product(self, devices):
+        old_device = torch.accelerator.current_device_index()
+        try:
+            torch.accelerator.set_device_index(0)
+            a = torch.randn(4, 8, 1, device=devices[1])
+            b = torch.randn(4, 1, 16, device=devices[1])
+
+            out = torch.bmm(a, b)
+
+            self.assertEqual(torch.accelerator.current_device_index(), 0)
+            self.assertEqual(out.device, torch.device(devices[1]))
+            self.assertEqual(out, a * b)
+
+            mismatched_a = torch.randn(4, 8, 1, device=devices[0])
+            with self.assertRaisesRegex(RuntimeError, "same device|different"):
+                torch.bmm(mismatched_a, b)
+        finally:
+            torch.accelerator.set_device_index(old_device)
+
 
 class TestBmmOuterProduct(TestCase):
     def test_cpu_outer_product_fallback(self):
@@ -105,29 +125,6 @@ class TestBmmOuterProduct(TestCase):
         b = torch.randn(4, 1, 16)
         self.assertTrue(a.device.type == "cpu")
         self.assertEqual(torch.bmm(a, b), a @ b)
-
-    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
-    def test_non_current_device_outer_product(self):
-        if torch.cuda.device_count() < 2:
-            self.skipTest("requires at least 2 visible CUDA devices")
-
-        old_device = torch.cuda.current_device()
-        try:
-            torch.cuda.set_device(0)
-            a = torch.randn(4, 8, 1, device="cuda:1")
-            b = torch.randn(4, 1, 16, device="cuda:1")
-
-            out = torch.bmm(a, b)
-
-            self.assertEqual(torch.cuda.current_device(), 0)
-            self.assertEqual(out.device, torch.device("cuda:1"))
-            self.assertEqual(out, a * b)
-
-            mismatched_a = torch.randn(4, 8, 1, device="cuda:0")
-            with self.assertRaisesRegex(RuntimeError, "same device|different"):
-                torch.bmm(mismatched_a, b)
-        finally:
-            torch.cuda.set_device(old_device)
 
 
 class TestOuterProductDetection(TestCase):
