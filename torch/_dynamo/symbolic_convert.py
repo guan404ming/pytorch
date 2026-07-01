@@ -183,7 +183,6 @@ from .variables.lists import (
 )
 from .variables.misc import (
     CellVariable,
-    ExceptionVariable,
     NullVariable,
     PythonModuleVariable,
     TracebackVariable,
@@ -2748,17 +2747,14 @@ class InstructionTranslatorBase(
     def CLEANUP_THROW(self, inst: Instruction) -> None:
         # https://github.com/python/cpython/pull/96010
         tos = self.stack[-1]
-        if not isinstance(tos, ExceptionVariable):
+        if not isinstance(tos, ExceptionVals):
             raise AssertionError(
                 "expected isinstance(tos, ExceptionVariable) to be true"
             )
-        if tos.exc_type is StopIteration:
-            unimplemented(
-                gb_type="CLEANUP_THROW with StopIteration",
-                context="",
-                explanation="Received StopIteration when handling generator.throw/close. This is not supported.",
-                hints=[],
-            )
+        if issubclass(tos.exc_type, StopIteration):
+            self.popn(3)
+            self.push(ConstantVariable.create(None))
+            self.push(tos.args[0] if tos.args else ConstantVariable.create(None))
         else:
             self.RERAISE(inst)
 
