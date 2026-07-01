@@ -1,12 +1,16 @@
 #include <ATen/Functions.h>
 #include <ATen/Tensor.h>
 #include <ATen/Utils.h>
+#include <ATen/xpu/EmptyTensor.h>
+#include <ATen/xpu/XPUContext.h>
 #include <ATen/xpu/XPUGeneratorImpl.h>
 #include <ATen/xpu/XPUGraph.h>
 #include <ATen/xpu/XPUGraphsUtils.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/util/CallOnce.h>
 #include <c10/xpu/XPUFunctions.h>
+#include <hal/XPUHal.h>
+#include <utility>
 
 constexpr uint64_t PHILOX_ROUND_SIZE = 4;
 
@@ -23,11 +27,69 @@ DeviceIndex num_gpus = -1;
 std::deque<c10::once_flag> xpu_gens_init_flag;
 std::vector<Generator> default_gens_xpu;
 
+// Bridge wrappers that allow kernel DLLs (in torch-xpu-ops) to call
+// generator functions via xpu_hal.dll instead of linking torch_xpu.dll.
+// This breaks the cyclic dependency in BUILD_SEPARATE_OPS builds.
+
 void initXPUGenVector() {
   static bool init_flag [[maybe_unused]] = []() {
     num_gpus = device_count();
     xpu_gens_init_flag.resize(num_gpus);
     default_gens_xpu.resize(num_gpus);
+    xpu_hal::registerXPUGeneratorBridge(
+        // getDefaultGenerator bridge
+        [](int64_t device_index) -> c10::intrusive_ptr<c10::GeneratorImpl> {
+          return getDefaultXPUGenerator(device_index).getIntrusivePtr();
+        },
+        // philoxState bridge
+        [](c10::GeneratorImpl* gen,
+           uint64_t increment) -> std::pair<uint64_t, uint64_t> {
+          auto* xpu_gen = static_cast<at::XPUGeneratorImpl*>(gen);
+          auto [seed, offset] =
+              at::xpu::philox::unpack(xpu_gen->philox_xpu_state(increment));
+          return {seed, offset};
+        });
+    // philoxCaptureState bridge — passes through raw pointers for
+    // graph capture (Attention.cpp needs the extragraph buffer
+    // addresses rather than unpacked values).
+    xpu_hal::registerXPUGeneratorCaptureBridge(
+        [](c10::GeneratorImpl* gen,
+           uint64_t increment) -> xpu_hal::PhiloxCaptureState {
+          auto* xpu_gen = static_cast<at::XPUGeneratorImpl*>(gen);
+          auto native_state = xpu_gen->philox_xpu_state(increment);
+          xpu_hal::PhiloxCaptureState result;
+          if (native_state.captured_) {
+            result.seed_.ptr = native_state.seed_.ptr;
+            result.offset_.ptr = native_state.offset_.ptr;
+            result.offset_intragraph_ = native_state.offset_intragraph_;
+            result.captured_ = true;
+          }
+          return result;
+        });
+    // empty_xpu + getCurrentDeviceProperties bridge — kernel DLLs
+    // call these through xpu_hal.dll instead of linking torch_xpu.dll.
+    {
+      using EmptyXpuFn = at::TensorBase (*)(
+          c10::IntArrayRef,
+          c10::ScalarType,
+          std::optional<c10::Device>,
+          std::optional<c10::MemoryFormat>);
+      using DevicePropFn = c10::xpu::DeviceProp* (*)();
+      xpu_hal::registerTorchXpuBridge(
+          reinterpret_cast<void*>(static_cast<EmptyXpuFn>(
+              [](c10::IntArrayRef size,
+                 c10::ScalarType dtype,
+                 std::optional<c10::Device> device_opt,
+                 std::optional<c10::MemoryFormat> memory_format_opt)
+                  -> at::TensorBase {
+                return at::detail::empty_xpu(
+                    size, dtype, device_opt, memory_format_opt);
+              })),
+          reinterpret_cast<void*>(
+              static_cast<DevicePropFn>([]() -> c10::xpu::DeviceProp* {
+                return at::xpu::getCurrentDeviceProperties();
+              })));
+    }
     return true;
   }();
 }
