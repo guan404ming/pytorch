@@ -11,6 +11,12 @@ requires = [
     "requests",
     "six",  # dependency chain: NNPACK -> PeachPy -> six
     "typing-extensions>=4.10.0",
+    # cupti_activity.h (from nvidia-cuda-cupti) is parsed at build time with the
+    # clang python bindings to generate torch/profiler/_cupti/_cupti_field_ids.py
+    # (the CUPTI field-id enums). clang loads a system libclang.so. >=13.3.75 for the
+    # user-defined-record field ids / record layouts the monitor relies on.
+    "nvidia-cuda-cupti>=13.3.75; platform_machine == 'x86_64' or platform_machine == 'aarch64'",
+    "clang; platform_machine == 'x86_64' or platform_machine == 'aarch64'",
 ]
 build-backend = "setuptools.build_meta"
 
