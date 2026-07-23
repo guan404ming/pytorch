@@ -2364,12 +2364,18 @@ class LoggingLoggerVariable(VariableTracker):
         if method in ignore_set or function in ignore_set:
             return variables.ConstantVariable.create(None)
 
+        reorderable = torch._dynamo.config.reorderable_logging_functions
+        if self.source and (method in reorderable or function in reorderable):
+            fn_var = DebuggingVariable(method, source=AttrSource(self.source, name))
+            return fn_var.call_function(tx, args, kwargs)
+
         unimplemented(
             gb_type="logging.Logger method not supported for non-export cases",
             context=f"method: {self.value}.{name}, args: {args}, kwargs: {kwargs}",
             explanation="logging.Logger methods are not supported for non-export cases.",
             hints=[
-                "Add the logging method to `torch._dynamo.config.ignore_logging_functions`.",
+                "Add the logging method to `torch._dynamo.config.ignore_logging_functions` to skip the call.",
+                f"If you need the log side effect to run, add the method to `torch._dynamo.config.reorderable_logging_functions` (e.g. `torch._dynamo.config.reorderable_logging_functions.add(logger.{name})`); it will run after the compiled region if its arguments are tensors, constants, or string formatters.",
             ],
         )
 
