@@ -1956,6 +1956,7 @@ class VariableBuilder:
                 torch.utils.hooks.BackwardHook,
                 torch.nn.Parameter,
                 torch.nn.Buffer,
+                torch.backends.cuda.SDPAParams,
             ):
                 # TODO(jansel): combine this case with the one above
                 # type: ignore[attr-defined]
