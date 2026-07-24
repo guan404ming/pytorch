@@ -2267,8 +2267,9 @@ class DebuggingVariable(VariableTracker):
             unimplemented(
                 gb_type="attempted to reorder a debugging function that can't actually be reordered",
                 context=f"fn: {self.value}, args: {args}, kwargs: {kwargs}",
-                explanation="`torch.compile` can only reorder functions where the arguments "
-                "are Tensors, constants, or string formatters.",
+                explanation="`torch.compile` can only reorder functions that are called "
+                "without keyword arguments and whose arguments are Tensors, constants, "
+                "or string formatters.",
                 hints=[
                     f"Avoid calling the logging function {self.value} with args that are not supported.",
                 ],
@@ -2291,13 +2292,17 @@ class DebuggingVariable(VariableTracker):
         actually reorder.
         """
 
+        # kwargs are dropped by the replay codegen, so refuse rather than lose them
+        if kwargs:
+            return False
+
         allowed_input_types = (
             variables.TensorVariable,
             variables.ConstantVariable,
             StringFormatVariable,
         )
 
-        flat_args = pytree.tree_leaves([args, kwargs])
+        flat_args = pytree.tree_leaves(args)
         for arg in flat_args:
             if not isinstance(arg, allowed_input_types):
                 return False
@@ -2375,7 +2380,7 @@ class LoggingLoggerVariable(VariableTracker):
             explanation="logging.Logger methods are not supported for non-export cases.",
             hints=[
                 "Add the logging method to `torch._dynamo.config.ignore_logging_functions` to skip the call.",
-                f"If you need the log side effect to run, add the method to `torch._dynamo.config.reorderable_logging_functions` (e.g. `torch._dynamo.config.reorderable_logging_functions.add(logger.{name})`); it will run after the compiled region if its arguments are tensors, constants, or string formatters.",
+                f"If you need the log side effect to run, add `logging.Logger.{name}` (all loggers) or `logger_obj.{name}` (one logger) to `torch._dynamo.config.reorderable_logging_functions`; it will run after the compiled region if it is called without kwargs and its arguments are tensors, constants, or string formatters.",
             ],
         )
 
